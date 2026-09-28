@@ -1068,6 +1068,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo == "FP8_BLOCK_SCALES":
+                from sglang.srt.layers.quantization.sm70_fp8_block_moe import (
+                    SM70FP8BlockMoEDequantMethod,
+                    can_use_sm70_fp8_block_moe_dequant,
+                )
+
+                if can_use_sm70_fp8_block_moe_dequant(layer, self.fp8_block_config):
+                    return SM70FP8BlockMoEDequantMethod(self.fp8_block_config)
                 return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)

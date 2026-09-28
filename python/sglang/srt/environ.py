@@ -1398,6 +1398,10 @@ class Envs:
     SGLANG_SM70_MTP_GDN = EnvBool(True)
     SGLANG_SM70_QSA_COMBINE = EnvBool(True)
     SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH = EnvBool(True)
+    # Dequantize FP8 block-128 routed experts to FP16 at load when the TP shard
+    # is not a block multiple (e.g. moe_intermediate 640 at TP4 = 160 columns,
+    # the Qwen3.8 MTP draft layer) and run the TurboMind FP16 MoE kernels.
+    SGLANG_DISABLE_SM70_FP8_BLOCK_MOE_DEQUANT = EnvBool(False)
 
     # ===================================================================
     # RoPE cache

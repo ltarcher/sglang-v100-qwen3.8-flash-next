@@ -1409,13 +1409,30 @@ class FusedMoE(torch.nn.Module):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=tp_rank,
-                )
+                if getattr(method, "load_scale_full_per_expert", False):
+                    # TP shards that are not a block multiple (e.g. 640/TP4=160
+                    # with block 128) have no whole-block scale slice; the
+                    # dequant method keeps every rank's copy whole and windows
+                    # the scales itself after loading. Gate/up scales share the
+                    # param in halves, matching _load_w13's layout.
+                    half = expert_data.shape[0] // 2
+                    loaded_weight = _maybe_copy_weight_view_before_h2d(
+                        loaded_weight
+                    )
+                    if shard_id == "w1":
+                        expert_data[:half].copy_(loaded_weight)
+                    elif shard_id == "w3":
+                        expert_data[half:].copy_(loaded_weight)
+                    else:
+                        expert_data.copy_(loaded_weight)
+                else:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=tp_rank,
+                    )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
                 if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
