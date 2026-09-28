@@ -3,21 +3,31 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 from xgrammar import StructuralTag
 from xgrammar.structural_tag import (
     AnyTextFormat,
-    AnyTokensFormat,
     ConstStringFormat,
-    ExcludeTokenFormat,
     Format,
     JSONSchemaFormat,
-    OptionalFormat,
     OrFormat,
     RegexFormat,
     SequenceFormat,
-    StarFormat,
     TagFormat,
     TagsWithSeparatorFormat,
-    TokenFormat,
     TriggeredTagsFormat,
 )
+
+# The token-level formats postdate xgrammar 0.1.32 (the V100 image pin);
+# degrade the affected constructs to free text there instead of failing the
+# whole function-call import chain.
+try:
+    from xgrammar.structural_tag import (
+        AnyTokensFormat,
+        ExcludeTokenFormat,
+        OptionalFormat,
+        StarFormat,
+        TokenFormat,
+    )
+except ImportError:
+    AnyTokensFormat = ExcludeTokenFormat = None
+    OptionalFormat = StarFormat = TokenFormat = None
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.kimik3_format import (
@@ -376,6 +386,13 @@ def _dynamic_argument_format(
     )
 
 
+def _star_format(content: Format) -> Format:
+    if StarFormat is not None:
+        return StarFormat(content=content)
+    # No StarFormat: free text stands in for the repeated-argument loop.
+    return AnyTextFormat()
+
+
 def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
     properties = parameters.get("properties", {})
     if not isinstance(properties, dict):
@@ -404,16 +421,21 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
                     f"Kimi K3 required parameter {key!r} accepts no values"
                 )
             continue
-        elements.append(
-            argument if key in required_set else OptionalFormat(content=argument)
-        )
+        if key in required_set:
+            elements.append(argument)
+        elif OptionalFormat is not None:
+            elements.append(OptionalFormat(content=argument))
+        else:
+            elements.append(
+                OrFormat(elements=[argument, ConstStringFormat(value="")])
+            )
 
     additional = parameters.get("additionalProperties", True)
     if additional is True:
-        elements.append(StarFormat(content=_dynamic_argument_format(True, parameters)))
+        elements.append(_star_format(_dynamic_argument_format(True, parameters)))
     elif isinstance(additional, dict):
         elements.append(
-            StarFormat(content=_dynamic_argument_format(additional, parameters))
+            _star_format(_dynamic_argument_format(additional, parameters))
         )
     elif additional is not False:
         raise ValueError(
@@ -428,8 +450,8 @@ def _tool_arguments_format(tool: Tool) -> Format:
     parameters = tool.function.parameters
     if not tool.function.strict:
         root_schema = parameters if isinstance(parameters, dict) else {}
-        return StarFormat(
-            content=_dynamic_argument_format(True, root_schema, loose_strings=True)
+        return _star_format(
+            _dynamic_argument_format(True, root_schema, loose_strings=True)
         )
     if parameters is None:
         # Server-side strict levels mark tools without parameters strict too;
@@ -509,9 +531,16 @@ def _single_xtml_type(
 
 
 def _nonempty_argument_format(key: str, xtml_type: str) -> Format:
+    begin = (
+        f'<|open|>argument key="{_escape_attr(key)}" type="{xtml_type}"<|sep|>'
+    )
+    if TokenFormat is None:
+        # Without a token-scoped end, the full close string bounds the
+        # free-text content directly.
+        return TagFormat(begin=begin, content=AnyTextFormat(), end=ARGUMENT_CLOSE)
     # A token-based end keeps the first close token out of both content formats.
     argument = TagFormat(
-        begin=(f'<|open|>argument key="{_escape_attr(key)}" type="{xtml_type}"<|sep|>'),
+        begin=begin,
         content=SequenceFormat(elements=[ExcludeTokenFormat(), AnyTokensFormat()]),
         end=TokenFormat(token=_CLOSE_TOKEN),
     )
