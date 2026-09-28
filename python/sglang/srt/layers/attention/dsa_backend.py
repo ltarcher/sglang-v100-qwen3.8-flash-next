@@ -97,9 +97,11 @@ _IS_GFX95 = is_gfx95_supported()
 if is_cuda():
     try:
         import deep_gemm
-    except ImportError:
-        # SM70 / boxes without the Hopper DeepGEMM wheel. Call sites below are
-        # DSA paged-MQA (SM90); they must not run on V100.
+    except Exception:
+        # SM70 / boxes without a loadable Hopper DeepGEMM wheel. Call sites
+        # below are DSA paged-MQA (SM90); they must not run on V100. The wheel
+        # can also be installed-but-unloadable (CUDA 13 build on a cu128
+        # stack), which raises from its module body, not ImportError.
         deep_gemm = None
 
 if TYPE_CHECKING:

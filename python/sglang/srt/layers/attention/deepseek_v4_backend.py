@@ -309,7 +309,9 @@ def _has_dense_fp4_indexer() -> bool:
         return False
     try:
         import deep_gemm
-    except ImportError:
+    except Exception:
+        # The wheel can be installed-but-unloadable (CUDA 13 build on a cu128
+        # stack), which raises from its module body, not ImportError.
         return False
     return hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
