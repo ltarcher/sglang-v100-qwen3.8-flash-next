@@ -1,11 +1,35 @@
 # syntax=docker/dockerfile:1.7
 
-# Reproducible SGLang image for NVIDIA V100 (Volta, SM70). Expensive native
-# builds are deliberately separate layers; a later validation failure never
-# invalidates completed FlashInfer, sglang-kernel, or Marlin compilation.
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS base
+# China-mirror variant of v100.Dockerfile for NVIDIA V100 (Volta, SM70).
+# Build logic, layer ordering, and artifact validation are identical to
+# docker/v100.Dockerfile; only the download endpoints change:
+#
+#   apt         -> mirrors.tuna.tsinghua.edu.cn      (APT_MIRROR)
+#   pip / PyPI  -> pypi.tuna.tsinghua.edu.cn         (PIP_INDEX_URL)
+#   torch       -> mirrors.aliyun.com pytorch-wheels (PYTORCH_WHEELS_URL)
+#   rustup      -> rsproxy.cn
+#   git clone   -> ghproxy.net prefix                (GITHUB_PROXY)
+#   HF models   -> hf-mirror.com                     (runtime HF_ENDPOINT)
+#
+# Every mirror is a build arg. For example, to clone GitHub directly instead
+# of through the proxy:
+#   docker build -f docker/v100.cn.Dockerfile --build-arg GITHUB_PROXY= .
+# Or build through compose:
+#   docker compose -f docker/v100-compose.yaml -f docker/v100-compose.cn.yaml build
+#
+# gh-proxy-style mirrors rotate frequently; if the default stops working,
+# swap GITHUB_PROXY for another working prefix or pass it empty.
+
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PYTORCH_WHEELS_URL=https://mirrors.aliyun.com/pytorch-wheels/cu128/
+ARG GITHUB_PROXY=https://ghproxy.net/
+
+FROM ${BASE_IMAGE} AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR
 
 ENV CUDA_HOME=/usr/local/cuda \
     CUDAHOSTCXX=/usr/bin/g++-12 \
@@ -15,9 +39,20 @@ ENV CUDA_HOME=/usr/local/cuda \
     PATH=/opt/venv/bin:/root/.cargo/bin:/usr/local/cuda/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
+# Swap the Ubuntu archives for the mirror before the first apt-get call. http
+# is deliberate: TLS trust is only guaranteed once ca-certificates (installed
+# in this same RUN) is present.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    for sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do \
+      [ -f "$sources" ] || continue; \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|http://${APT_MIRROR}/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|http://${APT_MIRROR}/ubuntu|g" \
+        -e "s|http://ports.ubuntu.com/ubuntu-ports|http://${APT_MIRROR}/ubuntu-ports|g" \
+        "$sources"; \
+    done \
+    && apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates cmake curl ffmpeg git g++-12 libnuma-dev \
       ninja-build patch pkg-config protobuf-compiler python3.12 python3.12-dev \
       python3-pip python3-venv \
@@ -28,17 +63,53 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 FROM base AS builder
 
 ARG MAX_JOBS
-ENV MAX_JOBS=${MAX_JOBS}
+ARG PIP_INDEX_URL
+ARG PYTORCH_WHEELS_URL
+ARG GITHUB_PROXY
+ENV MAX_JOBS=${MAX_JOBS} \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+# No trailing /dist above: rsproxy's rustup-init.sh appends /dist itself, so
+# RUSTUP_UPDATE_ROOT=.../rustup/dist would double it and 404 the installer.
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --no-modify-path --profile minimal
+# Rust through rsproxy.cn, with crates.io routed to its sparse index too.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
+    | sh -s -- -y --no-modify-path --profile minimal \
+    && mkdir -p /root/.cargo \
+    && printf '%s\n' \
+      '[source.crates-io]' \
+      'replace-with = "rsproxy-sparse"' \
+      '' \
+      '[source.rsproxy-sparse]' \
+      'registry = "sparse+https://rsproxy.cn/index/"' \
+      '' \
+      '[registries.rsproxy]' \
+      'index = "sparse+https://rsproxy.cn/index/"' \
+      '' \
+      '[net]' \
+      'git-fetch-with-cli = true' \
+      > /root/.cargo/config.toml
+
+# Transparently rewrite every https://github.com/ URL -- including the clone
+# inside scripts/setup_v100_marlin.sh -- to the proxy prefix. An empty
+# GITHUB_PROXY leaves all clones direct. HTTP/1.1 avoids curl 92 stream
+# aborts ("RPC failed") when large clones traverse the proxy.
+RUN if [ -n "${GITHUB_PROXY}" ]; then \
+      git config --global \
+        url."${GITHUB_PROXY}https://github.com/".insteadOf "https://github.com/" \
+      && git config --global http.version HTTP/1.1; \
+    fi
 
 WORKDIR /opt/sglang
 COPY scripts/v100_safe_jobs.sh /usr/local/bin/v100-safe-jobs
 RUN chmod +x /usr/local/bin/v100-safe-jobs
 
 # Install SGLang's current runtime dependency list while deliberately excluding
-# the four packages replaced below by CUDA 12.8 / SM70 builds.
+# the four packages replaced below by CUDA 12.8 / SM70 builds. pip goes to
+# PIP_INDEX_URL; the torch stack resolves its exact +cu128 wheels from
+# PYTORCH_WHEELS_URL (the PyPI default build is also cu128, so the find-links
+# mirror only pins provenance).
 COPY python/pyproject.toml /tmp/sglang-pyproject.toml
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     python -m pip install --upgrade \
@@ -46,7 +117,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
       ninja psutil packaging \
     && python -m pip install \
       torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-      --index-url https://download.pytorch.org/whl/cu128 \
+      --find-links "${PYTORCH_WHEELS_URL}" \
     && python - <<'PY'
 import subprocess
 import sys
@@ -149,7 +220,9 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
       /opt/sglang/python/sglang/kernels/aot
 
 # Marlin uses the dedicated marlin_v100 repository and the exact proven local
-# compatibility/tuning patches. Its smoke test is deferred to the next layer.
+# compatibility/tuning patches. Its clone goes through GITHUB_PROXY via the
+# insteadOf rewrite above; the script reuses the cache mount on rebuilds. Its
+# smoke test is deferred to the next layer.
 RUN git clone --depth 1 --branch v4.2.1 \
       https://github.com/NVIDIA/cutlass.git /opt/cutlass
 COPY scripts/setup_v100_marlin.sh /opt/sglang/scripts/setup_v100_marlin.sh
@@ -253,6 +326,7 @@ ENV NCCL_P2P_LEVEL=NVL \
     SGLANG_SM70_DENSE_GEMV=1 \
     SGLANG_SM70_QWEN_FUSIONS=1 \
     HF_HOME=/root/.cache/huggingface \
+    HF_ENDPOINT=https://hf-mirror.com \
     FLASHINFER_WORKSPACE_BASE=/root/sglang-v100-jit \
     TILELANG_CACHE_DIR=/root/sglang-v100-jit/tilelang \
     TRITON_CACHE_DIR=/root/sglang-v100-jit/triton \

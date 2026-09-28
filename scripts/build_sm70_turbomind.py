@@ -111,5 +111,8 @@ extension = load(
     verbose=True,
 )
 destination = repo / "python/sglang/kernels/prebuilt/_sm70_turbomind_v100.so"
+# Clean checkouts have no prebuilt/ directory (its only contents are
+# git-ignored .so artifacts), so create it before installing.
+destination.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(extension, destination)
 print(f"Installed {destination}")

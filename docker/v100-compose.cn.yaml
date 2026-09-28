@@ -1,0 +1,10 @@
+# Compose override that builds the sglang-v100 service from the China-mirror
+# Dockerfile. Layer everything over the base compose file:
+#   docker compose -f docker/v100-compose.yaml -f docker/v100-compose.cn.yaml build
+# Mirror endpoints are build args in docker/v100.cn.Dockerfile, e.g.:
+#   docker compose -f docker/v100-compose.yaml -f docker/v100-compose.cn.yaml \
+#     build --build-arg GITHUB_PROXY=
+services:
+  sglang-v100:
+    build:
+      dockerfile: docker/v100.cn.Dockerfile
