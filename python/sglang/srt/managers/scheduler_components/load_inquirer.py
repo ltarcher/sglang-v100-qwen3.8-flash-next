@@ -46,7 +46,7 @@ class SchedulerLoadInquirer:
     waiting_queue_prefix_matched: Callable
     get_recent_cache_hit_rate: Callable
     get_stats: Callable
-    get_chunked_req: Callable
+    get_chunked_reqs: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
@@ -61,20 +61,22 @@ class SchedulerLoadInquirer:
         """Get the total number of tokens pending prefill.
 
         This includes tokens from waiting queue requests plus remaining tokens
-        from the currently chunked request.
+        from the currently mid-prefill requests.
 
         Args:
-            chunk_deduct: extra tokens to subtract from the chunked request's
-                remaining count. At batch-scheduling time the current chunk
-                has been planned but ``prefix_indices`` does not yet include it,
-                so callers pass ``extend_input_len`` here. At load-reporting
-                time ``prefix_indices`` is already up-to-date, so the default
-                0 is correct.
+            chunk_deduct: extra tokens to subtract from the mid-prefill
+                requests' remaining count. At batch-scheduling time the current
+                chunk has been planned but ``prefix_indices`` does not yet
+                include it, so callers pass the planned chunks' total length
+                here. At load-reporting time ``prefix_indices`` is already
+                up-to-date, so the default 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        for req in self.get_chunked_reqs():
+            num_pending_tokens += req.seqlen - len(req.prefix_indices)
+        # `chunk_deduct` covers the chunks already planned for this pass across
+        # all mid-prefill requests, so subtract it once.
+        num_pending_tokens -= chunk_deduct
         return num_pending_tokens
 
     def get_num_waiting_uncached_tokens(self) -> int:
@@ -89,8 +91,7 @@ class SchedulerLoadInquirer:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
-        cr = self.get_chunked_req()
-        if cr is not None:
+        for cr in self.get_chunked_reqs():
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
         return num_tokens
 

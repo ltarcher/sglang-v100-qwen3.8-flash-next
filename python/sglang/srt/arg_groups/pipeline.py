@@ -100,6 +100,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
+        validate_long_prefill_token_threshold,
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
@@ -285,6 +286,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Handle multi-item scoring constraints. Must run after the above so
     # the final attention backend and chunked_prefill_size are in effect.
     run_hook(handle_multi_item_scoring, server_args)
+    # Validate the per-request prefill ceiling after chunked_prefill_size is
+    # final (it requires chunked prefill to be enabled).
+    run_hook(validate_long_prefill_token_threshold, server_args)
 
     # Backend-dependent half of --prefill-only-disable-kv-cache validation.
     # Must stay after _handle_attention_backend_compatibility() (above) and

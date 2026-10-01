@@ -500,6 +500,22 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_long_prefill_token_threshold(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.long_prefill_token_threshold < 0:
+        raise ValueError(
+            "--long-prefill-token-threshold must be >= 0, got "
+            f"{cfg.long_prefill_token_threshold}."
+        )
+    if cfg.long_prefill_token_threshold > 0 and (
+        cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0
+    ):
+        raise ValueError(
+            "--long-prefill-token-threshold requires chunked prefill to be "
+            "enabled (chunked_prefill_size > 0)."
+        )
+
+
 def default_unset_prefill_decode_interval(server_args: Any):
     """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
     from sglang.srt.arg_groups.overrides import declare_resolution

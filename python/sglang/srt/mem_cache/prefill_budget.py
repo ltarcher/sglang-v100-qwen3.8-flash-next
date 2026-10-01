@@ -144,10 +144,26 @@ class PrefillBudget:
         extra_tokens: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
+        reserve_total_len: int | None = None,
+        reserve_max_new_tokens: int | None = None,
     ) -> None:
+        # Reserve-to-completion: a request left mid-prefill pins its computed
+        # KV and cannot be retracted, so its whole remaining prefill (plus
+        # decode headroom) is charged to the lifetime budget at admission --
+        # not chunk by chunk -- or later admissions can consume the headroom
+        # the request needs to finish and deadlock it. The current-pass budget
+        # still sees only this pass's chunk. Defaults keep the non-reserving
+        # callers byte-identical.
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        reserve_len = (
+            extend_input_len
+            if reserve_total_len is None
+            else self.ceil_paged_tokens(reserve_total_len)
+        )
+        if reserve_max_new_tokens is None:
+            reserve_max_new_tokens = max_new_tokens
         immediate = extend_input_len + self.page_size + extra_tokens
-        self.total_offset += immediate + max_new_tokens
+        self.total_offset += reserve_len + self.page_size + extra_tokens + reserve_max_new_tokens
         self.current_offset += immediate
 
 
@@ -288,13 +304,34 @@ class SWAPrefillBudget(PrefillBudget):
         extra_tokens: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
+        reserve_total_len: int | None = None,
+        reserve_max_new_tokens: int | None = None,
     ) -> None:
-        super().reserve(extend_input_len, max_new_tokens, extra_tokens=extra_tokens)
+        super().reserve(
+            extend_input_len,
+            max_new_tokens,
+            extra_tokens=extra_tokens,
+            reserve_total_len=reserve_total_len,
+            reserve_max_new_tokens=reserve_max_new_tokens,
+        )
         # A continuation already owns its ring slot.
         if not (self.req_ring and is_chunked_continuation):
+            # SWA is windowed: only the window stays locked between chunks, so
+            # charge the SWA partition the reserve-to-completion extent when
+            # one is given (the request must be able to finish), else the chunk.
+            swa_extend_len = (
+                extend_input_len
+                if reserve_total_len is None
+                else reserve_total_len
+            )
+            swa_max_new_tokens = (
+                max_new_tokens
+                if reserve_max_new_tokens is None
+                else reserve_max_new_tokens
+            )
             self.swa_offset += self.swa_tokens(
-                self.ceil_paged_tokens(extend_input_len),
-                max_new_tokens,
+                self.ceil_paged_tokens(swa_extend_len),
+                swa_max_new_tokens,
                 chunk_limit=chunk_limit,
             )
 

@@ -47,8 +47,13 @@ export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
 # dies. Pick the newest complete GCC <= 14. NVCC_PREPEND_FLAGS is needed
 # separately from CUDAHOSTCXX: the runtime JIT invokes a bare nvcc, which
 # reads the former and not the latter.
-for _v in 14 13 12; do
-  if [[ -x "/usr/bin/g++-$_v" ]] && ls /usr/libexec/gcc/*/$_v/cc1plus >/dev/null 2>&1; then
+# Prefer GCC 12 on this box: /usr/include/crt/host_config.h (system CUDA
+# headers) rejects > 12, so a g++-13 JIT compile dies mid-serve. Verified
+# combo = g++-12 (smoke_v100 passed with it). Note Debian moved cc1plus
+# between gcc versions: 12 lives under /usr/lib/gcc/*/, 13 under
+# /usr/libexec/gcc/*/ — check both.
+for _v in 12 13 14; do
+  if [[ -x "/usr/bin/g++-$_v" ]] && compgen -G "/usr/libexec/gcc/*/$_v/cc1plus" -G "/usr/lib/gcc/*/$_v/cc1plus" >/dev/null 2>&1; then
     export CC="/usr/bin/gcc-$_v" CXX="/usr/bin/g++-$_v" CUDAHOSTCXX="/usr/bin/g++-$_v"
     export NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-$_v"
     break
@@ -57,7 +62,9 @@ done
 export TORCH_CUDA_ARCH_LIST=7.0
 # V100 runtime env (same set as the README's Flash-Next commands)
 export FLASHINFER_DISABLE_VERSION_CHECK=1
-export NCCL_P2P_LEVEL=NVL
+# Honor a caller-provided level: this box is PCIe-only and the test launcher
+# pre-sets NCCL_P2P_LEVEL=PXB per the PCIe note below.
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
 export SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage
 # 4x V100 PCIe-only (no NVLink, P2P via one PLX): NCCL_P2P_LEVEL=PXB and
 # SGLANG_CUSTOM_AR_ALLOW_PCIE=1 (default off; one-shot push, 128 KiB cap).
@@ -149,7 +156,8 @@ args=(
   # left only ~2G free (thrash-prone); N=8 -> 64G total, ~60G+ headroom. Safe
   # ONLY with SGLANG_NUMA_BIND_V2=0 (host memory interleaves across both nodes;
   # with the default node1 membind this swap-stormed). Disk tier = catch-all.
-  --enable-hierarchical-cache
+  # (--enable-hierarchical-cache moved below: conditionally appended, see
+  # FLASH_NEXT_NO_HICACHE — this box cannot fit the host pools.)
   # Host-tier pool size is PER-RANK (GB): total = N * 2 pools (KV+Mamba) * 4
   # ranks * dp replicas. SGLang asserts the host pool > the device (GPU KV)
   # pool in TOKENS (memory_pool_host.py:254/:1302). The device KV pool is
@@ -188,7 +196,8 @@ args=(
   # comes from the SHARED disk tier (content-addressed, identical across
   # replicas, write_back since 2026-08-31), so the per-replica host mirror
   # stays thin.
-  --hicache-size "${FLASH_NEXT_HICACHE:-8}"
+  # (--hicache-size moved below: conditionally appended, see
+  # FLASH_NEXT_NO_HICACHE — this box cannot fit the host pools.)
   # Upstream flipped this default layer_first -> page_first (b5bcd76a4 /
   # #21631). Pinned explicitly so a future flip cannot move it silently --
   # but it must be page_first: MambaPoolHost accepts only page_first /
@@ -196,9 +205,8 @@ args=(
   # for a mamba model with the hierarchical cache at all.
   # NOTE: the --hicache-size 8 sizing above was measured under layer_first;
   # re-validate host-tier memory once this run is stable.
-  --hicache-mem-layout page_first
-  --hicache-storage-backend file
-  --hicache-write-policy write_back
+  # (--hicache-mem-layout / --hicache-storage-backend / --hicache-write-policy
+  # moved below: conditionally appended, see FLASH_NEXT_NO_HICACHE.)
   # Idle-sleep (2026-08-31): without this, each TP rank's scheduler loop
   # busy-spins at ~100% CPU when idle -- every idle iteration calls
   # check_hicache_events() -> drain_storage_control_queues(), which runs an
@@ -241,6 +249,24 @@ args=(
   # during create_weights.
   --ple-offload-embedding
 )
+
+# Hierarchical cache (host KV + host Mamba pools + disk tier): appended
+# conditionally. FLASH_NEXT_NO_HICACHE=1 drops the whole block — for boxes
+# whose host RAM cannot fit it. This box: ~115G available (4090 workload
+# resident), N=8 short 0.93 GB, N=7 STILL short 0.31 GB (2026-09-29 00:39 /
+# 01:31 MambaPoolHost ValueError). Matches the community 125G-RAM PCIe-only
+# box, which serves the same model without the host/disk tiers: the GPU
+# radix cache and --ple-offload-embedding stay.
+if [[ -z "${FLASH_NEXT_NO_HICACHE:-}" ]]; then
+  args+=(
+    --enable-hierarchical-cache
+    --hicache-size "${FLASH_NEXT_HICACHE:-8}"
+    --hicache-mem-layout page_first
+    --hicache-storage-backend file
+    --hicache-write-policy write_back
+  )
+fi
+
 if [[ "$MODE" == mtp ]]; then
   # Built-in MTP-3/4 loads the MTP module from the same checkpoint.
   args+=(

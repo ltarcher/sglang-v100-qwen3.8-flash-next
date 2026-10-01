@@ -236,7 +236,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
         self.assertEqual(req.inflight_middle_chunks, 0)
         self.assertEqual(req.output_ids, [])
         processor.output_streamer.stream_output.assert_called_once_with(
-            [req], False, req
+            [req], False, [req]
         )
 
 
