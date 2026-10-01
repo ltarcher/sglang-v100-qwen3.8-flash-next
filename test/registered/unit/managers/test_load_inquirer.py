@@ -48,7 +48,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             disaggregation_mode=DisaggregationMode.NULL,
             get_waiting_queue=lambda: [waiting_req],
             waiting_queue_prefix_matched=lambda: waiting_queue_prefix_matched,
-            get_chunked_req=lambda: chunked_req,
+            get_chunked_reqs=lambda: [chunked_req],
             get_recent_cache_hit_rate=lambda: 0.75,
         )
 
