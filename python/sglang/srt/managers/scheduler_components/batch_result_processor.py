@@ -793,8 +793,18 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        # The round events completed before copy_done, so the elapsed read is
+        # a host-side computation, not a device wait.
+        round_ms = None
+        if result.spec_round_events is not None:
+            start_ev, end_ev = result.spec_round_events
+            result.spec_round_events = None
+            end_ev.synchronize()
+            round_ms = start_ev.elapsed_time(end_ev)
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            round_ms=round_ms,
         )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):

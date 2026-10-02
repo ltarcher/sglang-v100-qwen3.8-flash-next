@@ -61,10 +61,14 @@ class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+    # Per-num_steps storage behind the two prealloc attributes; see
+    # _rebuild_topk1_chain_buffers for why the tensors must never be reallocated.
+    _topk1_chain_storage: dict[int, tuple[torch.Tensor, torch.Tensor]]
 
     def __init__(self) -> None:
         self._specialized_graph_memory_usage: dict[str, float] = {}
         self._specialized_graph_time_usage: dict[str, float] = {}
+        self._topk1_chain_storage = {}
 
     @abstractmethod
     def draft():
@@ -129,7 +133,6 @@ class EagleDraftWorkerBase(ABC):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
         decode_max_bs = (
             get_exec().graph.cuda_graph_config.decode.max_bs
             if get_exec().graph.cuda_graph_config is not None
@@ -143,12 +146,33 @@ class EagleDraftWorkerBase(ABC):
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0
-        self._topk1_parents_prealloc = torch.arange(
-            -1, parent_width - 1, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
-        self._topk1_score_indices_prealloc = torch.arange(
+        # draft_forward returns these buffers and the draft graph capture
+        # records them as graph outputs, so each width's captured graphs hold
+        # their data pointers forever. Rebinding to a fresh tensor on every
+        # rebuild orphans those pointers: the first replay after a switch then
+        # reads recycled memory as parent_list (invalid eagle tree, wedge).
+        # Allocate once per width and refill in place -- the values are a
+        # deterministic arange, so refills are no-ops by value.
+        cached = self._topk1_chain_storage.get(num_steps)
+        if cached is not None and cached[0].shape[0] >= max_bs:
+            parents, score_indices = cached
+        else:
+            parents = torch.empty(
+                (max_bs, parent_width), dtype=torch.long, device=self.device
+            )
+            score_indices = torch.empty(
+                (max_bs, num_steps), dtype=torch.long, device=self.device
+            )
+            self._topk1_chain_storage[num_steps] = (parents, score_indices)
+        if parent_width > 0:
+            parents[:, :parent_width] = torch.arange(
+                -1, parent_width - 1, dtype=torch.long, device=self.device
+            )
+        score_indices[:, :num_steps] = torch.arange(
             num_steps, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
+        )
+        self._topk1_parents_prealloc = parents
+        self._topk1_score_indices_prealloc = score_indices
 
 
 class BaseSpecWorker(ABC):
@@ -334,9 +358,15 @@ class BaseSpecWorker(ABC):
         return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        round_ms: float | None = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
+
+        ``round_ms`` is the decode round's measured GPU wall time when the
+        cost-aware adaptive policy is active, else None.
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.

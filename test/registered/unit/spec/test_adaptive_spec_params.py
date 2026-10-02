@@ -2,9 +2,15 @@ import json
 import tempfile
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.adaptive_spec_params import (
+    _PROBE_CT,
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
+    CostAwareSpeculativeParams,
+    CostAwareStepSlot,
+    _cost_shape,
+    make_adaptive_policy,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
@@ -419,6 +425,187 @@ class TestResolveCandidateSteps(CustomTestCase):
             f.flush()
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
+
+
+class TestCostAwareStepSlot(CustomTestCase):
+    """Cost-aware width policy: argmax(accept_length / round_ms) with probing.
+
+    EMAs are seeded directly so each case isolates one decision rule.
+    """
+
+    def _slot(self, candidates, initial_steps):
+        return CostAwareStepSlot(
+            initial_steps=initial_steps,
+            cfg={
+                "candidate_steps": candidates,
+                "warmup_batches": 0,
+                "update_interval": 1,
+            },
+        )
+
+    def _seed(self, slot, steps, cost_ms, accept_len, ct=1.0):
+        slot._cost_ms[steps] = cost_ms
+        slot._cost_ct[steps] = ct
+        slot._accept_len[steps] = accept_len
+        slot._accept_ct[steps] = ct
+
+    def test_switches_to_width_with_best_tokens_per_ms(self):
+        slot = self._slot([1, 5], initial_steps=1)
+        # Both widths measured past the probe threshold so the margin rule is
+        # what decides.
+        self._seed(slot, 1, cost_ms=10.0, accept_len=2.0, ct=10.0)  # score 0.20
+        self._seed(slot, 5, cost_ms=12.0, accept_len=3.0, ct=5.0)  # score 0.25
+
+        # Running width 1 at 10 ms for 2 tokens/round scores 0.20: width 5
+        # beats it beyond the margin, so the policy must move despite width 5
+        # costing more per round (the acceptance policy would not).
+        self.assertTrue(slot.update([1, 1, 1], round_ms=10.0))
+        self.assertEqual(slot.current_steps, 5)
+
+    def test_stays_when_better_width_is_within_margin(self):
+        slot = self._slot([1, 5], initial_steps=1)
+        self._seed(slot, 1, cost_ms=10.0, accept_len=2.0, ct=10.0)  # score 0.20
+        self._seed(slot, 5, cost_ms=9.8, accept_len=2.0, ct=5.0)  # score 0.2041
+
+        # Width 5 scores within the 3% margin over width 1 (0.20): the
+        # narrower verify stays, guarding the stickiness rule.
+        self.assertFalse(slot.update([1, 1, 1], round_ms=10.0))
+        self.assertEqual(slot.current_steps, 1)
+
+    def test_probes_unmeasured_width_the_prior_ranks_first(self):
+        slot = self._slot([1, 3], initial_steps=1)
+        # Measured width 1 is poor: 1.33 tokens at 20 ms scores 0.067. The
+        # unmeasured width-3 prior scores 2.4 / 34 = 0.071 and wins on paper.
+        # The sweep finishes measuring the incumbent first (_PROBE_CT rounds),
+        # then probes width 3: a guessed cost that never gets measured can
+        # never be refuted.
+        for _ in range(4):
+            slot.update([0, 1, 0], round_ms=20.0)
+        self.assertEqual(slot.current_steps, 3)
+
+    def test_cold_start_sweep_probes_losing_prior_width(self):
+        slot = self._slot([1, 5], initial_steps=1)
+        self._seed(slot, 1, cost_ms=10.0, accept_len=2.0, ct=10.0)  # score 0.20
+
+        # Width 5 is unmeasured and its PRIOR ranks it below the incumbent
+        # (3.8 over a shape-scaled 24.5 ms guess scores 0.155): the old
+        # rank-first-only probe never tried it. On GLM easy text its real
+        # accept crushed the prior (5.9 vs 3.8) and cost-aware stayed 6%
+        # slower than the acceptance policy for the whole workload -- so the
+        # sweep measures every candidate regardless of prior rank.
+        self.assertTrue(slot.update([1], round_ms=10.0))
+        self.assertEqual(slot.current_steps, 5)
+
+    def test_probe_finishes_before_abandoning(self):
+        slot = self._slot([1, 5], initial_steps=1)
+        self._seed(slot, 1, cost_ms=10.0, accept_len=2.0, ct=10.0)  # score 0.20
+
+        # Width 5 is mid-probe with one bad round (score 0.033): finish its
+        # _PROBE_CT rounds before argmax can send the slot elsewhere --
+        # abandoning a probe on the first sample makes decisions noise-driven.
+        self._seed(slot, 5, cost_ms=30.0, accept_len=1.0, ct=1.0)
+        slot.current_steps = 5
+        self.assertFalse(slot.update([0], round_ms=30.0))
+        self.assertEqual(slot.current_steps, 5)
+
+    def test_missing_round_time_never_fabricates_a_cost_sample(self):
+        slot = self._slot([1, 3], initial_steps=1)
+        switched = False
+        for _ in range(20):
+            switched |= slot.update([0, 1, 0], round_ms=None)
+
+        self.assertEqual(slot._cost_ms, {})
+        # Decisions still happen, driven by the shape prior.
+        self.assertTrue(switched)
+
+    def test_zero_step_scores_one_token_not_the_linear_prior(self):
+        slot = self._slot([0, 1], initial_steps=0)
+        # 1 + 0.7*(0-1) = 0.3 would make steps=0 look hopeless and forever
+        # unselectable; a no-draft round emits exactly one token.
+        self.assertEqual(slot._tokens(0), 1.0)
+
+    def test_cost_guess_scales_from_measured_widths_with_capped_weights(self):
+        slot = self._slot([1, 3, 5], initial_steps=1)
+        slot._cost_ms = {1: 20.0, 5: 24.5}
+        slot._cost_ct = {1: 25.0, 5: 1.0}
+
+        # Scaled to width 3: width-1 contributes 20*1.7 = 34 per round but is
+        # capped at weight 20, width-5 contributes 24.5*(1.7/2.45) = 17.
+        # (680 + 17) / 21 = 33.19; an uncapped weight would give 33.35.
+        self.assertAlmostEqual(slot._cost_ms_est(3), 33.19, places=2)
+
+
+class TestCostAwarePolicyWiring(CustomTestCase):
+    def test_factory_selects_policy_by_env(self):
+        with envs.SGLANG_ADAPTIVE_SPEC_COST_AWARE.override(False):
+            policy = make_adaptive_policy(initial_steps=3)
+        self.assertNotIsInstance(policy, CostAwareSpeculativeParams)
+
+        with envs.SGLANG_ADAPTIVE_SPEC_COST_AWARE.override(True):
+            policy = make_adaptive_policy(initial_steps=3)
+        self.assertIsInstance(policy, CostAwareSpeculativeParams)
+
+    def test_acceptance_policy_tolerates_round_ms_kwarg(self):
+        # The controller passes round_ms unconditionally; the acceptance
+        # policy must accept and ignore it.
+        params = AdaptiveSpeculativeParams(initial_steps=3)
+        self.assertIsNone(
+            params.on_verify_complete([2, 2], batch_size=1, round_ms=123.4)
+        )
+
+    def test_round_ms_reaches_the_routed_cost_slot(self):
+        params = CostAwareSpeculativeParams(initial_steps=3)
+        self.assertIsNone(params.on_verify_complete([2], batch_size=1, round_ms=42.0))
+        slot = params._route(1)
+        self.assertEqual(slot._cost_ms, {3: 42.0})
+        self.assertEqual(slot._accept_len, {3: 3.0})
+
+
+class TestCostAwareMeasurementAging(CustomTestCase):
+    """Aging semantics in isolation: the chooser is gated off (huge update
+    interval) so rounds only fold measurements and decay counts; a live
+    policy would re-probe the stale width mid-phase and break the setup.
+    """
+
+    def _slot(self):
+        return CostAwareStepSlot(
+            initial_steps=3,
+            cfg={
+                "candidate_steps": [1, 3, 5],
+                "warmup_batches": 0,
+                "update_interval": 10**9,
+            },
+        )
+
+    def _run(self, slot, steps, rounds, round_ms, accept):
+        slot.current_steps = steps
+        for _ in range(rounds):
+            slot.update([int(accept) - 1], round_ms)
+
+    def test_stale_width_reverts_to_prior(self):
+        slot = self._slot()
+        self._run(slot, 3, 60, 900.0, 4)  # ct_3 -> ~35, measured values
+        self._run(slot, 1, 200, 600.0, 2)  # width 3 idle: ct 35*0.98^200 < 1
+        self.assertNotIn(3, slot._cost_ms)
+        self.assertNotIn(3, slot._accept_len)
+        # Scoring falls back to the priors, not to the stale measurements.
+        self.assertEqual(slot._tokens(3), 1.0 + 0.7 * 2)
+        self.assertEqual(slot._cost_ms_est(3), _cost_shape(3) * 600.0 / _cost_shape(1))
+
+    def test_incumbent_never_loses_measurements(self):
+        slot = self._slot()
+        self._run(slot, 3, 400, 900.0, 4)
+        self.assertGreater(slot._cost_ct[3], 1.0)
+        self.assertEqual(slot._tokens(3), 4.0)
+
+    def test_decayed_width_reprobes_after_regime_shift(self):
+        slot = self._slot()
+        self._run(slot, 3, 60, 900.0, 4)
+        self._run(slot, 1, 150, 600.0, 2)  # enough idle that ct_3 drops low
+        # Decay below the probe count makes width 3 probe-eligible again,
+        # instead of being blocked by stale-low cost estimates forever.
+        self.assertLess(slot._cost_ct.get(3, 0.0), _PROBE_CT)
+        self.assertLess(slot._accept_ct.get(3, 0.0), _PROBE_CT)
 
 
 if __name__ == "__main__":

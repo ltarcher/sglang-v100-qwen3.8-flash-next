@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -56,10 +57,11 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
     cfg = resolving_view(server_args)
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    # NEXTN aliases to the EAGLE worker, so it takes the same adaptive path.
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "NEXTN"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/NEXTN are supported)"
         )
     if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (
@@ -261,6 +263,204 @@ class AdaptiveStepSlot:
         return False
 
 
+# Strata DraftPolicy constants (src/spec/draft_policy.cpp), minus the n-gram
+# lookup machinery this port does not carry.
+_COST_ALPHA = 0.1  # EMA weight of a new measured round time
+_TOK_ALPHA = 0.05  # EMA weight of a new measured accept_length
+_PROBE_CT = 3.0  # rounds a guessed width is tried before its data is trusted
+_MARGIN = 0.03  # a width switch must beat the incumbent by this much
+# Per-round decay of the measurement counts: a width the workload drifted
+# away from loses its measurements (and reverts to the prior) after roughly
+# 130 idle rounds, so a regime shift can be re-probed instead of being
+# blocked forever by stale-low estimates.
+_CT_DECAY = 0.98
+# Round cost by step count relative to steps=1, used only for widths never
+# measured yet (measured round times replace it). Strata's measured curve;
+# index 0 (steps=0, no drafting) is this port's guess.
+_COST_SHAPE = (0.9, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6)
+
+
+def _cost_shape(steps: int) -> float:
+    if steps < len(_COST_SHAPE):
+        return _COST_SHAPE[steps]
+    # Linear extension beyond the tabulated range.
+    return _COST_SHAPE[-1] + 0.35 * (steps - (len(_COST_SHAPE) - 1))
+
+
+class CostAwareStepSlot:
+    """Picks the draft width with the best tokens per millisecond, one BS slot.
+
+    Strata DraftPolicy semantics without the lookup window: per step count the
+    slot keeps EMAs of the measured verify-round wall time and of accept_length
+    (tokens per round, bonus included), and selects
+    argmax(accept_length / round_ms). Unmeasured widths are scored from the
+    shape prior, but every candidate is still measured for ``_PROBE_CT`` rounds
+    before argmax decides (cold-start sweep), so a mis-calibrated prior never
+    permanently hides a width. Measurement counts decay every round and a width
+    whose counts reach zero is wiped back to the prior, so workload shifts can
+    re-probe widths whose stale estimates would otherwise block their own
+    re-measurement.
+    """
+
+    def __init__(self, initial_steps: int, cfg: dict):
+        candidates = sorted(set(cfg["candidate_steps"]))
+        assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
+        self.candidate_steps = candidates
+
+        self.cost_alpha = cfg.get("cost_alpha", _COST_ALPHA)
+        self.tok_alpha = cfg.get("tok_alpha", _TOK_ALPHA)
+        self.margin = cfg.get("margin", _MARGIN)
+        self.ct_decay = cfg.get("ct_decay", _CT_DECAY)
+        self.update_interval = cfg.get("update_interval", 4)
+        self.warmup_batches = cfg.get("warmup_batches", 10)
+
+        if initial_steps in self.candidate_steps:
+            self.current_steps = initial_steps
+        else:
+            self.current_steps = self.candidate_steps[len(self.candidate_steps) // 2]
+
+        # Per-step EMAs; the *_ct sample counts are floats so the cost scaling
+        # can cap how much one width's run length outweighs another's.
+        self._cost_ms: dict[int, float] = {}
+        self._cost_ct: dict[int, float] = {}
+        self._accept_len: dict[int, float] = {}
+        self._accept_ct: dict[int, float] = {}
+        self._round_ct = 0
+
+    def update(
+        self, num_correct_drafts_per_req: list[int], round_ms: float | None
+    ) -> bool:
+        """Fold one verify round's outcome in. True if the width changed."""
+        if not num_correct_drafts_per_req:
+            return False
+
+        steps = self.current_steps
+        if round_ms is not None and round_ms > 0:
+            prev = self._cost_ms.get(steps)
+            self._cost_ms[steps] = (
+                round_ms
+                if prev is None
+                else (1 - self.cost_alpha) * prev + self.cost_alpha * round_ms
+            )
+            self._cost_ct[steps] = self._cost_ct.get(steps, 0.0) * self.ct_decay + 1.0
+
+        # accept_length (bonus included): mean over the batch's verified rows.
+        n = len(num_correct_drafts_per_req)
+        got = (sum(num_correct_drafts_per_req) + n) / n
+        prev_len = self._accept_len.get(steps)
+        self._accept_len[steps] = (
+            got
+            if prev_len is None
+            else (1 - self.tok_alpha) * prev_len + self.tok_alpha * got
+        )
+        # Fold the count with the decay already applied: the +1 offsets this
+        # round's decay, so a freshly probed width's first sample (ct == 1.0)
+        # survives the wipe threshold instead of being erased at birth.
+        self._accept_ct[steps] = self._accept_ct.get(steps, 0.0) * self.ct_decay + 1.0
+
+        self._round_ct += 1
+        self._age_measurements(keep=steps)
+        if self._round_ct <= self.warmup_batches:
+            return False
+        if (self._round_ct - self.warmup_batches) % self.update_interval != 0:
+            return False
+
+        target = self._choose()
+        if target != self.current_steps:
+            self.current_steps = target
+            log_info_on_rank0(
+                logger,
+                f"Cost-aware adaptive spec switched: steps -> {target} "
+                f"(cost_ms={self._cost_ms_est(target):.2f}, "
+                f"accept_len={self._tokens(target):.2f}, "
+                f"scores={self._format_scores()})",
+            )
+            return True
+        return False
+
+    def _choose(self) -> int:
+        scores = {
+            t: self._tokens(t) / self._cost_ms_est(t) for t in self.candidate_steps
+        }
+        current = self.current_steps
+        # Cold-start sweep: the accept prior can rank an unmeasured width
+        # below the incumbent forever even when its real score wins (GLM
+        # width 5 on easy text: prior accept 3.8 vs measured 5.9), so every
+        # candidate gets measured up to _PROBE_CT rounds before argmax
+        # decides. Finish the current width's probe first, then sweep the
+        # rest best-prior-first; measured rounds are the probe's whole cost.
+        need_probe = [
+            t for t in self.candidate_steps if self._accept_ct.get(t, 0.0) < _PROBE_CT
+        ]
+        if need_probe:
+            if current in need_probe:
+                return current
+            return max(need_probe, key=lambda t: scores[t])
+        best = max(scores, key=scores.get)
+        if best == current:
+            return current
+        # Stickiness: leaving the incumbent requires beating it by the margin.
+        if scores[best] > scores[current] * (1.0 + self.margin):
+            return best
+        return current
+
+    def _age_measurements(self, keep: int) -> None:
+        """Decay every width's measurement counts; wipe the fully stale ones.
+
+        The width measured this round is exempt (its fold already applied the
+        decay), so the incumbent sits at the 1/(1-decay) equilibrium and is
+        never wiped, while an idle width's count decays toward the threshold.
+        """
+        decay = self.ct_decay
+        for steps in list(self._cost_ct):
+            if steps == keep:
+                continue
+            ct = self._cost_ct[steps] * decay
+            if ct < 1.0:
+                del self._cost_ct[steps]
+                del self._cost_ms[steps]
+            else:
+                self._cost_ct[steps] = ct
+        for steps in list(self._accept_ct):
+            if steps == keep:
+                continue
+            ct = self._accept_ct[steps] * decay
+            if ct < 1.0:
+                del self._accept_ct[steps]
+                del self._accept_len[steps]
+            else:
+                self._accept_ct[steps] = ct
+
+    def _tokens(self, steps: int) -> float:
+        if self._accept_ct.get(steps, 0.0) > 0:
+            return self._accept_len[steps]
+        if steps == 0:
+            return 1.0  # no drafts: every round emits exactly the root
+        # Before any round at this width: a typical acceptance.
+        return 1.0 + 0.7 * (steps - 1)
+
+    def _cost_ms_est(self, steps: int) -> float:
+        if self._cost_ct.get(steps, 0.0) > 0:
+            return self._cost_ms[steps]
+        # Scale from the measured widths, each weighted by how often it ran
+        # (capped so one width's long run cannot dominate the estimate).
+        num = den = 0.0
+        for other, ct in self._cost_ct.items():
+            if ct > 0:
+                w = min(ct, 20.0)
+                num += (
+                    w * self._cost_ms[other] * _cost_shape(steps) / _cost_shape(other)
+                )
+                den += w
+        return num / den if den > 0 else _cost_shape(steps)
+
+    def _format_scores(self) -> str:
+        return ",".join(
+            f"{t}:{self._tokens(t) / self._cost_ms_est(t):.3f}"
+            for t in self.candidate_steps
+        )
+
+
 class AdaptiveSpeculativeParams:
     """Routes ``batch_size`` to the correct per-BS slot.
 
@@ -278,7 +478,7 @@ class AdaptiveSpeculativeParams:
         self._cuda_graph_bs: list[int] | None = None
 
         for bs, entry in sorted(bs_entries.items()):
-            self._slots[bs] = AdaptiveStepSlot(
+            self._slots[bs] = self._make_slot(
                 initial_steps=initial_steps,
                 cfg={**cfg, **entry},
             )
@@ -296,6 +496,9 @@ class AdaptiveSpeculativeParams:
         """Union of all BS slots' candidate steps."""
         return sorted({s for p in self._slots.values() for s in p.candidate_steps})
 
+    def _make_slot(self, initial_steps: int, cfg: dict) -> AdaptiveStepSlot:
+        return AdaptiveStepSlot(initial_steps=initial_steps, cfg=cfg)
+
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
 
@@ -303,9 +506,15 @@ class AdaptiveSpeculativeParams:
         return self._route(batch_size).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        round_ms: float | None = None,
     ) -> int | None:
         """Feed verify results to the matching BS slot's EMA.
+
+        ``round_ms`` is the verify round's measured wall time; the
+        acceptance-driven policy ignores it, the cost-aware one consumes it.
 
         Returns the new step if a switch is warranted, else ``None``.
         """
@@ -345,3 +554,38 @@ class AdaptiveSpeculativeParams:
     def _find_closest_bs(self, target: int) -> int:
         idx = bisect.bisect_right(self._bs_list, target) - 1
         return self._bs_list[max(0, idx)]
+
+
+class CostAwareSpeculativeParams(AdaptiveSpeculativeParams):
+    """BS routing of the base class with the cost-aware width policy.
+
+    Selected by ``SGLANG_ADAPTIVE_SPEC_COST_AWARE``; see
+    :class:`CostAwareStepSlot` for the objective.
+    """
+
+    def _make_slot(self, initial_steps: int, cfg: dict) -> CostAwareStepSlot:
+        return CostAwareStepSlot(initial_steps=initial_steps, cfg=cfg)
+
+    def on_verify_complete(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        round_ms: float | None = None,
+    ) -> int | None:
+        params = self._route(batch_size)
+        if params.update(num_correct_drafts_per_req, round_ms):
+            return params.current_steps
+        return None
+
+
+def make_adaptive_policy(
+    initial_steps: int,
+    cfg_path: str | None = None,
+) -> AdaptiveSpeculativeParams:
+    """Build the adaptive policy: cost-aware when SGLANG_ADAPTIVE_SPEC_COST_AWARE."""
+    cls = (
+        CostAwareSpeculativeParams
+        if envs.SGLANG_ADAPTIVE_SPEC_COST_AWARE.get()
+        else AdaptiveSpeculativeParams
+    )
+    return cls(initial_steps=initial_steps, cfg_path=cfg_path)

@@ -60,7 +60,10 @@ class AdaptiveSpecPolicy(Protocol):
     def get_steps_for_batch(self, batch_size: int) -> int: ...
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        round_ms: float | None = None,
     ) -> int | None: ...
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
@@ -125,11 +128,14 @@ class AdaptiveController:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        round_ms: float | None = None,
     ) -> None:
         """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
+            num_correct_drafts_per_req, batch_size, round_ms=round_ms
         )
         if new_step is not None:
             self._activate(new_step)
