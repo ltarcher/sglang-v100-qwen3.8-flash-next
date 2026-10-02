@@ -416,6 +416,25 @@ def handle_model_specific_adjustments(server_args: Any):
 
             run_post_process_pass(server_args, _deepseek_spec_moe_resolution)
 
+        if model_arch == "Glm5NextForConditionalGeneration" and (
+            get_platform().is_sm70
+        ):
+            # GLM-5.3 shares DeepSeek V4.1's mHC hyper-connections. The
+            # TileLang mhc_pre/mhc_post kernels are bf16-only (asserted), so
+            # Volta's fp16 path must use the torch implementation -- same
+            # defaults the V4 arm sets below, which GLM used to miss (it only
+            # worked when the env was hand-set at launch). The torch
+            # fallback's Sinkhorn section routes to the sm70 JIT kernel
+            # (SGLANG_SM70_MHC_SINKHORN_JIT, default on).
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+            logger.info(
+                "SM70 GLM: torch mHC fallback enabled "
+                "(SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=0)"
+            )
+
     elif model_arch in [
         "DeepseekV4ForCausalLM",
     ]:

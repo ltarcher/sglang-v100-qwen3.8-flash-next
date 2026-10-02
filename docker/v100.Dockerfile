@@ -157,6 +157,8 @@ COPY patches/marlin-v100-qwen-sm70-tuning.patch \
       /opt/sglang/patches/marlin-v100-qwen-sm70-tuning.patch
 COPY patches/marlin-v100-qwen38-nvfp4-tuning.patch \
       /opt/sglang/patches/marlin-v100-qwen38-nvfp4-tuning.patch
+COPY patches/marlin-v100-u2-experts.patch \
+      /opt/sglang/patches/marlin-v100-u2-experts.patch
 RUN --mount=type=cache,target=/opt/deps/marlin-v100,sharing=locked \
     export CUTLASS_DIR=/opt/cutlass \
     && export MARLIN_V100_REPO=/opt/deps/marlin-v100 \

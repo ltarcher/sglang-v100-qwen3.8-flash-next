@@ -1206,6 +1206,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         # reads it from this wrapper.
         return getattr(self.full_attn_backend, "kv_cache_dtype", None)
 
+    @property
+    def supports_dsa_indexer(self) -> bool:
+        # The DSA indexer lives on the full-attention child; a dense child
+        # (triton on sm70) cannot publish an MTP seed.
+        return getattr(self.full_attn_backend, "supports_dsa_indexer", True)
+
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:

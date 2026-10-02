@@ -83,6 +83,12 @@ class GenerationBatchResult:
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1
 
+    # Cost-aware adaptive spec: (start, end) CUDA events bracketing the decode
+    # round's GPU work on the forward stream. Recorded by the worker when the
+    # policy is on; the scheduler reads the elapsed time after copy_done (which
+    # completes after these on the same stream) and feeds it to the policy.
+    spec_round_events: Optional[tuple] = None
+
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
     # lazily in _resolve_spec_v2_tokens — and the latter consumes

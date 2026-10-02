@@ -290,3 +290,4 @@ internal-docs/
 # results, planning notes. Not source -- the tools and tests this work produces
 # are committed on their own, under benchmark/ and test/.
 .workbench/
+kernels/prebuilt/

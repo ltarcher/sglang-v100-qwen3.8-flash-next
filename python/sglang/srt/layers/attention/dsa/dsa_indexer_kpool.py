@@ -22,7 +22,9 @@ from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 if is_cuda():
     try:
         import deep_gemm
-    except ImportError as e:
+    except Exception as e:
+        # not just ImportError: the C extension can fail to load at runtime
+        # (e.g. a CUDA-13-built libdeep_gemm on a CUDA-12 stack, as on Volta)
         deep_gemm = e
 
 if is_npu():
@@ -115,7 +117,15 @@ class IndexerKPool(MultiPlatformOp):
             self.compress_gate_stream = torch.cuda.Stream()
 
         if is_cuda():
-            self.sm_count = deep_gemm.get_num_sms()
+            if isinstance(deep_gemm, Exception):
+                # deep_gemm unavailable (Volta: the shipped wheel targets
+                # CUDA 13). Only the fp8 deep_gemm dispatch paths read these;
+                # fill in the real device counts so heuristics stay sane.
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(

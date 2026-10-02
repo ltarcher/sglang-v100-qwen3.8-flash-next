@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -67,7 +68,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.speculative.adaptive_spec_params import make_adaptive_policy
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import (
     DraftBackendFactory,
@@ -434,6 +435,47 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
+    def _draft_backend_supports_dsa_indexer(self) -> bool:
+        """Whether the draft can run the DSA indexer at all.
+
+        get_indexer_metadata returning None is the backend contract for "no
+        indexer": the sm70 triton stack computes dense attention there and has
+        no top-k to publish, so an MTP seed request could never be served.
+        Composite wrappers (HybridLinearAttnBackend, TritonMultiStepDraftBackend)
+        are unwrapped to their full-attention child for the check.
+        """
+        backend = (
+            getattr(self.draft_runner, "attn_backend", None)
+            or getattr(self, "draft_attn_backend", None)
+            or getattr(self, "draft_extend_attn_backend", None)
+        )
+        for _ in range(4):
+            if backend is None:
+                return True
+            cap = getattr(backend, "supports_dsa_indexer", None)
+            if cap is not None:
+                return bool(cap)
+            child = getattr(backend, "full_attn_backend", None)
+            if child is None:
+                children = getattr(backend, "attn_backends", None)
+                child = children[0] if children else None
+            backend = child
+        return True
+
+    def _gate_dsa_index_share_on_backend(self) -> None:
+        if not self.index_share_for_mtp_iteration:
+            return
+        if self._draft_backend_supports_dsa_indexer():
+            return
+        logger.info(
+            "DSA IndexShare/MTP seed disabled: the draft attention stack "
+            "cannot run the DSA indexer (dense attention needs no shared "
+            "sparse selection)."
+        )
+        self.index_share_for_mtp_iteration = False
+        self.dsa_seed_topk_width = None
+        self.seed_dsa_topk_from_draft_extend = False
+
     def init_token_map(self):
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -541,6 +583,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
+        # The capability is only decidable now that the backends exist; this
+        # still precedes _capture_cuda_graphs and every seed consumer.
+        self._gate_dsa_index_share_on_backend()
         if (
             _is_cuda
             and torch.cuda.get_device_capability() == (7, 0)
@@ -1378,14 +1423,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+        self._cost_timing_enabled = False
         if get_spec().speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
-                AdaptiveSpeculativeParams(
+                make_adaptive_policy(
                     initial_steps=self.speculative_num_steps,
                     cfg_path=get_spec().speculative_adaptive_config,
                 ),
             )
+            # One CUDA event pair per decode round feeds the cost EMAs.
+            self._cost_timing_enabled = envs.SGLANG_ADAPTIVE_SPEC_COST_AWARE.get()
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -1496,6 +1544,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
+            round_events = None
+            if self._cost_timing_enabled and not batch.forward_mode.is_idle():
+                round_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                round_events[0].record()
+
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -1599,6 +1655,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_parent_list = parent_list.clone()
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
+            if round_events is not None:
+                round_events[1].record()
+                batch_output.spec_round_events = round_events
+
             return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -1687,11 +1747,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        round_ms: float | None = None,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req, batch_size=batch_size, round_ms=round_ms
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:

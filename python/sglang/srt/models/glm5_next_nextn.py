@@ -52,12 +52,64 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             return None
         return super()._resolve_nextn_quant_config(config, quant_config)
 
-    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        super().__init__(
-            getattr(config, "text_config", config),
-            quant_config=quant_config,
-            prefix=prefix,
+    @staticmethod
+    def _checkpoint_quant_layout(config):
+        """Return (nextn_quant_in_checkpoint, lm_head_ignored) for a mixed
+        ModelOpt FP4 checkpoint. GLM-5.3 NVFP4 quantizes the NextN block's
+        routed experts and leaves everything else (attn projs, gate, shared
+        experts, eh_proj, lm_head, embeddings) in BF16 via
+        quantization_config.ignore -- the ignore list carries NO entry for
+        the NextN layer itself, unlike checkpoints whose NextN block is BF16.
+        """
+        raw = getattr(config, "quantization_config", None) or {}
+        if hasattr(raw, "to_dict"):
+            raw = raw.to_dict()
+        ignored = raw.get("ignore", []) if isinstance(raw, dict) else []
+        nextn_ignored = (
+            f"model.layers.{config.num_hidden_layers}.*" in ignored
+            or f"model.language_model.layers.{config.num_hidden_layers}.*" in ignored
         )
+        head_ignored = any(
+            isinstance(p, str) and p.endswith("lm_head") for p in ignored
+        )
+        return (not nextn_ignored, head_ignored)
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        text_config = getattr(config, "text_config", config)
+        # Keep the draft's routed experts fully GPU-resident: the process-wide
+        # spill env would shrink this single-layer MoE to the target plan's
+        # kept-slot count while the draft forward has no spill remap, sending
+        # Marlin past the shrunk weight tensor (illegal memory access at the
+        # first draft decode capture).
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            exempt_fused_moe_from_spill,
+        )
+
+        _spill_exempt = exempt_fused_moe_from_spill()
+        if (
+            quant_config is not None
+            and getattr(quant_config, "get_name", lambda: None)() == "modelopt_fp4"
+        ):
+            nextn_quant_in_ckpt, head_ignored = self._checkpoint_quant_layout(
+                text_config
+            )
+            if nextn_quant_in_ckpt:
+                # DeepseekModelNextN would otherwise strip the quant config
+                # and build BF16 modules that cannot take NVFP4 weights.
+                logger.info(
+                    "GLM5 NextN: checkpoint quantizes the NextN block; "
+                    "keeping NVFP4 draft quantization."
+                )
+                text_config.nextn_quant_in_checkpoint = True
+            if head_ignored:
+                # set_embed_and_head installs the target's BF16 head tensor.
+                text_config.nextn_head_shares_target_bf16 = True
+        with _spill_exempt:
+            super().__init__(
+                text_config,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
 
     def load_weights(self, weights):
         if not hasattr(self, "fuse_qkv_a_proj"):

@@ -2321,18 +2321,32 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.is_sm70 = _is_sm70()
         self.use_sm70_marlin = False
+        self.sm70_u2_pool = False
         if self.is_sm70:
             from sglang.srt.layers.quantization.marlin_utils import (
                 _sm70_marlin_v100_available,
             )
+            from sglang.srt.layers.quantization.sm70_u2_pool import (
+                sm70_u2_expert_pool_enabled,
+            )
 
-            self.use_sm70_marlin = _sm70_marlin_v100_available()
+            self.use_sm70_marlin = _sm70_marlin_v100_available() and not envs.SGLANG_SM70_DISABLE_MARLIN_MOE.get()
             if not self.use_sm70_marlin:
                 logger.warning_once(
                     "SM70 ModelOpt NVFP4: marlin_v100 is unavailable; falling "
                     "back to the much slower Triton W4A16 path. Run "
                     "scripts/setup_v100_marlin.sh to install it."
                 )
+            # GLM-5.3 P4: requantize the routed experts to u2b2 at weight-load
+            # ingest and keep the full pool resident (no spill, no page-in).
+            # Requires the Marlin kernel: uint2b2 only exists there.
+            if sm70_u2_expert_pool_enabled() and not self.use_sm70_marlin:
+                raise ValueError(
+                    "SGLANG_SM70_U2_EXPERT_POOL=1 requires the SM70 Marlin "
+                    "MoE kernel; run scripts/setup_v100_marlin.sh or unset "
+                    "SGLANG_SM70_DISABLE_MARLIN_MOE."
+                )
+            self.sm70_u2_pool = sm70_u2_expert_pool_enabled()
         # Both the specialized decode kernel and its Marlin fallback allocate
         # a separate output. Shared experts may safely read the same input on
         # another stream; the Triton fallback can still overwrite its input.
@@ -2434,13 +2448,40 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
+        # num_experts is the caller's GPU expert-dim length. Without expert
+        # spill it equals num_local_experts; with the DSV4.1-style spill plan
+        # it is kept_routed + shared, and cold experts are routed to pinned
+        # host rows by the FusedMoE weight loader. Allocating the full
+        # num_local_experts here would silently undo the create-time shrink
+        # and trip the LRU's already-shrunk check.
+        alloc_experts = num_experts
+
+        # GLM-5.3 P4 (u2b2 resident pool): stage the checkpoint tensors at
+        # their normal NVFP4 shapes in disk-backed memmaps -- ~43 GB/rank of
+        # anonymous host RAM would OOM the shared 125 GB box, and VRAM cannot
+        # hold the full NVFP4 pool even transiently. The weight loader fills
+        # the staging rows unchanged; process_weights_after_loading
+        # requantizes them into the GPU u2 pool and frees the file
+        # (sm70_u2_pool.py).
+        if self.sm70_u2_pool:
+            from sglang.srt.layers.quantization.sm70_u2_pool import alloc_u2_staging
+        else:
+            alloc_u2_staging = None
+
+        def _u2_stage(shape, dtype):
+            if alloc_u2_staging is None:
+                return torch.empty(*shape, dtype=dtype)
+            return alloc_u2_staging(layer, shape, dtype)
+
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                num_shards * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
-                hidden_size // 2,
-                dtype=weight_dtype,
+            data=_u2_stage(
+                (
+                    alloc_experts,
+                    num_shards * intermediate_size_per_partition,
+                    # 2 fp4 items are packed in the input dimension
+                    hidden_size // 2,
+                ),
+                weight_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -2450,12 +2491,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 2
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                hidden_size,
-                # 2 fp4 items are packed in the input dimension
-                intermediate_size_per_partition // 2,
-                dtype=weight_dtype,
+            data=_u2_stage(
+                (
+                    alloc_experts,
+                    hidden_size,
+                    # 2 fp4 items are packed in the input dimension
+                    intermediate_size_per_partition // 2,
+                ),
+                weight_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -2464,11 +2507,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                num_shards * intermediate_size_per_partition,
-                hidden_size // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
+            data=_u2_stage(
+                (
+                    alloc_experts,
+                    num_shards * intermediate_size_per_partition,
+                    hidden_size // self.quant_config.group_size,
+                ),
+                weight_scale_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -2482,6 +2527,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
+            or self.sm70_u2_pool
         ):
             layer.w13_blockscale_swizzled = None
         else:
@@ -2490,11 +2536,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                hidden_size,
-                intermediate_size_per_partition // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
+            data=_u2_stage(
+                (
+                    alloc_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.quant_config.group_size,
+                ),
+                weight_scale_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -2505,6 +2553,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
+            or self.sm70_u2_pool
         ):
             layer.w2_blockscale_swizzled = None
         else:
@@ -2519,9 +2568,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w13_weight_scale_shape = (
-            (layer.num_local_experts, 2)
+            (alloc_experts, 2)
             if layer.moe_runner_config.is_gated
-            else (layer.num_local_experts,)
+            else (alloc_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
@@ -2530,7 +2579,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(alloc_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -2560,8 +2609,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online installs per-token activation scales after loading;
         # per-tensor paths default to 1.0 here.
         input_scale_fill = 1.0 if not is_nvfp4_online else None
+        # Same expert-dim shrink as the block scales above: the activation
+        # scales feed _compute_gemm1_alphas against w*_weight_scale_2, so a
+        # full num_experts allocation would fail to broadcast once the spill
+        # plan shrinks the GPU tensors.
         w13_input_scale = _make_per_tensor_scale_parameter(
-            (layer.num_experts, num_shards),
+            (alloc_experts, num_shards),
             weight_loader=weight_loader,
             fill_value=input_scale_fill,
         )
@@ -2569,7 +2622,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = _make_per_tensor_scale_parameter(
-            (layer.num_experts,),
+            (alloc_experts,),
             weight_loader=weight_loader,
             fill_value=input_scale_fill,
         )
@@ -2628,6 +2681,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale.data = l2_pair[1]
         layer._mega_moe_nvfp4 = True
         layer._mega_moe_weights_built = True
+
+    def manages_post_load_residency(self) -> bool:
+        # SM70 u2 full-pool mode stages the expert slots on CPU memmaps and
+        # repacks them chunk-by-chunk in place. The generic device-staging
+        # scope would re-home every rebinding through a pinned host copy on
+        # the way back to its CPU origin, which this platform accounts as
+        # unevictable shmem (~19 GiB cached per rank across 42 layers).
+        return self.sm70_u2_pool
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
@@ -2859,15 +2920,72 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # Weight processing based on strategy
         if self.is_sm70:
-            # Both SM70 paths consume the checkpoint's per-expert tensor
-            # scales directly. ModelOpt emits matching gate/up scales for a
-            # fused W13 tensor; process_weights_after_loading validated this
-            # above and selected the gate scale.
+            if self.sm70_u2_pool:
+                # GLM-5.3 P4: requantize the host-staged NVFP4 experts into
+                # the resident u2b2 pool and rebind the layer parameters;
+                # the u4 paths below never run in this mode.
+                from sglang.srt.layers.quantization.sm70_u2_pool import (
+                    convert_moe_layer_to_u2,
+                )
+
+                convert_moe_layer_to_u2(layer)
+                return
+
+            # Both SM70 paths (marlin_v100 alpha, Triton w13_scale2) apply a
+            # single per-expert scalar to the whole fused W13 GEMM output, so
+            # the gate/up global scales must be unified. Qwen3.8-family
+            # checkpoints quantize a fused W13 and share the scale; GLM-5.3-
+            # Flash quantizes gate and up separately (they differ on most
+            # experts, up to ~2x). Fold each half's E4M3 block scales by its
+            # own ratio to the larger of the two scalars. Folding DOWN is not
+            # optional: float8_e4m3fn has no inf, so an overflowing cast
+            # produces NaN -- folding up by up_scale2/gate_scale2 (>1) NaNed
+            # every amax-adjacent block scale that sat near 448 (observed on
+            # real GLM experts with ratios of 1.03-1.18, and those NaN scales
+            # then zero-shot into NaN MoE outputs whenever the expert routed).
+            # The E4M3 re-rounding adds ~2% RMS against the ~5% fp4 noise
+            # floor.
             if (
                 layer.moe_runner_config.is_gated
                 and layer.w13_weight_scale_2.dim() == 2
+                and layer.w13_weight_scale_2.shape[1] >= 2
             ):
-                w13_scale2 = layer.w13_weight_scale_2[:, 0].to(torch.float32)
+                gate_scale2 = layer.w13_weight_scale_2[:, 0].to(torch.float32)
+                up_scale2 = layer.w13_weight_scale_2[:, 1].to(torch.float32)
+                if not torch.allclose(gate_scale2, up_scale2):
+                    s2_eff = torch.maximum(gate_scale2, up_scale2)
+                    scales = layer.w13_weight_scale.data
+                    half = scales.shape[1] // 2
+                    gate_ratio = (gate_scale2 / s2_eff).view(-1, 1, 1).to(
+                        scales.device
+                    )
+                    up_ratio = (up_scale2 / s2_eff).view(-1, 1, 1).to(scales.device)
+                    # clamp is belt-and-braces: both ratios are <= 1, so the
+                    # products cannot exceed the source scales' 448 ceiling.
+                    folded_gate = (
+                        (scales[:, :half, :].float() * gate_ratio)
+                        .clamp_(max=448.0)
+                        .to(scales.dtype)
+                    )
+                    folded_up = (
+                        (scales[:, half:, :].float() * up_ratio)
+                        .clamp_(max=448.0)
+                        .to(scales.dtype)
+                    )
+                    copy_or_rebind_param(
+                        layer,
+                        "w13_weight_scale",
+                        torch.cat([folded_gate, folded_up], dim=1),
+                    )
+                    logger.warning_once(
+                        "SM70 NVFP4 MoE: gate/up weight_scale_2 differ (max rel "
+                        "%.1e); folded both halves' block scales to "
+                        "max(gate,up) weight_scale_2.",
+                        (up_scale2 / gate_scale2 - 1).abs().max().item(),
+                    )
+                    w13_scale2 = s2_eff
+                else:
+                    w13_scale2 = gate_scale2
             else:
                 w13_scale2 = layer.w13_weight_scale_2.to(torch.float32)
             w13_scale2 = w13_scale2.contiguous().reshape(-1)
@@ -3224,6 +3342,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if self.is_sm70:
+            if self.sm70_u2_pool:
+                from sglang.srt.layers.moe.moe_runner.marlin import (
+                    MarlinMoeQuantInfo,
+                )
+
+                # u2b2 resident pool: the conversion folded weight_scale_2
+                # into the requantized group scales, so there is no per-expert
+                # global scale; and the spill LRU never exists in this mode,
+                # so plain TP indexing applies.
+                quant_info = MarlinMoeQuantInfo(
+                    w13_qweight=layer.w13_weight,
+                    w2_qweight=layer.w2_weight,
+                    w13_scales=layer.w13_weight_scale,
+                    w2_scales=layer.w2_weight_scale,
+                    w13_g_idx_sort_indices=None,
+                    w2_g_idx_sort_indices=None,
+                    weight_bits=2,
+                    is_expert_parallel=False,
+                )
+                return self.runner.run(dispatch_output, quant_info)
+
             # SM70 (V100): weights/scales were prepared by the SM70 branch of
             # process_weights_after_loading, not by the upstream SM80+ marlin
             # prep, so build the quant info here rather than going through
@@ -3243,8 +3382,48 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     weight_bits=4,
                     w13_global_scale=layer.w13_scale2,
                     w2_global_scale=layer.w2_scale2,
+                    # Spilled routes run as -1 (main run: skipped slots;
+                    # landing run: kept slots). Marlin must skip those blocks
+                    # instead of reading expert row -1 out of bounds.
+                    is_expert_parallel=(
+                        getattr(layer, "_dsv41_expert_lru", None) is not None
+                    ),
                 )
-                return self.runner.run(dispatch_output, quant_info)
+                runner_output = self.runner.run(dispatch_output, quant_info)
+                hs = runner_output.hidden_states
+                # Expert-spill join (same contract as the MXFP4 Marlin MoE):
+                # D4-H adds the host-GEMV partial, D4-G runs the just-paged
+                # landing rows through the same runner with physical ids.
+                # Always join when a request ran so CUDA graph capture cannot
+                # skip it via a host-side occupancy check.
+                if getattr(layer, "_dsv41_host_gemv_pending", False):
+                    from sglang.srt.layers.moe.dsv41_expert_spill import (
+                        spill_join_host_gemv,
+                    )
+
+                    spill_join_host_gemv(layer, hs)
+                else:
+                    land_ids = getattr(layer, "_dsv41_land_ids", None)
+                    pool = getattr(layer, "_dsv41_landing_pool", None)
+                    if (
+                        land_ids is not None
+                        and pool is not None
+                        and pool.quant_info is not None
+                    ):
+                        land_topk = dispatch_output.topk_output._replace(
+                            topk_ids=land_ids
+                        )
+                        land_out = self.runner.run(
+                            dispatch_output._replace(topk_output=land_topk),
+                            quant_info=pool.quant_info,
+                        )
+                        # Sum the split partials in fp32: each partial was
+                        # already rounded to fp16, and a second fp16 add would
+                        # stack avoidable ulp noise on decode ties.
+                        hs = (hs.float() + land_out.hidden_states.float()).to(
+                            hs.dtype
+                        )
+                return runner_output._replace(hidden_states=hs)
 
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -3407,3 +3586,132 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             f"Unsupported moe_runner_backend for NVFP4 MoE: {moe_runner_backend}. "
             "Use --moe-runner-backend flashinfer_cutlass instead."
         )
+
+
+def prepare_moe_nvfp4_layer_for_sm70_marlin(
+    layer: torch.nn.Module, activation_dtype: torch.dtype = torch.float16
+) -> None:
+    """Checkpoint-layout NVFP4 MoE -> SM70 Marlin, CPU host rows included.
+
+    Mirror of the is_sm70/use_sm70_marlin branch of
+    ModelOptNvFp4FusedMoEMethod.process_weights_after_loading, used by the
+    DSV4.1 expert-spill machinery to repack the pinned host mirror so the LRU
+    row swaps exchange Marlin-consumable bytes with the GPU-resident experts.
+    The per-expert GPTQ repack kernel is CUDA-only, so host rows stream one
+    expert at a time through the GPU and copy back (same pattern as the MXFP4
+    host pack in marlin_utils_fp4). Scale/global-scale encoding is pure torch
+    and runs on CPU.
+    """
+    w13_weight = layer.w13_weight.data
+    w2_weight = layer.w2_weight.data
+    w13_weight_scale = layer.w13_weight_scale.data
+    w2_weight_scale = layer.w2_weight_scale.data
+    if w13_weight_scale.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "prepare_moe_nvfp4_layer_for_sm70_marlin expects raw E4M3 checkpoint "
+            f"scales, got {w13_weight_scale.dtype} (already repacked?)"
+        )
+
+    # ---- fold-down gate/up weight_scale_2 (see the SM70 branch for the
+    # overflow rationale; identical math, host side).
+    moe_runner_config = getattr(layer, "moe_runner_config", None)
+    is_gated = getattr(moe_runner_config, "is_gated", True)
+    activation_dtype = getattr(layer, "orig_dtype", activation_dtype)
+    if (
+        is_gated
+        and layer.w13_weight_scale_2.dim() == 2
+        and layer.w13_weight_scale_2.shape[1] >= 2
+    ):
+        gate_scale2 = layer.w13_weight_scale_2[:, 0].to(torch.float32)
+        up_scale2 = layer.w13_weight_scale_2[:, 1].to(torch.float32)
+    else:
+        flat = layer.w13_weight_scale_2.to(torch.float32).reshape(-1)
+        gate_scale2 = up_scale2 = flat
+    if torch.allclose(gate_scale2, up_scale2):
+        w13_scale2 = gate_scale2
+        w13_weight_scale_folded = w13_weight_scale
+    else:
+        s2_eff = torch.maximum(gate_scale2, up_scale2)
+        half = w13_weight_scale.shape[1] // 2
+        gate_ratio = (gate_scale2 / s2_eff).view(-1, 1, 1).to(
+            w13_weight_scale.device
+        )
+        up_ratio = (up_scale2 / s2_eff).view(-1, 1, 1).to(w13_weight_scale.device)
+        # clamp is belt-and-braces: both ratios are <= 1, so the products
+        # cannot exceed the source scales' 448 ceiling.
+        folded_gate = (
+            (w13_weight_scale[:, :half, :].float() * gate_ratio)
+            .clamp_(max=448.0)
+            .to(w13_weight_scale.dtype)
+        )
+        folded_up = (
+            (w13_weight_scale[:, half:, :].float() * up_ratio)
+            .clamp_(max=448.0)
+            .to(w13_weight_scale.dtype)
+        )
+        w13_weight_scale_folded = torch.cat([folded_gate, folded_up], dim=1)
+        w13_scale2 = s2_eff
+    w13_scale2 = w13_scale2.contiguous().reshape(-1)
+    w2_scale2 = layer.w2_weight_scale_2.to(torch.float32).contiguous().reshape(-1)
+
+    # ---- per-expert GPTQ repack through the CUDA kernel (host rows included).
+    from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+        gptq_marlin_moe_repack,
+    )
+    from sglang.srt.layers.quantization.marlin_utils import (
+        sm70_nvfp4_marlin_process_global_scale,
+        sm70_nvfp4_marlin_process_scales,
+    )
+
+    def _repack_nvfp4_weight(weight: torch.Tensor) -> torch.Tensor:
+        num_experts, size_n, packed_k = weight.shape
+        size_k = packed_k * 2
+        pack_device = "cuda" if torch.cuda.is_available() else weight.device
+        packed = torch.empty(
+            (num_experts, size_k // 16, size_n * 2),
+            dtype=torch.int32,
+            device=weight.device,
+        )
+        empty_perm = torch.empty(
+            (1, 0), dtype=torch.int32, device=pack_device
+        )
+        for e in range(num_experts):
+            gptq_layout = (
+                weight[e : e + 1]
+                .to(pack_device)
+                .contiguous()
+                .view(torch.int32)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            packed_e = gptq_marlin_moe_repack(
+                gptq_layout, empty_perm, size_k, size_n, 4
+            )
+            packed[e].copy_(packed_e[0] if packed.is_cuda else packed_e[0].cpu())
+        return packed
+
+    copy_or_rebind_param(layer, "w13_weight", _repack_nvfp4_weight(w13_weight))
+    copy_or_rebind_param(layer, "w2_weight", _repack_nvfp4_weight(w2_weight))
+
+    # ---- scales: logical [E,K/16,N] -> marlin S0E5M3-encoded E4M3 (pure torch,
+    # CPU-capable).
+    w13_marlin_scales, w13_scale_factor = sm70_nvfp4_marlin_process_scales(
+        w13_weight_scale_folded.transpose(1, 2).contiguous(), activation_dtype
+    )
+    w2_marlin_scales, w2_scale_factor = sm70_nvfp4_marlin_process_scales(
+        w2_weight_scale.transpose(1, 2).contiguous(), activation_dtype
+    )
+    copy_or_rebind_param(layer, "w13_weight_scale", w13_marlin_scales)
+    copy_or_rebind_param(layer, "w2_weight_scale", w2_marlin_scales)
+    copy_or_rebind_param(
+        layer,
+        "w13_scale2",
+        sm70_nvfp4_marlin_process_global_scale(w13_scale2, activation_dtype)
+        / w13_scale_factor,
+    )
+    copy_or_rebind_param(
+        layer,
+        "w2_scale2",
+        sm70_nvfp4_marlin_process_global_scale(w2_scale2, activation_dtype)
+        / w2_scale_factor,
+    )

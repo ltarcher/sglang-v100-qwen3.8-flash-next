@@ -46,6 +46,9 @@ PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches"
 SM70_PATCHES=(
   "$PATCH_DIR/marlin-v100-qwen-sm70-tuning.patch"
   "$PATCH_DIR/marlin-v100-qwen38-nvfp4-tuning.patch"
+  # GLM-5.3 P4: uint2b2 resident-expert GEMM (pure addition; the dispatch
+  # hook in ops.cu is inert until a caller passes ScalarType.uint(2, 2)).
+  "$PATCH_DIR/marlin-v100-u2-experts.patch"
 )
 if [[ "${MARLIN_V100_SKIP_BF16_COMPAT:-0}" != 1 ]]; then
   SM70_PATCHES+=("$PATCH_DIR/marlin-v100-sm70.patch")
@@ -64,17 +67,39 @@ else
   fi
 fi
 
-for SM70_PATCH in "${SM70_PATCHES[@]}"; do
-  [[ -f "$SM70_PATCH" ]] || die "missing SM70 compatibility patch: $SM70_PATCH"
-  if git -C "$REPO" apply --reverse --check "$SM70_PATCH" >/dev/null 2>&1; then
-    log "already applied: $(basename "$SM70_PATCH")"
-  elif git -C "$REPO" apply --check "$SM70_PATCH"; then
-    git -C "$REPO" apply "$SM70_PATCH"
-    log "applied: $(basename "$SM70_PATCH")"
-  else
-    die "SM70 compatibility patch does not apply cleanly: $SM70_PATCH"
+# --- apply SM70 patches ----------------------------------------------------------
+# Idempotency: the tuning patches overlap in sm70_marlin_gemm.cuh, so once both
+# are applied `git apply --reverse --check` of the first fails even though the
+# tree is exactly right. Stamp the applied set instead: a hash of the patch list
+# and contents recorded beside the checkout. On a stamp mismatch the patch set
+# changed since this checkout was patched, and the overlap means the old set
+# cannot be un-applied in place -- rebuild the tree from the pinned ref. The
+# checkout is script-managed build state (this script is the only writer), so
+# the reset is automatic; anything uncommitted there is discarded.
+STAMP_FILE="$REPO/.marlin_v100_sm70_patches"
+STAMP_EXPECT="$(printf '%s\n' "${SM70_PATCHES[@]}"; cat "${SM70_PATCHES[@]}")" \
+  && STAMP_EXPECT="$(printf '%s' "$STAMP_EXPECT" | sha256sum | cut -d' ' -f1)"
+if [[ -f "$STAMP_FILE" && "$(cat "$STAMP_FILE")" == "$STAMP_EXPECT" ]]; then
+  log "patches already applied (stamp match)"
+else
+  if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
+    warn "patch set changed; resetting $REPO to a clean $MARLIN_V100_REF checkout (uncommitted state discarded)"
+    git -C "$REPO" checkout --detach --force "$MARLIN_V100_REF"
+    git -C "$REPO" clean -fdx
   fi
-done
+  for SM70_PATCH in "${SM70_PATCHES[@]}"; do
+    [[ -f "$SM70_PATCH" ]] || die "missing SM70 compatibility patch: $SM70_PATCH"
+    if git -C "$REPO" apply --check "$SM70_PATCH" >/dev/null 2>&1; then
+      git -C "$REPO" apply "$SM70_PATCH"
+      log "applied: $(basename "$SM70_PATCH")"
+    elif git -C "$REPO" apply --reverse --check "$SM70_PATCH" >/dev/null 2>&1; then
+      log "already applied: $(basename "$SM70_PATCH")"
+    else
+      die "SM70 compatibility patch does not apply cleanly: $SM70_PATCH (reset $REPO to a clean checkout and re-run)"
+    fi
+  done
+  printf '%s\n' "$STAMP_EXPECT" > "$STAMP_FILE"
+fi
 
 # --- toolchain: CUDA, host compiler, CUTLASS -----------------------------------
 [[ -n "${CUDA_HOME:-}" ]] || CUDA_HOME="/usr/local/cuda-${CUDA_VER}"

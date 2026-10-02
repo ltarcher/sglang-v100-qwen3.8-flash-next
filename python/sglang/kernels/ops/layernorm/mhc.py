@@ -1821,6 +1821,38 @@ def _mhc_pre_torch(
     post_base = hc_base[n : 2 * n]
     comb_base = hc_base[2 * n :].view(n, n)
 
+    if (
+        n == 4
+        and hc_post_mult_value == 2.0
+        and hc_pre_eps == hc_sinkhorn_eps
+        and is_sm70_supported()
+        and envs.SGLANG_SM70_MHC_SINKHORN_JIT.get()
+    ):
+        # One SM70 JIT kernel replaces the eager section below; DSV4.1 runs it
+        # as its production path and the math mirrors the torch reference
+        # (same 4-wide reduction order). Without it the 20-iteration Sinkhorn
+        # costs ~139 eager launches per layer (measured); the JIT cuts that to
+        # 11 and shrinks decode graph replay by ~11k nodes/step, but the
+        # prefill wall is spill page-in bandwidth, not launches, so this is
+        # correctness/host-efficiency work, not a prefill lever.
+        from sglang.kernels.ops.elementwise.sm70_dsv41_hc_mix import split_sinkhorn
+
+        pre, post, comb = split_sinkhorn(
+            mixes.view(1, s, (2 + n) * n),
+            hc_scale,
+            hc_base,
+            hc_mult=n,
+            sinkhorn_iters=sinkhorn_repeat,
+            eps=hc_sinkhorn_eps,
+        )
+        return (
+            post.squeeze(0).unsqueeze(-1),
+            comb.squeeze(0),
+            torch.bmm(pre.squeeze(0).to(dtype).unsqueeze(1), residual)
+            .squeeze(1)
+            .to(dtype),
+        )
+
     pre = torch.sigmoid(pre_raw * hc_scale[0] + pre_base) + hc_pre_eps
     post = hc_post_mult_value * torch.sigmoid(post_raw * hc_scale[1] + post_base)
     comb = comb_raw * hc_scale[2] + comb_base
@@ -1831,7 +1863,14 @@ def _mhc_pre_torch(
         comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
         comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
 
-    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(dtype)
+    # Same contraction as (pre.unsqueeze(-1) * residual.float()).sum(1), but
+    # as a batched GEMM: the broadcast form materializes a full fp32 copy of
+    # the residual plus the product, which OOMs long prefills on VRAM-tight
+    # ranks. Mixing coefficients are O(1), so fp16 inputs with cuBLAS fp32
+    # accumulation match the fp32 sum to fp16 output precision.
+    layer_input = torch.bmm(
+        pre.to(dtype).unsqueeze(1), residual
+    ).squeeze(1).to(dtype)
     return post.unsqueeze(-1), comb, layer_input
 
 
@@ -1841,9 +1880,13 @@ def _mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    out = post_layer_mix * x.unsqueeze(1) + (
-        comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
-    ).sum(dim=1)
+    # Same contraction as (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(1)
+    # -- out[j] = sum_i comb[i, j] * residual[i] -- which materializes
+    # (s, n, n, h), n^2 copies of the residual and the single largest
+    # transient of a prefill forward. One batched GEMM computes it without
+    # the intermediate; see _mhc_pre_torch for the precision note.
+    mixed = torch.bmm(comb_res_mix.to(residual.dtype).transpose(1, 2), residual)
+    out = post_layer_mix.to(x.dtype) * x.unsqueeze(1) + mixed
     return out.type_as(x)
 
 

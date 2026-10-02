@@ -1389,6 +1389,11 @@ class Envs:
     # for the Qwen3.8 TP4 MTP shapes. 0 falls back to the Triton/cuBLAS
     # implementation for comparisons.
     SGLANG_SM70_DENSE_GEMV = EnvBool(False)
+
+    # 0 routes SM70 NVFP4 MoE through the Triton per-element FP4/E4M3 decode
+    # instead of the marlin_v100 tensor-core kernel. Reference path for
+    # debugging the kernel's numerics.
+    SGLANG_SM70_DISABLE_MARLIN_MOE = EnvBool(False)
     SGLANG_SM70_QWEN_FUSIONS = EnvBool(False)
     SGLANG_SM70_HC_NATIVE = EnvBool(True)
     SGLANG_SM70_MTP_HC = EnvBool(True)
@@ -1402,6 +1407,18 @@ class Envs:
     # is not a block multiple (e.g. moe_intermediate 640 at TP4 = 160 columns,
     # the Qwen3.8 MTP draft layer) and run the TurboMind FP16 MoE kernels.
     SGLANG_DISABLE_SM70_FP8_BLOCK_MOE_DEQUANT = EnvBool(False)
+
+    # GLM-5.3 P4: requantize the modelopt NVFP4 routed experts to 2-bit at
+    # weight-load ingest and keep the full expert pool resident in VRAM on the
+    # u2b2 SM70 Marlin kernel, instead of spilling cold experts to host RAM.
+    # The group size must divide hidden and moe_intermediate (128 does for
+    # GLM-5.3; 64 is the fallback knob for narrower shapes).
+    SGLANG_SM70_U2_EXPERT_POOL = EnvBool(False)
+    SGLANG_SM70_U2_GROUP = EnvInt(128)
+    # Disk directory for the per-layer NVFP4 staging memmaps (must be real
+    # disk with ~45 GB free per rank, never tmpfs -- tmpfs pages are anon
+    # RAM and defeat the whole point).
+    SGLANG_SM70_U2_STAGE_DIR = EnvStr("")
 
     # ===================================================================
     # RoPE cache
@@ -1432,6 +1449,14 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Swap the adaptive spec objective from acceptance thresholds to cost-aware
+    # width selection: per-step EMAs of measured verify-round wall time and
+    # accept_length, pick argmax(tokens/round / round_ms). Strata DraftPolicy
+    # semantics; a cold-start sweep measures every candidate a few rounds
+    # before argmax decides, so a mis-calibrated prior cannot hide a width.
+    # Measurement counts decay each round, so widths the workload drifted away
+    # from revert to the prior and can be re-probed after a regime shift.
+    SGLANG_ADAPTIVE_SPEC_COST_AWARE = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
@@ -1676,15 +1701,53 @@ class Envs:
     # Built by scripts/dsv41_cold_set_from_dumps.py from expert-distribution
     # recorder dumps. Unset -> today's tail placement (ids n_kept..n_routed-1).
     SGLANG_DSV41_EXPERT_SPILL_COLD_SET = EnvStr(None)
+    # P2: whole-layer prefill bank. Wide (prefill/extend) batches stop using
+    # the per-claim landing assign; each layer's spilled half is copied into
+    # the landing pool with one contiguous pinned HtoD per tensor (static
+    # slot mapping, alternating two banks across layers). After the first
+    # pass each fill was enqueued as the previous module's prefetch, so
+    # steady-state prefill waits on no page-in: the DMA runs behind the
+    # prior module's compute instead of serializing before it. A decode
+    # landing claim may overwrite a bank slot; the host marks the banks
+    # dirty and the next prefill forward refills them (2 fills).
+    # Requires SGLANG_DSV41_SPILL_PREFILL_LANDING=1 and
+    # SGLANG_DSV41_SPILL_LANDING >= 2 * spilled experts per layer.
+    SGLANG_DSV41_SPILL_PREFILL_BANK = EnvBool(False)
     # Per-rank GiB of routed-expert MXFP4 to keep on host (attention stays GPU).
     # 0 disables. Size this from the launch script / HBM budget, not here.
     SGLANG_DSV41_EXPERT_SPILL_GB = EnvFloat(0.0)
     # Shrink FusedMoE expert rows after attaching the spill plan. Marlin remaps
     # topk_ids through RoutedExpertLru; ensure() is an eager BCG break.
     SGLANG_DSV41_EXPERT_SPILL_APPLY = EnvBool(False)
+    # MoE layer count the spill GiB is divided over. Defaults to the DSV4.1
+    # 40; other stacks either pass their real count via plan_gpu_expert_slots
+    # (which FusedMoE does when it knows better) or set this for plan-only
+    # sizing.
+    SGLANG_DSV41_EXPERT_SPILL_N_LAYERS = EnvInt(0)
+    # Smallest local-routed shard the spill planner may shrink. The DSV4.1
+    # default (384/8=48) keeps small-MoE drafts fully GPU-resident; lower it
+    # for forced-spill smoke tests on small models.
+    SGLANG_DSV41_EXPERT_SPILL_MIN_LOCAL = EnvInt(0)
+    # Disable the chunked prefill run that keeps the LRU working set inside
+    # the GPU expert slots (rollback knob; a thrashing batch then drops
+    # overflow experts exactly like the pre-chunking behavior).
+    SGLANG_DSV41_EXPERT_SPILL_NO_CHUNK = EnvBool(False)
     # WO-13 D4-G: shared GPU landing slots for in-graph UVA page-in of spilled
     # decode hits. 0 keeps the Python LRU on decode (and the MoE BCG break).
     SGLANG_DSV41_SPILL_LANDING = EnvInt(6)
+    # Route prefill/extend batches through the landing pool too (device-side
+    # assign+copy, no host LRU sync, no write-back). Only engages when the
+    # pool holds every logical expert, so a wide batch can never drop one.
+    SGLANG_DSV41_SPILL_PREFILL_LANDING = EnvBool(False)
+    # TEMP (RAM bring-up): log per-layer host RSS in the spill apply loop.
+    SGLANG_DSV41_EXPERT_SPILL_RSS_LOG = EnvBool(False)
+    # TEMP (RAM bring-up): name referrers of retained big pageable CPU tensors
+    # after the spill mirror pin swap.
+    SGLANG_DSV41_SPILL_REF_CENSUS = EnvBool(False)
+    # Debug probe: dump each page-in call's raw topk table to
+    # <dir>/call_r<R>_<n>.pt for the cold-set / route-stability analysis
+    # (scripts/glm53_cold_set_from_route_probe.py).
+    SGLANG_SPILL_ROUTE_PROBE = EnvStr("")
     # WO-15: box knob for the V100 serve script. Engine still keys off
     # --speculative-algorithm DSPARK. Default off; D15-3 sets it in the script.
     SGLANG_DSV41_DSPARK = EnvBool(False)
@@ -1707,6 +1770,13 @@ class Envs:
     # WO-13 D6-d: fuse SM70 mHC mix_stats+Sinkhorn (and combine) into one CTA.
     # Default on; 0 keeps the four unfused launches.
     SGLANG_DSV41_MHC_FUSION = EnvBool(True)
+    # GLM-5.3 on SM70: the TileLang mhc_pre is bf16-only, so hc_pre falls back
+    # to _mhc_pre_torch, whose 20-iteration Sinkhorn is ~139 eager launches per
+    # layer. When set (default), that torch fallback routes the gated
+    # pre/post/comb + Sinkhorn section through the sm70_dsv41_hc_mix JIT
+    # kernel (hc_mult=4 only; same math, DSV4.1's production kernel; 11
+    # launches/layer). 0 keeps the fully eager reference.
+    SGLANG_SM70_MHC_SINKHORN_JIT = EnvBool(True)
     # WO-13 D6-e: keep dense MXFP8 as e4m3+UE8M0 g32 (decode GEMV M<=4).
     # marlin_v100 FP8 W8A16 has no group-32; 0 unpacks to FP16 as before.
     SGLANG_DSV41_MXFP8_W8A16 = EnvBool(True)

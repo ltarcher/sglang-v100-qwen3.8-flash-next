@@ -762,7 +762,12 @@ class ModelConfig:
         ) or getattr(self.hf_config, "image_token_index", None)
 
         self.hf_config.encoder_only = encoder_only
-        self.hf_config.language_only = language_only
+        # A checkpoint that declares language_only itself ships no vision
+        # weights, so the flag's default must not flip it back off; the flag
+        # may only turn it on (same rule as language_model_only below).
+        self.hf_config.language_only = language_only or getattr(
+            self.hf_config, "language_only", False
+        )
         # Checkpoints declare this one themselves (hf_transformers/processor.py),
         # so the flag may only turn it on: writing the default back would build a
         # vision tower with no weights to fill.

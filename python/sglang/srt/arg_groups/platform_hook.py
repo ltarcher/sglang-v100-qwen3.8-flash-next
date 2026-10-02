@@ -163,12 +163,23 @@ def handle_sm70_backends(server_args: Any):
         return
     cfg = resolving_view(server_args)
     if cfg.attention_backend is None:
+        # Probe availability with find_spec only: importing tilelang here would
+        # run its carver driver, which dlopens tilelang's libcudart_stub.so into
+        # the launcher process. flashinfer.comm then resolves "the first loaded
+        # libcudart" from /proc/self/maps (lowest address wins) to that stub and
+        # dies on the missing cudaDeviceReset symbol at import time. The real
+        # import still happens later, in each scheduler subprocess.
         try:
-            import tilelang  # noqa: F401
+            import importlib.util
 
-            from sglang.srt.layers.attention.tilelang_fa_v100 import (  # noqa: F401
-                paged_forward,
-            )
+            if (
+                importlib.util.find_spec("tilelang") is None
+                or importlib.util.find_spec(
+                    "sglang.srt.layers.attention.tilelang_fa_v100"
+                )
+                is None
+            ):
+                return
         except Exception:
             return
         declare_resolution(

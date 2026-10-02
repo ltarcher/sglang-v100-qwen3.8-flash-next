@@ -597,9 +597,18 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             "Learnable DSA attention sinks require a bfloat16 KV cache; "
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
+    # The Volta fp16 pipeline (SGLANG_SM70_FORCE_FP16 downgrades the model
+    # itself) has no bfloat16 kernels; a bf16 KV cache would hand the SM70
+    # tilelang kernels a dtype they never compiled for. Mirror the model
+    # dtype there, and honor an explicit float16 request on any device.
+    fp16_kv = view.dtype == "float16" or (
+        major < 8 and envs.SGLANG_SM70_FORCE_FP16.get()
+    )
     if kv_cache_dtype == "auto":
         kv_cache_dtype = (
-            "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"
+            "fp8_e4m3"
+            if major >= 10 and not has_attention_sinks
+            else ("float16" if fp16_kv else "bfloat16")
         )
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
@@ -608,8 +617,12 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         kv_cache_dtype = "bfloat16"
     assert kv_cache_dtype in [
         "bfloat16",
+        "float16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+    ] or (kv_cache_dtype == "fp16" and fp16_kv), (
+        "DeepSeek DSA only supports bf16/bfloat16, fp16 (Volta fp16 mode), "
+        "or fp8_e4m3 kv_cache_dtype"
+    )
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}

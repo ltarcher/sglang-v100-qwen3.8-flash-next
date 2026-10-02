@@ -43,7 +43,10 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
-from sglang.srt.model_loader.post_load import stage_module_for_post_load
+from sglang.srt.model_loader.post_load import (
+    quant_method_manages_post_load_residency,
+    stage_module_for_post_load,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
@@ -150,6 +153,13 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
+        yield module
+        return
+
+    if quant_method_manages_post_load_residency(module):
+        # The quant method keeps its post-load weights where it needs them;
+        # staging here would bounce multi-GiB slots through pinned memory on
+        # the way back to their origin device.
         yield module
         return
 
