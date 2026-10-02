@@ -62,9 +62,9 @@ class SchedulerInvariantChecker:
     get_last_batch: Callable
     get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks is in neither batch;
-    # its uncached tokens must still be counted.
-    get_chunked_req: Callable = field(default=lambda: None)
+    # The chunked-prefill requests parked between chunks are in neither batch;
+    # their uncached tokens must still be counted.
+    get_chunked_reqs: Callable = field(default=lambda: ())
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -270,9 +270,7 @@ class SchedulerInvariantChecker:
         swa_uncached = self.tree_cache.swa_transient_size()
         counted: set[int] = set()
         reqs = [req for batch in batches for req in batch.reqs]
-        chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
-            reqs.append(chunked_req)
+        reqs.extend(self.get_chunked_reqs())
         for req in reqs:
             if id(req) in counted:
                 continue
