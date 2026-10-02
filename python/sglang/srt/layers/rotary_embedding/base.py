@@ -201,9 +201,16 @@ class RotaryEmbedding(BaseFusedOp):
         if needed_max_pos < cur_len:
             return
 
-        # Align to reduce realloc frequency
+        # Align to reduce realloc frequency. Grow by doubling (max of the
+        # aligned need and 2x the current length): the extension cost is a
+        # full-cache `torch.cat`, so align-only growth makes a long prefill
+        # pay O(len) per chunk per layer — quadratic overall, and visible as
+        # a collapse on the first request that reaches a new max context
+        # length (e.g. the 131k step of an ascending sweep). Doubling makes
+        # the extensions O(log len) amortized.
         align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
-        new_len = ((needed_max_pos + align) // align) * align
+        aligned_need = ((needed_max_pos + align) // align) * align
+        new_len = max(aligned_need, cur_len * 2)
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
 
