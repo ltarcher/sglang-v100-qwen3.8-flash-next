@@ -715,6 +715,13 @@ backend,target-only:
 + `SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage`),镜像 venv 为 09-27 重建后的环境,host 为
 09-29 重启后的同一台机——基线数字在"当前一切"下成立,venv 重建与重启均不构成残差。
 
+**专用镜像复测(同日)**:按"GLM 改动前后分线"要求,从 GLM 改动之前的
+12c6dbda98 拉 `dev-qwen3.8-flash-next`(+ NCCL 自检修复 cherry-pick),构建
+`sglang-v100-qwen3.8-flash-next:latest`,同一 compose 配置下复测:decode **93.0
+tok/s**、prefill **2,690–3,053 tok/s**、accept 1.85–2.55、greedy 输出与生产镜像
+逐字一致、镜像内 smoke 通过——与生产镜像同配置无差异,Qwen 专用镜像线成立
+(compose 变体:`~/vllm-Qwen3.8/docker-compose-sglang-v100-qwen38next.yaml`)。
+
 **首轮误报的根因(记为教训)**:首轮 A/B 经 serve 脚本变体裸跑,而脚本 60 行
 `export NCCL_P2P_LEVEL=NVL` 是给 NVLink mesh 目标机的默认;本机 PCIe-only(无
 NVLink,P2P 经单 PLX)下 NVL 使 NCCL 判定 P2P 等级不足、整体退到 SHM 过 host,
