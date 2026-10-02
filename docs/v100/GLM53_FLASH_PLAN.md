@@ -682,6 +682,7 @@ backend,target-only:
   的已知未定位项(spill 时代被 556 ms 页入掩盖,pool 路径上成为 decode 第一墙)。
 - 结论:P5 的 decode 杠杆就是那个既有开放探针(spec step 解剖),不是 u2 回归;
   在其解决前,pool 路径 C=1 交互建议 target-only(21.1 tok/s)。
+  **(2026-10-02 复测结项:见 G.8——decode 29.5、MTP 转正,本条建议作废。)**
 - u2 池与 spec 全域相容(F.3 预测成立:无 landing/verify-width 互斥,boot 一次过,
   图捕获无特判;draft 层同样被 u2 化)。
 
@@ -698,6 +699,37 @@ backend,target-only:
   配置复测已回到基线;顺带修复 spill-landing 误过滤 boot 回归与两个 serve 脚本的
   NCCL 拓扑自检)。
 - g64 旋钮保留未用(质量门在 g128 即过);GPTQ 误差修正离线版未启用(F.2 的 (b) 案)。
+
+### G.8 P5-b 复测(2026-10-02,统一镜像 + 通信修复):decode 杠杆结项
+
+配置:统一镜像 `sglang-v100-unified:latest`(`dev-ltarcher` = GLM 线合并 +
+NCCL 拓扑自检 + 两个镜像构建修复),docker compose 起(`~/vllm-Qwen3.8/
+docker-compose-sglang-v100-glm53.yaml`:PXB + `SGLANG_CUSTOM_AR_ALLOW_PCIE=1`,
+与 Qwen 生产 compose 同款通信 env;模型/u2 暂存挂载见该文件),u2 全池 +
+NEXTN MTP 3/1/4,4×V100,boot ~23 min。bench 客户端口径:flushed radix、
+unique suffix;decode 170 tok ×3(`ignore_eos`)。
+
+| 项 | G.6(P4 战役,同配置) | 本次复测 | Δ |
+| --- | --- | --- | --- |
+| decode C=1 ×3 | 12.2 tok/s | **29.49–29.51** | **+142%** |
+| decode vs target-only(21.1) | −42%(负收益) | **+40%,MTP 转正** | |
+| prefill 2k | 573 tok/s | 717 | +25% |
+| prefill 8k ×3 | 238–239(对照 target 254) | 233 / 255 / 255 | 带内持平 |
+| accept len | 2.0–2.8 | 1.4–2.0 窗口(数字串任务 3.42) | 量级一致 |
+
+- **归因**:accept ~1.7 折算 spec 步 ~58 ms(G.6 的 ~195 ms 降 ~137 ms)。
+  未定位项的大头不是机制开销,而是通信:战役 boot 的 serve 脚本无
+  `ALLOW_PCIE`,custom AR 拒启,decode small AR 全程走 NCCL——与本附录 Qwen
+  回归误报同一根因。P2.5 cost-aware width 也在同一 boot,两项收益未做 A/B
+  拆分;合并效果即上表。
+- **质量复核**(同 boot):`p4_gate_probe.py` 对战役 arm-A JSON 逐位对照,
+  same-top1 **93.2%**(384 位,门杠 91.7%)、needle 5/5、算术抽查正确。
+  方法注记:裸 `/generate`(无 chat template)在开放提示上会复读,质量判定
+  一律走 `/v1/chat/completions`。
+- **P5-a 不受影响**:prefill 8k 与战役持平,DSA triton full-attention 75%
+  仍是 prefill 第一墙、P5 杠杆 #1;decode 侧的 spec step 解剖杠杆就此结项。
+- C=1 交互建议更新:u2 池 + MTP(29.5 tok/s)即为推荐形态,不再需要退回
+  target-only。
 
 ## 附录:Qwen3.8 NVFP4 回归(2026-10-02,GLM 结项补跑)
 
@@ -742,7 +774,7 @@ GPU 核时 20.7 ms/步 ≈ 基线整步 21.3 ms——核本身是基线档)与�
 GLM 侧连带发现:`serve_glm53_flash_v100.sh` 原先不设 `NCCL_P2P_LEVEL`(NCCL 自检
 拓扑 → PXB,正确)但同样缺 `SGLANG_CUSTOM_AR_ALLOW_PCIE`,GLM 全程 decode 的
 small AR 走的是 NCCL 而非 custom AR——脚本修复后 P5-b 复测时 decode 或有小幅
-免费收益,记入 P5-b 清单。
+免费收益,记入 P5-b 清单(**已复测,见 G.8:decode +142%,MTP 转正**)。
 
 顺带抓获的真 fork 回归(已修):Qwen 裸 boot(未设 `SGLANG_DSV41_SPILL_LANDING`,
 默认 6)在 spill 未启用时也被 landing 宽度过滤砍光 spec 图形状而拒启;新增
