@@ -11,7 +11,13 @@ import triton.language as tl
 def apply_interleaved_rope_kernel(
     x_ptr,
     out_ptr,
-    S: tl.constexpr,
+    # 2026-10-02: S used to be `tl.constexpr`, which made Triton compile a
+    # fresh variant for every distinct token count (i.e. every prompt whose
+    # length mod chunk differs). Each cold compile froze the single-threaded
+    # scheduler for seconds to minutes mid-output. S is only used in the
+    # `s_offsets < S` mask, so a runtime argument is free — and Triton's
+    # int specialization (==1, %16) bounds the variants to a handful.
+    S,
     D: tl.constexpr,
     stride_x_m,
     stride_x_s,
