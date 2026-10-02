@@ -731,6 +731,57 @@ unique suffix;decode 170 tok ×3(`ignore_eos`)。
 - C=1 交互建议更新:u2 池 + MTP(29.5 tok/s)即为推荐形态,不再需要退回
   target-only。
 
+### G.9 长上下文与 DFlash 评估(2026-10-02;纸面评估,P5 规划输入)
+
+两项均未实测;数字来自 config 维度与本附录实测外推。引擎侧精确值(boot 日志的
+KV 池 GiB 与 `max_total_num_tokens`)待首次相应 boot 回填。
+
+**长上下文(目标 262,144;`max_position_embeddings` = 1,048,576,架构合法)**
+
+显存账(每 rank 32 GiB,u2 池形态不变):
+
+| 项 | 每 rank |
+| --- | ---: |
+| u2 专家池 + dense/attention(G.4 形态) | ~26.9 GiB |
+| KV 池(= 32 × 0.92 − 26.9) | **~2.5 GiB** |
+| KV 单价:11 层 DSA latent(512 维 fp16,不随 TP 切分) | 11 KB/token/rank |
+
+(34 层 KDA 为固定循环状态,~17 MB/rank/seq,fp32 下 ~35 MB,可忽略。)
+
+- 单条 262k 请求 ≈ **2.9 GiB/rank > 2.5 GiB 池:0.92 装不下**(差 ~15%)。
+  0.95(+~1 GiB)可装一条流,但零并发/零前缀缓存余量,且 capture 阶段对
+  mem-fraction 敏感(见 serve 脚本 OOM 注记)。
+- P5-a 启用 indexer 后其 key 池在 262k 再加 ~2.9 GiB/rank——届时要在 u2 池与
+  上下文长度之间做一次显式取舍,不是调参问题。
+- 性能墙(G.5 实测外推):DSA 层 triton full-attention 24.25 s @8k,二次方
+  增长 → 262k 单次 prefill ≈ **6.9 h**;decode 每步 11 层全注意力 ~32× 于 8k,
+  预计个位数 tok/s。
+- **结论:262k 的唯一前提是 P5-a。P5-a 落地前现实的阶梯是 32k(分钟级
+  prefill)→ 64k。**
+
+**DFlash(draft = `/data/models/GLM-5.3-Flash-DFlash`,2.6 GB)**
+
+6 层 qwen3 型 sliding-window(4096)小模型,block-8 块扩散并行提案,EAGLE 式读
+target 第 23/27/31/35/39/43 层 hidden states,target 逐步 verify;与 NEXTN 互斥,
+一次只能跑一个 spec 算法。
+
+- 支持面全套在树:`DFLASH` 算法与 `dflash_worker_v2`、`models/dflash.py`、
+  `glm5_next` capture hooks(:1035 起,含 capture×mHC 专门分支)、arg 层
+  `_handle_dflash` 校验(强制 num_steps=topk=1)。启用只需换 spec 段旗标。
+- V100 适配缺口:draft 注意力后端须 triton(README 推荐 `trtllm_mha` 为
+  sm80+);draft config bf16 → 必须 fp16(README 警告降精度伤 accept);draft
+  KV 直接 fp16(窗口仅 4096,不值得上 fp8);capture×mHC 分支行为待 boot 验证。
+- 显存:draft 权重 ÷TP4 ≈ 0.65 GiB/rank + 图/KV ~0.2 → KV 池 2.5 → ~1.6 GiB
+  (8k 运行无感,长上下文更紧)。
+- 吞吐期望:verify 8 token → target 步长 ~90–105 ms → **打平点 accept ≈ 3.1**
+  (NEXTN 现状 29.5 tok/s @ accept 1.7、步 ~58 ms)。论文口径 accept 3.5–4.5,
+  但被两个本机因素夹击:u2 噪声(capture 特征带 2-bit 专家噪声,draft 训练于
+  干净 bf16 target,正确性无损——verify 从 target 分布采样——但 agreement
+  可能缩水)、MoE target 步长抬高门槛。
+- 长上下文形态优势:sliding-window draft 成本不随 ctx 增长(NEXTN 的 draft 是
+  全注意力),真做长上下文时 DFlash 是更对的 spec 形态。
+- **决策:排 P5-a 之后实测;accept > 3.1 才替换 NEXTN;测后无论正负回填本节。**
+
 ## 附录:Qwen3.8 NVFP4 回归(2026-10-02,GLM 结项补跑)
 
 **最终结论:无回归。** 基线(README 2026-09-24)在当日机器上复现:
