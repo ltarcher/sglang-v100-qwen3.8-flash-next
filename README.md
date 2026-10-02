@@ -8,7 +8,9 @@
 
 **DeepSeek-V4.1-Flash** (official mixed MXFP8+MXFP4, DSpark, 8× V100-32GB, 256k, one stream) — short code ~9 tok/s, warm prefill ~560 tok/s.
 
-A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang). Those two models are the supported ones. Others may load; they are untested here.
+**GLM-5.3-Flash** (320B/18B MoE, 34× KDA linear attention + 11× DSA, NVFP4 checkpoint requantized to a 2-bit resident expert pool, 4× V100-32GB) — decode ~21 tok/s per stream, 8k prefill ~254 tok/s; 8k validated of 1M native.
+
+A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang). Those three models are the supported ones. Others may load; they are untested here.
 
 </div>
 
@@ -24,15 +26,15 @@ Upstream SGLang does not support Volta. CUDA 13 dropped sm70, FlashAttention nee
 
 ## Hardware and software requirements
 
-| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash |
-|---|---|---|
-| GPUs | 4× V100 32 GB (SXM2 recommended; NVLink helps, a partial mesh is fine). Four cards are the Qwen shape | **8×** V100-SXM2-32GB, TP=8 / EP=8. Four cards are not enough |
-| Host RAM | **~134 GB measured in use** at 262k with `--hicache-size 8`. 160 GB is a comfortable floor. The host cache tier scales with `--hicache-size` | Host Engram (~189 GiB) plus pinned expert spill, on a large RAM node next to the GPUs, with **1G hugepages** on that NUMA node |
-| Disk | 126 GB NVFP4 weights, plus the disk cache tier | ~476 GB (48 shards) |
-| Context | 262,144 | 262,144 advertised. 8k prefill is what has been smoked; 512k has not left ~300 MiB for the Engram MXFP8 unpack |
-| CUDA | 12.8 or 12.9. CUDA 13.x removed Volta | same |
-| Host compiler | GCC **≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, and many distros now default to it | same |
-| Python | 3.12 | 3.12 |
+| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash |
+|---|---|---|---|
+| GPUs | 4× V100 32 GB (SXM2 recommended; NVLink helps, a partial mesh is fine). Four cards are the Qwen shape | **8×** V100-SXM2-32GB, TP=8 / EP=8. Four cards are not enough | 4× V100 32 GB, TP=4 |
+| Host RAM | **~134 GB measured in use** at 262k with `--hicache-size 8`. 160 GB is a comfortable floor. The host cache tier scales with `--hicache-size` | Host Engram (~189 GiB) plus pinned expert spill, on a large RAM node next to the GPUs, with **1G hugepages** on that NUMA node | No resident expert state in the u2-pool mode (the spill modes pin ~80 GB). The 182 GB checkpoint streams through the page cache once |
+| Disk | 126 GB NVFP4 weights, plus the disk cache tier | ~476 GB (48 shards) | 182 GB NVFP4 (safetensors ×120), plus the u2 staging dir — **real disk, not tmpfs** |
+| Context | 262,144 | 262,144 advertised. 8k prefill is what has been smoked; 512k has not left ~300 MiB for the Engram MXFP8 unpack | 1,048,576 native. 8k is what has been smoked |
+| CUDA | 12.8 or 12.9. CUDA 13.x removed Volta | same | same |
+| Host compiler | GCC **≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, and many distros now default to it | same | same |
+| Python | 3.12 | 3.12 | 3.12 |
 
 The 32 GB-per-GPU figure is not negotiable for Qwen: the NVFP4 weights alone are ~22 GB per rank at TP=4. The host-RAM and disk figures are measured on a running system. Four PCIe-only V100s (P2P, no NVLink): set `SGLANG_CUSTOM_AR_ALLOW_PCIE=1` and `NCCL_P2P_LEVEL=PXB`. Those stay off by default; leave them off on an 8× hybrid NVLink mesh.
 
@@ -63,6 +65,9 @@ bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
 
 # DeepSeek-V4.1-Flash, 8× V100
 bash scripts/serve_dsv41_v100.sh
+
+# GLM-5.3-Flash, 4× V100, 2-bit resident expert pool (mtp for the draft head)
+GLM53_MODEL=/data/models/GLM-5.3-Flash-NVFP4 bash scripts/serve_glm53_flash_v100.sh target
 ```
 
 ## Qwen3.8-Flash-Next
@@ -309,6 +314,52 @@ python -m sglang.launch_server \
 | `--chunked-prefill-size` | 2048 | Vestigial SWA floor is sized for this chunk |
 
 Leave `--speculative-dspark-block-size` at the checkpoint default. Checkpoint weights stay mixed MXFP4 experts + packed MXFP8 dense.
+
+## GLM-5.3-Flash
+
+320B/18B-activation MoE, 45 layers = 34× KDA linear attention + 11× DSA (first 3 dense), a built-in MTP head, modelopt NVFP4 checkpoint, ~182 GB. The ship deployment is the **2-bit resident expert pool**: at boot the NVFP4 routed experts are requantized once to a 2-bit (u2b2, group-128) format and the FULL 288-expert pool stays in VRAM, ~19 GiB per rank. No expert is ever on the host: no spill pool, no page-in, no landing pool. The grid was tuned to the theoretical 4-level bound (end-to-end MoE cosine 0.830 vs the NVFP4 truth) and gated against the u4+spill engine on the same server: first-token top-1 agreement 91.7% over 24 mixed prompts, 5/5 needle retrieval on both arms. The full record — grid counterfactuals, the boot-time requantization path, and the trace anatomy — is `docs/v100/GLM53_FLASH_PLAN.md` appendix G.
+
+### Get the model
+
+The validated checkpoint is the modelopt NVFP4 export of GLM-5.3-Flash (safetensors ×120 with its config). Point `GLM53_MODEL` at it; on the dev box it lives at `/data/models/GLM-5.3-Flash-NVFP4`.
+
+### Measured performance
+
+2026-10-02, temperature 0, flushed-radix protocol (`/flush_cache` + a unique suffix per rep, so no radix self-hits), 4× V100-32GB TP=4, `scripts/serve_glm53_flash_v100.sh`, chunked prefill 1024, Triton attention backend. The right-hand column is the identical bench the same day against the prior deployment shape (u4 NVFP4 + host expert spill).
+
+| check | u2 pool (ship) | u4 + spill (prior shape) |
+|---|---:|---:|
+| prefill ~7.6k tokens, cold | **254** tok/s | 102 tok/s |
+| prefill ~3.8k | **401** tok/s | 103 tok/s |
+| prefill ~1.9k | **598** tok/s | 103 tok/s |
+| decode, real text, 1 stream, target-only | **21.1** tok/s | 4.6 tok/s |
+| decode, 1 stream, MTP-3/4 (accept 2.0–2.8) | 12.2 tok/s | 4.1–4.3 tok/s (P1.6 record) |
+
+Honest reading of those numbers:
+
+- **Prefill falls with context** (598 → 254 tok/s from 2k to 8k). A GPU trace of the 8k request shows why: the 11 DSA layers currently run FULL attention through the Triton backend (the sparse indexer is not enabled in this tree), and that one kernel is 75% of prefill busy time. The 2-bit MoE itself is 5% — the expert side is no longer on any critical path. A faster or sparser DSA prefill path is the next lever and has ~3–5× of headroom behind it (appendix G.5).
+- **MTP accepts well but nets −42% at one stream** (12.2 vs 21.1 tok/s): target decode got 5.7× faster while the fixed draft+verify cost (~195 ms/step) did not move, and accept 2.3 needs ≤ ~108 ms/step to break even. That step cost contains a known ~114 ms unlocated item from the earlier decode survey; until that probe lands, use `target` mode for interactive single-stream work. MTP on this engine still beats every spill-era MTP number by 2.4–3×.
+- One engine per host still applies; this binds the same `SGLANG_V100_HOST`/`SGLANG_V100_PORT` address as the other two.
+
+### Reference recipe
+
+The wrapper is the supported entry. `target` (u2 pool, no speculation) is what the numbers above were measured on; `mtp` adds the NEXTN draft; `spill`/`spill-mtp` reproduce the pre-P4 shape for A/B.
+
+```bash
+export GLM53_MODEL=/data/models/GLM-5.3-Flash-NVFP4
+bash scripts/serve_glm53_flash_v100.sh target
+```
+
+Key knobs (the script header carries the full list):
+
+| knob | ship value | why |
+|---|---|---|
+| u2 pool | on (`target`/`mtp` modes) | The whole point: a resident full pool ends page-in. Requantization runs at boot — first layer ~30 s (kernel warmup), remaining 41 layers under 2 min |
+| `SGLANG_SM70_U2_STAGE_DIR` | `~/.cache/sglang-glm53-u2-stage` | Boot-time requant staging memmaps. MUST be real disk; tmpfs is host RAM |
+| `--mem-fraction-static` | 0.92 | 18.9 GiB expert pool + ~8 GiB dense/attention on a 32 GB card. The measured OOM chain on this engine is at boot/capture, not under load |
+| `--context-length` | 8192 | The validated ceiling. Raising it re-opens the KV/activation trade on the pool path; do not bump it and the mem fraction together on faith |
+| `--chunked-prefill-size` | 1024 | The benched configuration; larger chunks are untested on the pool path |
+| `GLM53_U2_GROUP` | 128 | The tuned grid's group; 64/32 are kernel fallbacks and were measured worse per byte |
 
 ## What the port adds
 
