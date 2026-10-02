@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Serve RadixArk/Qwen3.8-Flash-Next-NVFP4 (Qwen4-arch, NVFP4 W4A16, E5M2 KV)
-# on a 4x V100 NVLink domain. No conda, no docker — plain venv.
+# on 4x V100 (NVLink mesh or PCIe-only, auto-detected). No conda, no docker.
 #
 # Before the FIRST serve, run the (GPU-touching) validation once:
 #   bash scripts/smoke_v100.sh
@@ -57,11 +57,21 @@ done
 export TORCH_CUDA_ARCH_LIST=7.0
 # V100 runtime env (same set as the README's Flash-Next commands)
 export FLASHINFER_DISABLE_VERSION_CHECK=1
-export NCCL_P2P_LEVEL=NVL
 export SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage
-# 4x V100 PCIe-only (no NVLink, P2P via one PLX): NCCL_P2P_LEVEL=PXB and
-# SGLANG_CUSTOM_AR_ALLOW_PCIE=1 (default off; one-shot push, 128 KiB cap).
-# Do not set that on this 8x V100 hybrid NVLink mesh.
+# NCCL's P2P floor is machine-dependent and a wrong value is expensive: on the
+# 4x V100 PCIe-only box (no NVLink, P2P via one PLX) NVL makes NCCL drop P2P
+# for SHM through the host (measured -41% decode, -47% prefill, 2026-10-02)
+# and keeps custom AR off -- SGLANG_CUSTOM_AR_ALLOW_PCIE=1 (one-shot push,
+# 128 KiB cap) is what lets it run over PCIe. Detect the mesh instead of
+# assuming it; an explicit NCCL_P2P_LEVEL in the environment still wins.
+if [[ -z "${NCCL_P2P_LEVEL:-}" ]]; then
+  if nvidia-smi topo -m 2>/dev/null | grep -E '^GPU[0-9]' | grep -qE 'NV[0-9]'; then
+    export NCCL_P2P_LEVEL=NVL
+  else
+    export NCCL_P2P_LEVEL=PXB
+    export SGLANG_CUSTOM_AR_ALLOW_PCIE="${SGLANG_CUSTOM_AR_ALLOW_PCIE:-1}"
+  fi
+fi
 export SGLANG_MAMBA_CONV_DTYPE=float16
 export SGLANG_MAMBA_SSM_DTYPE=float16
 export SGLANG_SM70_FORCE_FP16=1
