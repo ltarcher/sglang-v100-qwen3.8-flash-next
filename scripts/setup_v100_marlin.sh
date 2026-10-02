@@ -71,16 +71,22 @@ fi
 # Idempotency: the tuning patches overlap in sm70_marlin_gemm.cuh, so once both
 # are applied `git apply --reverse --check` of the first fails even though the
 # tree is exactly right. Stamp the applied set instead: a hash of the patch list
-# and contents recorded beside the checkout. A mismatch means the patch set
-# changed since this repo was patched; reset the repo to a clean checkout
-# (git checkout --detach "$MARLIN_V100_REF" && git clean -fdx after saving local
-# work) and re-run.
+# and contents recorded beside the checkout. On a stamp mismatch the patch set
+# changed since this checkout was patched, and the overlap means the old set
+# cannot be un-applied in place -- rebuild the tree from the pinned ref. The
+# checkout is script-managed build state (this script is the only writer), so
+# the reset is automatic; anything uncommitted there is discarded.
 STAMP_FILE="$REPO/.marlin_v100_sm70_patches"
 STAMP_EXPECT="$(printf '%s\n' "${SM70_PATCHES[@]}"; cat "${SM70_PATCHES[@]}")" \
   && STAMP_EXPECT="$(printf '%s' "$STAMP_EXPECT" | sha256sum | cut -d' ' -f1)"
 if [[ -f "$STAMP_FILE" && "$(cat "$STAMP_FILE")" == "$STAMP_EXPECT" ]]; then
   log "patches already applied (stamp match)"
 else
+  if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
+    warn "patch set changed; resetting $REPO to a clean $MARLIN_V100_REF checkout (uncommitted state discarded)"
+    git -C "$REPO" checkout --detach --force "$MARLIN_V100_REF"
+    git -C "$REPO" clean -fdx
+  fi
   for SM70_PATCH in "${SM70_PATCHES[@]}"; do
     [[ -f "$SM70_PATCH" ]] || die "missing SM70 compatibility patch: $SM70_PATCH"
     if git -C "$REPO" apply --check "$SM70_PATCH" >/dev/null 2>&1; then
