@@ -264,7 +264,11 @@ ENV NCCL_P2P_LEVEL=NVL \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/deps/flashinfer-sm70 /opt/deps/flashinfer-sm70
 COPY --from=builder /opt/sglang/python /opt/sglang/python
-COPY scripts/smoke_v100.sh scripts/serve_qwen38_flash_next_nvfp4_v100.sh /opt/sglang/scripts/
+COPY scripts/smoke_v100.sh \
+      scripts/serve_qwen38_flash_next_nvfp4_v100.sh \
+      scripts/serve_glm53_flash_v100.sh \
+      scripts/serve_dsv41_v100.sh \
+      /opt/sglang/scripts/
 COPY docker/v100-entrypoint.sh /usr/local/bin/v100-entrypoint
 RUN chmod +x /opt/sglang/scripts/smoke_v100.sh /usr/local/bin/v100-entrypoint
 
