@@ -7,7 +7,42 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
+
+def _install_oom_tolerant_autotune() -> None:
+    """Score a CUDA OOM during Triton autotune benchmarking like OutOfResources.
+
+    One autotune session of the FLA chunk kernels transiently holds every
+    benchmarked config's do_bench buffers (~4 GB across configs, independent of
+    the real shapes). On VRAM-tight sm70 ranks (spilled-MoE servers keep only a
+    few GB free) that session OOMs even though the winning config fits and
+    would run fine. Triton already handles triton.OutOfResources this way; this
+    extends the same treatment to a driver-level out-of-memory raised by the
+    launcher. Kill-switch: SGLANG_SM70_TOLERANT_AUTOTUNE=0.
+    """
+    import os
+
+    if os.environ.get("SGLANG_SM70_TOLERANT_AUTOTUNE", "1") == "0":
+        return
+    from triton.runtime import autotuner as _autotuner
+
+    orig_bench = _autotuner.Autotuner._bench
+    if getattr(orig_bench, "_sglang_oom_tolerant", False):
+        return
+
+    def oom_tolerant_bench(self, *args, config, **meta):
+        try:
+            return orig_bench(self, *args, config=config, **meta)
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            return [float("inf")] * 3
+
+    oom_tolerant_bench._sglang_oom_tolerant = True
+    _autotuner.Autotuner._bench = oom_tolerant_bench
+
+
 if not is_cpu():
+    _install_oom_tolerant_autotune()
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_kda_packed_decode,
     )

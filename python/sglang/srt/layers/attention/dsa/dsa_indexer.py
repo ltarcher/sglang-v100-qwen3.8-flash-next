@@ -110,7 +110,9 @@ if _use_aiter and not _use_aiter_preshuffle:
 if _is_cuda:
     try:
         import deep_gemm
-    except ImportError as e:
+    except Exception as e:
+        # not just ImportError: the C extension can fail to load at runtime
+        # (e.g. a CUDA-13-built libdeep_gemm on a CUDA-12 stack, as on Volta)
         deep_gemm = e
 
 if _is_xpu:
@@ -261,7 +263,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             self.cp_size = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            if isinstance(deep_gemm, Exception):
+                # deep_gemm unavailable (Volta: the shipped wheel targets
+                # CUDA 13). Only the fp8 deep_gemm dispatch paths read these;
+                # fill in the real device counts so heuristics stay sane.
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = (

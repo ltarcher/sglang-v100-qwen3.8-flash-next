@@ -69,9 +69,20 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.debug(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not getattr(config, "nextn_quant_in_checkpoint", False)
+        ):
+            # ModelOpt FP4 checkpoints usually keep the embedded NextN block
+            # in BF16: strip draft quantization. Checkpoints that quantize the
+            # NextN block (GLM-5.3 NVFP4: no ignore entry for the NextN layer,
+            # expert weights carry NVFP4 block scales) opt out via the
+            # nextn_quant_in_checkpoint config flag (set by
+            # Glm5NextForConditionalGenerationNextN) and keep quantization.
+            logger.info(
+                "NextN draft: modelopt_fp4 checkpoint with BF16 NextN block; "
+                "building unquantized draft modules."
             )
             quant_config = None
 
@@ -287,10 +298,21 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
         )
+        # The draft always shares the TARGET model's lm_head tensor via
+        # set_embed_and_head (eagle_worker_v2.init_lm_head), so the head
+        # module must be built unquantized whenever the target head is BF16
+        # (checkpoint quantization_config lists lm_head in ignore). A
+        # quantized head module would receive the target's BF16 weight and
+        # produce garbage logits from the packed-weight epilogue.
+        draft_head_quant = (
+            None
+            if getattr(config, "nextn_head_shares_target_bf16", False)
+            else quant_config
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            quant_config=draft_head_quant,
             prefix=add_prefix("model.shared_head.head", prefix),
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )

@@ -147,6 +147,11 @@ class TritonAttnBackend(AttentionBackend):
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
 
+    # sm70 dense-DSA policy: this backend computes full attention and never
+    # overrides get_indexer_metadata (base returns None = unsupported), so the
+    # DSA indexer is dormant here and has no top-k to publish as an MTP seed.
+    supports_dsa_indexer: bool = False
+
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -1569,6 +1574,12 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        # The DSA indexer's token selection (shared across MTP iterations via
+        # index_share_for_mtp_iteration) arrives here on the NextN draft path.
+        # This sm70 backend computes dense full attention (the indexer is
+        # dormant on V100), so the selection is accepted and ignored -- dense
+        # is a superset of the selected sparse set.
+        topk_indices=None,
     ):
         if (
             k is not None
@@ -2154,6 +2165,12 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        # The DSA indexer's token selection (shared across MTP iterations via
+        # index_share_for_mtp_iteration) arrives here on the NextN draft path.
+        # This sm70 backend computes dense full attention (the indexer is
+        # dormant on V100), so the selection is accepted and ignored -- dense
+        # is a superset of the selected sparse set.
+        topk_indices=None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.

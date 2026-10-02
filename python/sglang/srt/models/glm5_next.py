@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -1194,7 +1195,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        vision_utils.update_vit_attn_dummy_heads_config(config)
+        # language_only checkpoints carry no vision tower (config.vision_config
+        # is None); the dummy-head split only matters for ViT attention
+        if getattr(config, "vision_config", None) is not None:
+            vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
@@ -1693,6 +1697,40 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+
+    def finalize_after_quant_processing(self) -> None:
+        """Pack spill-host rows after the GPU Marlin rewrite, then attach LRU.
+
+        Same contract as DeepseekV4: ``post_load_weights`` runs *inside*
+        ``load_weights``, before ``process_weights_after_loading`` -- packing
+        the host mirror there would leave it in checkpoint layout while the
+        GPU experts are already Marlin-packed, and the first LRU swap dies on
+        the shape/dtype guard. The loader calls this hook after per-module
+        ``process_weights_after_loading``.
+        """
+        if self.encoder_only:
+            return
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            maybe_spill_model_routed_experts,
+        )
+
+        maybe_spill_model_routed_experts(self)
+
+        # Dev diagnostics (SGLANG_M3_SPILL_DUMP): verify spill placement and
+        # LRU swap bytes against an independent checkpoint repack. Runs once
+        # after load; a mis-set path just writes nothing.
+        dump_path = os.environ.get("SGLANG_M3_SPILL_DUMP")
+        if dump_path:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "m3_spill_dump", "/opt/sglang/scripts/m3_spill_dump.py"
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.dump_model(self, dump_path)
+            if os.environ.get("SGLANG_M3_SPILL_PROBE"):
+                mod.probe_forward(self, dump_path)
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

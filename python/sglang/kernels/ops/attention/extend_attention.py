@@ -159,9 +159,19 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                     BLOCK_M, BLOCK_N = (32, 64)
         else:
             # Older architectures
-            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+            if _is_cuda and CUDA_CAPABILITY[0] == 7 and Lq > 256:
+                # Volta has 96 KiB shared memory. The absorbed MLA shapes
+                # (Lq=Lk=576, Lv=512 -- GLM-5.3/Kimi K3) need ~136 KiB with
+                # the default (32, 32) tiles and 100 KiB even at (16, 32),
+                # so only 16x16 fits; verified against a torch reference at
+                # fp16-noise parity for ext_len 250..1024.
+                BLOCK_M, BLOCK_N = (16, 16)
+            else:
+                BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
         num_warps = 4 if Lq <= 64 else 8
+        if BLOCK_M == 16 and BLOCK_N == 16:
+            num_warps = 4
 
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
 

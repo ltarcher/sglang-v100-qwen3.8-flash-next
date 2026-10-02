@@ -262,6 +262,14 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 
+def handle_attention_tilelang_fa_v100(attn, forward_batch):
+    # The SM70 tilelang kernels read the compressed MLA cache directly
+    # (kv_lora+rope as one kv head) — they have no path for the plain-MHA
+    # per-head layout the MHA/MHA_CHUNKED_KV methods produce, so pin every
+    # mode to absorbed MLA.
+    return _dispatch_mla_subtype(attn, forward_batch)
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -276,3 +284,9 @@ AttentionBackendRegistry.register(
 )  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register(
+    "tilelang_fa_v100", handle_attention_tilelang_fa_v100
+)
+AttentionBackendRegistry.register(
+    "flash_attn_v100", handle_attention_tilelang_fa_v100
+)
