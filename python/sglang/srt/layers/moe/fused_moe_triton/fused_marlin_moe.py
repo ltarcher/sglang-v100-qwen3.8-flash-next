@@ -118,8 +118,19 @@ def get_scalar_type(
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
-    else:
-        return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+    if num_bits == 2:
+        # SM70 2-bit resident-expert path (GLM-5.3 P4): uniform group scales in
+        # the activation dtype, codes biased by 2, no zero points and no global
+        # scale. The fp8-dtype NVFP4 probe above cannot fire at num_bits == 2,
+        # so an fp16 scale tensor here is unambiguous.
+        assert scales is None or scales.dtype in (torch.float16, torch.bfloat16), (
+            f"2-bit Marlin MoE expects half-precision group scales, got {scales.dtype if scales is not None else None}"
+        )
+        assert global_scale is None, "2-bit Marlin MoE takes no global scale."
+        from sgl_kernel.scalar_type import ScalarType
+
+        return ScalarType.uint(2, 2)
+    return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
 
 
 def swiglu_limit_func(
@@ -260,7 +271,7 @@ def fused_marlin_moe(
         assert hidden_states.dtype == w2_scale.dtype, (
             f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
         )
-    assert num_bits in [4, 8]
+    assert num_bits in [2, 4, 8]
 
     M, K = hidden_states.shape
     E = w1.shape[0]

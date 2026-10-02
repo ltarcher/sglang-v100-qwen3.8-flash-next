@@ -106,6 +106,11 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     # Optional
     expert_map: Optional[torch.Tensor] = None
     global_num_experts: int = -1
+    # Force the Marlin kernel's EP contract (skip expert_ids < 0 blocks)
+    # even for a no-EP layer. The DSV4.1 expert-spill remap marks spill-skipped
+    # routes as -1 on plain TP layers; without this the kernel reads expert
+    # row -1 out of bounds and corrupts the run instead of skipping it.
+    is_expert_parallel: Optional[bool] = None
     # ModelOpt NVFP4 specific (one FP32 scale per expert).
     w13_global_scale: Optional[torch.Tensor] = None
     w2_global_scale: Optional[torch.Tensor] = None
@@ -277,6 +282,7 @@ def fused_experts_none_to_marlin(
         expert_map=quant_info.expert_map,
         is_expert_parallel=(
             runner_config.num_experts != runner_config.num_local_experts
+            or bool(quant_info.is_expert_parallel)
         ),
         g_idx1=quant_info.w13_g_idx,
         g_idx2=quant_info.w2_g_idx,

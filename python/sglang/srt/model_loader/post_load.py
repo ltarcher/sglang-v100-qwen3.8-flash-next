@@ -11,7 +11,19 @@ from typing import Iterator
 import torch
 from torch import nn
 
-__all__ = ["stage_module_for_post_load"]
+__all__ = ["quant_method_manages_post_load_residency", "stage_module_for_post_load"]
+
+
+def quant_method_manages_post_load_residency(module: nn.Module) -> bool:
+    # Opt-out probe for the device-staging scope. Quant methods that keep
+    # their own post-load weight residency (e.g. the SM70 u2 pool, whose
+    # multi-GiB slots live on CPU memmaps during repack) must not be staged:
+    # restoring those slots to a CPU origin afterwards routes every pool
+    # through a pinned host copy, which this platform accounts as unevictable
+    # shmem.
+    quant_method = getattr(module, "quant_method", None)
+    manages = getattr(quant_method, "manages_post_load_residency", None)
+    return callable(manages) and bool(manages())
 
 
 @dataclass(slots=True)
