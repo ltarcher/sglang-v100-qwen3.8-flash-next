@@ -150,6 +150,41 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+def filter_capture_bs_for_spill_landing(
+    capture_bs: list[int], tokens_per_req: int
+) -> list[int]:
+    """Drop capture shapes wider than the D4-G spill landing pool can hold.
+
+    The landing page-in path requires landing >= tokens*topk unique experts
+    per call; wider captured shapes (MTP verify bs>=2) would bake silent
+    expert drops into the graph (P0: 29 -> 5065 drops). Filtered batch sizes
+    replay through the eager host-LRU spill path instead.
+    """
+    from sglang.srt.layers.moe.dsv41_expert_spill import (
+        _decode_shaped_max_tokens,
+        spill_decode_landing_active,
+    )
+
+    if not spill_decode_landing_active():
+        return capture_bs
+    width = _decode_shaped_max_tokens()
+    keep = [bs for bs in capture_bs if bs * tokens_per_req <= width]
+    if len(keep) != len(capture_bs):
+        dropped = [bs for bs in capture_bs if bs * tokens_per_req > width]
+        logger.warning(
+            "D4-G spill landing holds %d decode tokens; batch sizes %s "
+            "(%d tokens/req) exceed it and are excluded from CUDA-graph "
+            "capture -- they run the eager spill path. A per-req width "
+            "above %d can never be captured; raising "
+            "SGLANG_DSV41_SPILL_LANDING re-enables the rest.",
+            width,
+            dropped,
+            tokens_per_req,
+            width,
+        )
+    return keep
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -311,6 +346,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        # The draft worker's model is exempt from expert spill (its MoE stays
+        # GPU-resident), so only the target runner's verify shapes are bound
+        # by the landing pool width.
+        if not self.model_runner.is_draft_worker:
+            self.capture_bs = filter_capture_bs_for_spill_landing(
+                self.capture_bs, self.captured_req_width
+            )
+        if not self.capture_bs:
+            # Empty means the landing pool cannot host even one verify step:
+            # capturing nothing would crash on max() further down. Fail with
+            # the knob and the arithmetic instead.
+            from sglang.srt.layers.moe.dsv41_expert_spill import (
+                _decode_shaped_max_tokens,
+            )
+
+            raise RuntimeError(
+                "Spill landing pool fits %d tokens/step but spec verify needs "
+                "%d per request -- no decode CUDA-graph shape survives the "
+                "landing filter. Raise SGLANG_DSV41_SPILL_LANDING to at least "
+                "max_capture_bs * %d * 8, or set it to 0 to route all decode "
+                "MoE through the eager host-LRU path."
+                % (
+                    _decode_shaped_max_tokens(),
+                    self.captured_req_width,
+                    self.captured_req_width,
+                )
+            )
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -1007,18 +1069,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # D15-1: land_ids must already be T=γ+1 before the first captured
         # page_in. Warmup at T=1 would otherwise freeze a length-2 buffer.
         from sglang.srt.layers.moe.dsv41_expert_spill import (
-            spill_landing_slots,
+            spill_decode_landing_active,
             warmup_spill_landing_for_capture,
         )
 
-        if spill_landing_slots() > 0:
+        if spill_decode_landing_active():
             k = 6
             hf = getattr(self.model_runner.model_config, "hf_config", None)
             if hf is not None:
                 k = int(getattr(hf, "num_experts_per_tok", None) or k)
+            # The buffer must already cover the WIDEST captured batch (decode
+            # T = bs * per-req tokens), not the per-request width: growing it
+            # mid-capture is illegal, and a graph replaying against a stale
+            # buffer would read the wrong land_ids.
             warmup_spill_landing_for_capture(
                 self.model_runner.model,
-                int(self.captured_req_width),
+                int(self.captured_req_width) * int(getattr(self, "max_bs", 1) or 1),
                 k,
                 torch.device(self.model_runner.device),
             )

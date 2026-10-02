@@ -540,6 +540,7 @@ class FusedMoE(torch.nn.Module):
             n_shared=int(self.num_fused_shared_experts),
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
+            is_nvfp4=isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod),
         )
         self._dsv41_gpu_expert_slots = gpu_n
 
@@ -679,7 +680,27 @@ class FusedMoE(torch.nn.Module):
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
         expert_id: int,
+        spilled: Optional[tuple[torch.Tensor, int]] = None,
     ):
+        # Expert-spill: spilled experts load into the pinned host mirror row
+        # (the LRU swaps these rows together with the weights). Same contract
+        # as _load_single_value; NVFP4 checkpoints index per-expert
+        # weight_scale_2 / input_scale here.
+        #
+        # `spilled` comes from _weight_loader_impl, which resolved placement
+        # from the raw checkpoint id. `expert_id` for kept experts is already
+        # the GPU slot there, so re-consulting the spill tables with it would
+        # misfile the write whenever the slot index collides with a cold
+        # expert id (a non-identity cold-set table makes that the common case).
+        if spilled is not None:
+            host, host_row = spilled
+            row = host[host_row]
+            if shard_id in ("w1", "w3") and self.moe_runner_config.is_gated:
+                idx = 0 if shard_id == "w1" else 1
+                row[idx] = loaded_weight
+            else:
+                row.copy_(loaded_weight)
+            return
         param_data = param.data
         # for per tensor weight quantization
         if shard_id in ("w1", "w3"):
@@ -1010,19 +1031,18 @@ class FusedMoE(torch.nn.Module):
         return True
 
     def _load_single_value(
-        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        spilled: Optional[tuple[torch.Tensor, int]] = None,
     ):
-        from sglang.srt.layers.moe.dsv41_expert_spill import (
-            remap_shared_expert_gpu_index,
-            spilled_expert_host_row,
-        )
-
-        spilled = spilled_expert_host_row(self, param, expert_id)
+        # Placement is resolved once in _weight_loader_impl and passed in;
+        # see _load_per_tensor_weight_scale for why a re-consult is wrong.
         if spilled is not None:
             host, host_row = spilled
             host[host_row] = loaded_weight
             return
-        expert_id = remap_shared_expert_gpu_index(self, expert_id)
         param.data[expert_id] = loaded_weight
 
     def _load_g_idx(
@@ -1342,7 +1362,10 @@ class FusedMoE(torch.nn.Module):
                 )
 
             self._load_single_value(
-                param=param, loaded_weight=loaded_weight, expert_id=expert_id
+                param=param,
+                loaded_weight=loaded_weight,
+                expert_id=expert_id,
+                spilled=spilled,
             )
             return
 
@@ -1374,6 +1397,7 @@ class FusedMoE(torch.nn.Module):
                     param=param,
                     loaded_weight=loaded_weight,
                     expert_id=expert_id,
+                    spilled=spilled,
                 )
             elif "weight" in weight_name:
                 self._load_model_weight_or_group_weight_scale(
@@ -1443,6 +1467,7 @@ class FusedMoE(torch.nn.Module):
                     param=param,
                     loaded_weight=loaded_weight,
                     expert_id=expert_id,
+                    spilled=spilled,
                 )
             else:
                 raise ValueError(
@@ -1454,7 +1479,10 @@ class FusedMoE(torch.nn.Module):
         if "weight_shape" in weight_name:
             # only required by compressed-tensors
             self._load_single_value(
-                param=param, loaded_weight=loaded_weight, expert_id=expert_id
+                param=param,
+                loaded_weight=loaded_weight,
+                expert_id=expert_id,
+                spilled=spilled,
             )
             return
 
@@ -1722,8 +1750,30 @@ class FusedMoE(torch.nn.Module):
         if getattr(self, "_dsv41_expert_lru", None) is not None:
             from sglang.srt.layers.moe.dsv41_expert_spill import (
                 remap_dispatch_for_expert_spill,
+                slice_dispatch_for_spill_chunk,
+                spill_chunk_slices,
             )
 
+            # A batch whose unique expert set exceeds the GPU slots would
+            # thrash the LRU and silently drop overflow experts (-1 remap).
+            # Run it in token chunks so each chunk's working set stays
+            # resident, then concatenate the partial outputs.
+            slices = spill_chunk_slices(self, dispatch_output)
+            if slices is not None:
+                partials = []
+                combine_input = None
+                for start, end in slices:
+                    chunk = remap_dispatch_for_expert_spill(
+                        self, slice_dispatch_for_spill_chunk(dispatch_output, start, end)
+                    )
+                    combine_input = self.quant_method.apply(
+                        layer=self,
+                        dispatch_output=chunk,
+                    )
+                    partials.append(combine_input.hidden_states)
+                return combine_input._replace(
+                    hidden_states=torch.cat(partials, dim=0)
+                )
             dispatch_output = remap_dispatch_for_expert_spill(self, dispatch_output)
         return self.quant_method.apply(
             layer=self,

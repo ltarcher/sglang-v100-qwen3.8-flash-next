@@ -160,6 +160,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         graph = torch.cuda.CUDAGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]
+        graph_ctx_kwargs: dict
         if (
             self._memory_saver_adapter is not None
             and self._memory_saver_adapter.enabled
@@ -168,12 +169,27 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
                 self._memory_saver_adapter.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
             )
+            graph_ctx_kwargs = {}
         else:
             graph_ctx = self._device_module.graph
+            # This process runs background CUDA threads (DSV4.1 spill cache
+            # stats reader, metrics). torch's default "global" capture error
+            # mode lets any foreign-thread D2H -- the stats reader's periodic
+            # counter read -- invalidate the capture mid-flight, surfacing as
+            # "operation failed due to a previous error during capture" on an
+            # unrelated later kernel. The capture stream is non-blocking and
+            # no foreign thread targets it, so "thread_local" is the mode
+            # whose contract actually holds here.
+            graph_ctx_kwargs = {"capture_error_mode": "thread_local"}
 
         with (
             graph_pool_capture_scope(),
-            graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+            graph_ctx(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                **graph_ctx_kwargs,
+            ),
         ):
             self._precarve.mint()
             out = forward_fn()

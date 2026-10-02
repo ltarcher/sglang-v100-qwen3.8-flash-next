@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
+
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -42,8 +45,17 @@ logger = logging.getLogger(__name__)
 
 GIB = 1024**3
 
-# FusedMoE expert-dim parameters after MXFP4 Marlin pack. Shrink them together
-# so w13/w2/scales stay row-aligned with the LRU slot map.
+# FusedMoE expert-dim parameters after MXFP4/NVFP4 Marlin pack. Shrink them
+# together so w13/w2/scales stay row-aligned with the LRU slot map. The two
+# scale-inv names are the MXFP4 checkpoint layout, the two scale_2 names the
+# NVFP4 checkpoint layout; after the SM70 Marlin pack both families carry the
+# per-expert global scales instead (w13_scale2 / w2_scale2), which the LRU
+# must swap just like any other expert-dim row because the fold-down makes
+# them expert-specific. The per-expert input_scale rows exist only on NVFP4
+# checkpoints and must mirror too: the loader routes every expert-indexed
+# load, and a spilled expert with no host row would hit the no-GPU-slot
+# guard. (SM70 Marlin never consumes them -- process_weights_after_loading
+# reduces them to a scalar -- but the loads must land somewhere.)
 _EXPERT_PARAM_ATTRS = (
     "w13_weight",
     "w2_weight",
@@ -51,6 +63,12 @@ _EXPERT_PARAM_ATTRS = (
     "w2_weight_scale",
     "w13_weight_scale_inv",
     "w2_weight_scale_inv",
+    "w13_weight_scale_2",
+    "w2_weight_scale_2",
+    "w13_scale2",
+    "w2_scale2",
+    "w13_input_scale",
+    "w2_input_scale",
     "w13_weight_bias",
     "w2_weight_bias",
 )
@@ -136,23 +154,77 @@ def marlin_mxfp4_packed_expert_bytes(
     return w13 + w2 + s13 + s2
 
 
+def marlin_nvfp4_packed_expert_bytes(
+    hidden_size: int, intermediate_size_per_partition: int
+) -> int:
+    """Bytes for one expert after NVFP4 SM70 Marlin pack.
+
+    Codes: [K/16, 2N] int32 for w13 (i.e. K*N fp4 elements at 0.5 B), same
+    density for w2. Scales: one e4m3 per 16 inputs per output. Plus the two
+    per-expert fp32 global scales (fold-down makes the w13 one
+    expert-specific, so the LRU swaps it with the rows).
+    """
+    hidden = hidden_size
+    inter = intermediate_size_per_partition
+    w13 = inter * hidden
+    w2 = inter * hidden // 2
+    s13 = 2 * inter * hidden // 16
+    s2 = hidden * inter // 16
+    return w13 + w2 + s13 + s2 + 16
+
+
+# Construction-time exemption for FusedMoE layers that must keep every routed
+# expert GPU-resident even when the process-wide spill env is set. The NextN
+# draft MoE is the canonical user: a single full-size MoE layer run on every
+# decode step whose forward dispatch has no spill LRU/remap wiring (that wiring
+# attaches only to the target model via finalize_after_quant_processing), so a
+# shrunk slot count would leave its unremapped topk_ids indexing past the
+# weight tensor.
+_spill_exempt_depth = 0
+
+
+@contextmanager
+def exempt_fused_moe_from_spill():
+    global _spill_exempt_depth
+    _spill_exempt_depth += 1
+    try:
+        yield
+    finally:
+        _spill_exempt_depth -= 1
+
+
 def plan_gpu_expert_slots(
     *,
     num_local_experts: int,
     n_shared: int,
     hidden_size: int,
     intermediate_size_per_partition: int,
-    n_layers: int = N_LAYERS,
+    n_layers: Optional[int] = None,
+    is_nvfp4: bool = False,
 ) -> tuple[int, Optional[RoutedExpertSpillPlan]]:
     """GPU expert-dim length for create_weights. APPLY shrinks at alloc time."""
     spill_gib = float(envs.SGLANG_DSV41_EXPERT_SPILL_GB.get() or 0.0)
     apply = bool(envs.SGLANG_DSV41_EXPERT_SPILL_APPLY.get())
     if not apply or spill_gib <= 0 or num_local_experts <= 0:
         return num_local_experts, None
+    if _spill_exempt_depth > 0:
+        logger.info(
+            "DSV4.1 expert spill exempt at construction: keeping all %d routed "
+            "experts GPU-resident (NextN draft / spill-unwired MoE).",
+            num_local_experts,
+        )
+        return num_local_experts, None
+    if n_layers is None:
+        # DSV4.1's 40 was the planning default; other stacks override (GLM
+        # has 42 MoE layers), or via SGLANG_DSV41_EXPERT_SPILL_N_LAYERS.
+        n_layers = int(envs.SGLANG_DSV41_EXPERT_SPILL_N_LAYERS.get() or N_LAYERS)
     local_routed = max(num_local_experts - n_shared, 0)
     # Spill GiB is sized for the 40-layer 384-expert target (48 local routed
     # at EP8). DSpark draft is 128/EP8=16 and must stay fully GPU-resident.
-    target_local = N_ROUTED_EXPERTS // 8
+    # Overridable for other stacks / forced-spill smoke tests.
+    target_local = int(
+        envs.SGLANG_DSV41_EXPERT_SPILL_MIN_LOCAL.get() or (N_ROUTED_EXPERTS // 8)
+    )
     if 0 < local_routed < target_local:
         logger.info(
             "DSV4.1 expert spill skipped: local routed %d < target shard %d. "
@@ -162,9 +234,14 @@ def plan_gpu_expert_slots(
             num_local_experts,
         )
         return num_local_experts, None
-    bytes_per = marlin_mxfp4_packed_expert_bytes(
-        hidden_size, intermediate_size_per_partition
-    )
+    if is_nvfp4:
+        bytes_per = marlin_nvfp4_packed_expert_bytes(
+            hidden_size, intermediate_size_per_partition
+        )
+    else:
+        bytes_per = marlin_mxfp4_packed_expert_bytes(
+            hidden_size, intermediate_size_per_partition
+        )
     plan = plan_routed_expert_spill(
         spill_gib=spill_gib,
         local_routed=local_routed,
@@ -225,9 +302,33 @@ def spill_host_is_marlin_packed(
     host_scale = hosts.get("w13_weight_scale")
     if host_scale is None or gpu_scale is None:
         return False
-    return tuple(host_scale.shape[1:]) == tuple(gpu_scale.shape[1:]) and (
-        host_scale.dtype == gpu_scale.dtype
-    )
+    if tuple(host_scale.shape[1:]) != tuple(gpu_scale.shape[1:]) or (
+        host_scale.dtype != gpu_scale.dtype
+    ):
+        return False
+    # NVFP4 checkpoints also name their raw E4M3 scales "w13_weight_scale"
+    # with the same trailing shape and dtype as the packed Marlin tensor, so
+    # shape alone cannot separate checkpoint from packed. The pack additionally
+    # emits the per-expert global scales, which only exist post-pack.
+    if host_scale.dtype == torch.float8_e4m3fn and "w13_scale2" not in hosts:
+        return False
+    return True
+
+
+def _alloc_ctor_row(
+    n_host: int, row_shape: tuple, dtype: torch.dtype
+) -> torch.Tensor:
+    """Allocate a checkpoint-layout ctor row (pageable).
+
+    Measured on the 4xV100 host: every *fresh* pinned allocation costs 2x its
+    size in process RSS there (standalone it is 1x), so a fully pinned
+    19 GiB/rank mirror bills 38 GiB/rank and the kernel OOM-killer wins at
+    create time. The mirror therefore stays pageable end to end; with the
+    landing pool disabled the LRU swaps through pageable staging, and the
+    pinned+landing path waits on pinning the mirror without fresh
+    cudaHostAlloc growth.
+    """
+    return torch.empty(n_host, *row_shape, dtype=dtype, device="cpu")
 
 
 def alloc_spill_host_buffers(moe: nn.Module, plan: RoutedExpertSpillPlan) -> None:
@@ -235,10 +336,9 @@ def alloc_spill_host_buffers(moe: nn.Module, plan: RoutedExpertSpillPlan) -> Non
     if plan.n_spilled <= 0:
         return
     hosts: Dict[str, torch.Tensor] = {}
-    # Checkpoint-layout rows, filled by the weight loader; repacked and pinned
-    # after Marlin pack (pin_spill_host_numa). Not registered here: pinning
-    # 80 GiB before the load would only add to the loader's peak.
-    #
+    # Checkpoint-layout rows, filled by the weight loader; repacked after the
+    # Marlin pack (pin_spill_host_numa / the SM70 pack's packed outputs).
+    # These stay pageable end to end on RAM-tight hosts (see _alloc_ctor_row);
     # WO-13 D1: place them on the *same* NUMA node the pinned mirror of this
     # layer will use. With the default (preferred node 1) policy and node 1
     # full of Engram hugetlb, these 10 GiB/rank overflowed onto node 0 and
@@ -262,13 +362,67 @@ def alloc_spill_host_buffers(moe: nn.Module, plan: RoutedExpertSpillPlan) -> Non
             continue
         n_host = plan.n_spilled
         numel = n_host * int(p[0].numel())
+        if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+            import sys as _sys
+
+            before = int(
+                next(
+                    ln.split()[1]
+                    for ln in open("/proc/self/status")
+                    if ln.startswith("VmRSS")
+                )
+            )
+            _sys.stdout.flush()
         if node is not None and numel > 0:
-            mm = mmap_numa_thp(numel * p.element_size(), node=node)
-            mms.append(mm)
-            host = torch.frombuffer(mm, dtype=p.dtype, count=numel).view(n_host, *row_shape)
+            try:
+                mm = mmap_numa_thp(numel * p.element_size(), node=node)
+            except EngramNumaError:
+                # No CAP_SYS_NICE (containers): fall back to the plain
+                # allocator; pin_spill_host_numa degrades the same way.
+                node = None
+                logger.warning(
+                    "DSV4.1 spill host NUMA bind failed (%s); using pageable "
+                    "ctor rows",
+                    "set_mempolicy/mbind EPERM",
+                )
+                mm = None
+            if mm is not None:
+                mms.append(mm)
+                host = torch.frombuffer(mm, dtype=p.dtype, count=numel).view(
+                    n_host, *row_shape
+                )
+            else:
+                host = _alloc_ctor_row(n_host, row_shape, p.dtype)
         else:
-            host = torch.empty(n_host, *row_shape, dtype=p.dtype, device="cpu")
+            host = _alloc_ctor_row(n_host, row_shape, p.dtype)
         hosts[attr] = host
+        if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+            after = int(
+                next(
+                    ln.split()[1]
+                    for ln in open("/proc/self/status")
+                    if ln.startswith("VmRSS")
+                )
+            )
+            logger.info(
+                "DSV4.1 ctor attr %s: %d MiB pinned=%s RSS %+d kB",
+                attr,
+                numel * p.element_size() // (1024**2),
+                host.is_pinned(),
+                after - before,
+            )
+    if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+        with open("/proc/self/status") as _f:
+            _rss = next(
+                ln.split(":")[1].strip() for ln in _f if ln.startswith("VmRSS")
+            )
+        logger.info(
+            "DSV4.1 spill ctor alloc %s: %d attrs %.0f MiB, VmRSS=%s",
+            type(moe).__name__,
+            len(hosts),
+            sum(t.numel() * t.element_size() for t in hosts.values()) / (1024**2),
+            _rss,
+        )
     moe._dsv41_spill_host = hosts  # type: ignore[attr-defined]
     moe._dsv41_spill_host_ctor_mms = mms  # type: ignore[attr-defined]
     moe._dsv41_spill_numa_node = node  # type: ignore[attr-defined]
@@ -284,6 +438,9 @@ def repack_spill_host_for_sm70_marlin(moe: nn.Module) -> None:
     hosts: Optional[Dict[str, torch.Tensor]] = getattr(moe, "_dsv41_spill_host", None)
     if not hosts or "w13_weight" not in hosts:
         return
+    if getattr(moe, "_dsv41_spill_host_packed", False):
+        return
+    _rss_probe(moe, "repack-enter")
     gpu = moe.w13_weight
     host_w13 = hosts["w13_weight"]
     host_trail = tuple(host_w13.shape[1:])
@@ -297,6 +454,7 @@ def repack_spill_host_for_sm70_marlin(moe: nn.Module) -> None:
             hosts["w13_weight_scale"].dtype,
             tuple(hosts["w13_weight_scale"].shape[1:]),
         )
+        moe._dsv41_spill_host_packed = True  # type: ignore[attr-defined]
         return
     logger.info(
         "DSV4.1 spill host packing w13 host=%s %s gpu=%s %s host_scale_keys=%s",
@@ -313,33 +471,72 @@ def repack_spill_host_for_sm70_marlin(moe: nn.Module) -> None:
     # writes the packed E-stack on CPU when the dummy is not CUDA.
     dummy.w13_weight = nn.Parameter(hosts["w13_weight"].contiguous(), requires_grad=False)
     dummy.w2_weight = nn.Parameter(hosts["w2_weight"].contiguous(), requires_grad=False)
-    s13 = hosts.get("w13_weight_scale_inv", hosts.get("w13_weight_scale"))
-    s2 = hosts.get("w2_weight_scale_inv", hosts.get("w2_weight_scale"))
-    if s13 is None or s2 is None:
+    raw_s13 = hosts.get("w13_weight_scale")
+    raw_s2 = hosts.get("w2_weight_scale")
+    if raw_s13 is None or raw_s2 is None:
         raise RuntimeError(
             "DSV4.1 spill host pack needs w13/w2 scales "
             f"(keys={sorted(hosts)})"
         )
-    dummy.w13_weight_scale_inv = nn.Parameter(s13.contiguous(), requires_grad=False)
-    dummy.w2_weight_scale_inv = nn.Parameter(s2.contiguous(), requires_grad=False)
-    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-        _prepare_moe_mxfp4_layer_for_sm70_marlin,
-    )
+    # NVFP4 checkpoints ship raw E4M3 block scales plus per-expert fp32
+    # weight_scale_2; MXFP4 ships ue8m0 under the *_scale_inv name. Dispatch
+    # on the block-scale dtype so both families pack through their own
+    # SM70 helper.
+    is_nvfp4 = raw_s13.dtype == torch.float8_e4m3fn
+    if is_nvfp4:
+        dummy.w13_weight_scale = nn.Parameter(
+            raw_s13.contiguous(), requires_grad=False
+        )
+        dummy.w2_weight_scale = nn.Parameter(raw_s2.contiguous(), requires_grad=False)
+        ckpt_s13_2 = hosts.get("w13_weight_scale_2")
+        ckpt_s2_2 = hosts.get("w2_weight_scale_2")
+        if ckpt_s13_2 is None or ckpt_s2_2 is None:
+            raise RuntimeError(
+                "DSV4.1 NVFP4 spill host pack needs weight_scale_2 rows "
+                f"(keys={sorted(hosts)})"
+            )
+        dummy.w13_weight_scale_2 = nn.Parameter(
+            ckpt_s13_2.contiguous(), requires_grad=False
+        )
+        dummy.w2_weight_scale_2 = nn.Parameter(
+            ckpt_s2_2.contiguous(), requires_grad=False
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            prepare_moe_nvfp4_layer_for_sm70_marlin,
+        )
+
+        pack_fn = prepare_moe_nvfp4_layer_for_sm70_marlin
+    else:
+        s13 = hosts.get("w13_weight_scale_inv", raw_s13)
+        s2 = hosts.get("w2_weight_scale_inv", raw_s2)
+        dummy.w13_weight_scale_inv = nn.Parameter(
+            s13.contiguous(), requires_grad=False
+        )
+        dummy.w2_weight_scale_inv = nn.Parameter(s2.contiguous(), requires_grad=False)
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            _prepare_moe_mxfp4_layer_for_sm70_marlin,
+        )
+
+        pack_fn = _prepare_moe_mxfp4_layer_for_sm70_marlin
 
     if torch.cuda.is_available():
         free_b, _total_b = torch.cuda.mem_get_info()
         logger.info(
-            "DSV4.1 spill host pack GPU free=%.1f MiB before dummy pack",
+            "DSV4.1 spill host pack GPU free=%.1f MiB before dummy pack (%s)",
             free_b / (1024**2),
+            "nvfp4" if is_nvfp4 else "mxfp4",
         )
     try:
-        _prepare_moe_mxfp4_layer_for_sm70_marlin(dummy)
+        pack_fn(dummy)
+        _rss_probe(moe, "pack-fn-done")
         packed: Dict[str, torch.Tensor] = {}
         for attr in (
             "w13_weight",
             "w2_weight",
             "w13_weight_scale",
             "w2_weight_scale",
+            "w13_scale2",
+            "w2_scale2",
             "w13_weight_bias",
             "w2_weight_bias",
         ):
@@ -349,6 +546,8 @@ def repack_spill_host_for_sm70_marlin(moe: nn.Module) -> None:
             packed[attr] = t.detach().to("cpu").contiguous()
             del t
         moe._dsv41_spill_host = packed  # type: ignore[attr-defined]
+        moe._dsv41_spill_host_packed = True  # type: ignore[attr-defined]
+        _rss_probe(moe, "repack-done")
         logger.info(
             "DSV4.1 spill host Marlin-packed w13 %s %s -> %s %s",
             host_w13.dtype,
@@ -444,6 +643,300 @@ def _pin_spill_hosts_on_node(
     return pinned, mms, total, registered
 
 
+def _rss_probe(moe: nn.Module, tag: str) -> None:
+    if not envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+        return
+    n = getattr(moe, "_dsv41_spill_probe_n", 0)
+    if n > 5:
+        return
+    moe._dsv41_spill_probe_n = n + 1  # type: ignore[attr-defined]
+    with open("/proc/self/status") as _f:
+        _status = {
+            ln.split(":")[0]: ln.split(":")[1].strip()
+            for ln in _f
+            if ln.startswith(("VmRSS", "RssAnon", "RssFile"))
+        }
+    # VmRSS counts mmap'd checkpoint page cache; RssAnon is the process's own
+    # resident memory (spill mirror, pinned host, activations).
+    logger.info(
+        "DSV4.1 spill RSS probe %s L%s: VmRSS=%s RssAnon=%s RssFile=%s",
+        tag, n,
+        _status.get("VmRSS"), _status.get("RssAnon"), _status.get("RssFile"),
+    )
+
+
+def _ref_census(moe: nn.Module, layer_ordinal: int) -> None:
+    """TEMP (RAM bring-up): reconcile host RSS against tensor buckets.
+
+    Big pageable storages reconcile exactly with the design residency, yet RSS
+    climbs ~440 MiB/layer -- attribute the excess: dedup CPU storages by
+    data_ptr into pinned / big-pageable / mid-pageable buckets and log totals
+    plus the top mid-size shapes.
+    """
+    if not envs.SGLANG_DSV41_SPILL_REF_CENSUS.get():
+        return
+    if layer_ordinal > 8:
+        return
+    seen_ptrs = set()
+    pin_total = page_big = page_mid = 0
+    mid_shapes: Dict[tuple, int] = {}
+    pin_shapes: Dict[tuple, int] = {}
+    n_page_big = 0
+    with open("/proc/self/status") as _f:
+        _rss = next(
+            ln.split(":")[1].strip() for ln in _f if ln.startswith("VmRSS")
+        )
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                continue
+            nb = obj.numel() * obj.element_size()
+            if nb < (1 << 20):
+                continue
+            ptr = int(obj.untyped_storage().data_ptr())
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            if obj.is_pinned():
+                pin_total += nb
+                k = (tuple(obj.shape), str(obj.dtype))
+                pin_shapes[k] = pin_shapes.get(k, 0) + nb
+            elif nb >= (64 << 20):
+                page_big += nb
+                n_page_big += 1
+            else:
+                page_mid += nb
+                k = (tuple(obj.shape), str(obj.dtype))
+                mid_shapes[k] = mid_shapes.get(k, 0) + nb
+        except Exception:
+            continue
+    gib = 1024**3
+    logger.info(
+        "DSV4.1 mem census L%s: VmRSS=%s pinned=%.2fG page_big=%.2fG(%d) "
+        "page_mid=%.2fG",
+        layer_ordinal,
+        _rss,
+        pin_total / gib,
+        page_big / gib,
+        n_page_big,
+        page_mid / gib,
+    )
+    top_pin = sorted(pin_shapes.items(), key=lambda kv: -kv[1])[:4]
+    for (shape, dtype), nb in top_pin:
+        logger.info(
+            "DSV4.1 mem census L%s: pinned %d MiB %s %s",
+            layer_ordinal,
+            nb // (1024**2),
+            shape,
+            dtype,
+        )
+    top_mid = sorted(mid_shapes.items(), key=lambda kv: -kv[1])[:8]
+    for (shape, dtype), nb in top_mid:
+        logger.info(
+            "DSV4.1 mem census L%s: mid %d MiB %s %s",
+            layer_ordinal,
+            nb // (1024**2),
+            shape,
+            dtype,
+        )
+
+
+def _register_spill_hosts_inplace(moe: nn.Module, layer_ordinal: int) -> bool:
+    """Pin the packed host mirror via cudaHostRegister -- in place, no copy.
+
+    The copy-based fallback below holds the full pageable mirror while the
+    pinned copy is built. On the 4xV100 RAM bring-up that peak
+    (pageable-full + pinned-growing, 4 TP ranks, no swap) crossed the OS OOM
+    killer at SGLANG_DSV41_EXPERT_SPILL_GB=18 and 20. Registering the
+    existing mapping adds no memory at all: the pages are already resident,
+    they only become unevictable and UVA device-accessible -- exactly what
+    the D4-G landing page-in kernel dereferences. The ctor rows are plain
+    allocator blocks (mmap-backed, page-aligned); if any register call still
+    fails, every registration is rolled back and the copy path runs as
+    before.
+    """
+    hosts: Optional[Dict[str, torch.Tensor]] = getattr(moe, "_dsv41_spill_host", None)
+    if not hosts or getattr(moe, "_dsv41_spill_host_pinned", False):
+        return False
+    _rss_probe(moe, "pin-register-enter")
+    cudart = torch.cuda.cudart()
+    page = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+    mask = page - 1
+    # The attrs share allocator pages (the tiny *_scale2 rows live inside the
+    # w13/w2 row blocks), so per-tensor registration overlaps itself: the
+    # second register of a shared page fails with cudaErrorHostMemoryAlreadyRegistered
+    # and any later rollback unmaps a page a surviving span still "holds".
+    # Union the page-aligned spans first and register each disjoint run once.
+    # glibc places large blocks as back-to-back mmaps, so a naive page
+    # rounding of a tensor's range reaches into the neighboring mapping
+    # (the next layer's ctor rows, pack temporaries). Registering those
+    # pages poisons them for their owner and the driver surfaces
+    # cudaErrorHostMemoryAlreadyRegistered later, far from the cause. Clip
+    # every span to the /proc/self/maps VMAs it actually lives in first.
+    vmas: List[tuple] = []
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                parts = line.split()
+                start_s, end_s = parts[0].split("-")
+                vmas.append((int(start_s, 16), int(end_s, 16)))
+        vmas.sort()
+    except OSError:
+        vmas = []
+    if not vmas:
+        logger.warning(
+            "DSV4.1 spill mirror L%s: /proc/self/maps unreadable; "
+            "falling back to copy pin",
+            layer_ordinal,
+        )
+        return _plain_pin_spill_hosts(moe, layer_ordinal)
+    # A tensor is only safe to register if its padded page span exactly owns
+    # its backing VMA (glibc serves large blocks as dedicated mmaps, header
+    # included). Small scale rows live in the shared heap arena: registering
+    # arena pages pins foreign allocations, and once glibc trims/frees them
+    # the driver's registration goes stale -- the next cudaHostAlloc dies
+    # with cudaErrorHostMemoryAlreadyRegistered far from the cause. Migrate
+    # those attrs into private anonymous mmaps first (same pattern the ctor
+    # path uses for NUMA placement); the page-in kernel UVA-reads every
+    # attr, so each must end up registered.
+    mms: List = []
+    raw_spans: List[tuple] = []
+    for attr, t in hosts.items():
+        nbytes = t.numel() * t.element_size()
+        if nbytes == 0:
+            continue
+        if not t.is_contiguous():
+            logger.warning(
+                "DSV4.1 spill mirror %s not contiguous; falling back to copy pin",
+                attr,
+            )
+            return _plain_pin_spill_hosts(moe, layer_ordinal)
+        lo = int(t.data_ptr()) & ~mask
+        hi = (int(t.data_ptr()) + nbytes + mask) & ~mask
+        owner = next(
+            ((s, e) for s, e in vmas if s <= lo and hi <= e), None
+        )
+        if owner is None:
+            logger.warning(
+                "DSV4.1 spill mirror %s spans no single VMA; falling back "
+                "to copy pin",
+                attr,
+            )
+            # Already-migrated attrs view private mmaps: keep the mappings
+            # alive for the copy path to swap out (closing here would leave
+            # the hosts dict reading unmapped memory).
+            moe._dsv41_spill_host_mms = mms  # type: ignore[attr-defined]
+            return _plain_pin_spill_hosts(moe, layer_ordinal)
+        if owner != (lo, hi):
+            import mmap as _mmap_mod
+
+            mm_obj = _mmap_mod.mmap(-1, nbytes)
+            moved = torch.frombuffer(mm_obj, dtype=t.dtype, count=t.numel()).view(
+                t.shape
+            )
+            moved.copy_(t)
+            hosts[attr] = moved
+            mms.append(mm_obj)
+            lo = int(moved.data_ptr()) & ~mask
+            hi = (int(moved.data_ptr()) + nbytes + mask) & ~mask
+        raw_spans.append((lo, hi))
+    if not raw_spans:
+        return _plain_pin_spill_hosts(moe, layer_ordinal)
+    merged: List[List[int]] = []
+    for base, end in sorted(raw_spans):
+        if merged and base <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([base, end])
+    registered_spans: List[tuple] = []
+    for base, end in merged:
+        err = int(
+            cudart.cudaHostRegister(base, end - base, _CUDA_HOST_REGISTER_MAPPED)
+        )
+        if err != 0:
+            logger.warning(
+                "DSV4.1 spill mirror in-place cudaHostRegister(%d bytes) "
+                "failed err=%d; rolling back",
+                end - base,
+                err,
+            )
+            for rb, re_ in reversed(registered_spans):
+                try:
+                    cudart.cudaHostUnregister(rb)
+                except Exception:
+                    pass
+            moe._dsv41_spill_host_mms = mms  # type: ignore[attr-defined]
+            return _plain_pin_spill_hosts(moe, layer_ordinal)
+        registered_spans.append((base, end))
+    registered = sum(end - base for base, end in registered_spans)
+    moe._dsv41_spill_host_mms = mms  # type: ignore[attr-defined]
+    moe._dsv41_spill_host_pinned = True  # type: ignore[attr-defined]
+    moe._dsv41_spill_host_node = None  # type: ignore[attr-defined]
+    # The mirror rows were registered in place, so nothing was replaced: any
+    # construct-time mappings they view must stay alive (same rule as the
+    # pageable path).
+    gc.collect()
+    _rss_probe(moe, "pin-register-done")
+    logger.info(
+        "DSV4.1 spill mirror L%s: %.0f MiB pinned in place via "
+        "cudaHostRegister (no copy)",
+        layer_ordinal,
+        registered / (1024**2),
+    )
+    return True
+
+
+def _plain_pin_spill_hosts(moe: nn.Module, layer_ordinal: int) -> bool:
+    """Pin the packed host mirror with the CUDA allocator (no NUMA placement).
+
+    Pinned memory is UVA device-accessible, which the D4-G landing page-in
+    kernel requires: it dereferences the host rows' VAs directly. A pageable
+    mirror faults there, so this is the mandatory fallback when
+    set_mempolicy/mbind is unavailable (containers without CAP_SYS_NICE).
+    """
+    hosts: Optional[Dict[str, torch.Tensor]] = getattr(moe, "_dsv41_spill_host", None)
+    if not hosts or getattr(moe, "_dsv41_spill_host_pinned", False):
+        return False
+    _rss_probe(moe, "pin-enter")
+    # The mirror was packed through ~42 layers of construction transients; the
+    # default allocator retains a multi-GiB heap high-water mark that a fresh
+    # pinned allocation of the same size cannot reuse. Hand it back before
+    # doubling the mirror's footprint -- measured +5-7 GiB/rank resident at
+    # this point on the 4xV100 RAM bring-up (no swap: it is all unevictable).
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    total = 0
+    for attr, host in list(hosts.items()):
+        # Swap per tensor and drop the pageable source immediately: on a
+        # RAM-tight host (4 TP ranks pinning ~GB-scale mirrors) the original
+        # all-at-once copy peaked at 2x the mirror set and the kernel
+        # OOM-killed the container.
+        pinned = host.pin_memory()
+        total += pinned.numel() * pinned.element_size()
+        hosts[attr] = pinned
+        del host
+    _rss_probe(moe, "pin-swapped")
+    moe._dsv41_spill_host = hosts  # type: ignore[attr-defined]
+    moe._dsv41_spill_host_mms = []  # type: ignore[attr-defined]
+    moe._dsv41_spill_host_pinned = True  # type: ignore[attr-defined]
+    moe._dsv41_spill_host_node = None  # type: ignore[attr-defined]
+    # Construct-time checkpoint-layout mappings: the pinned copies replaced
+    # their tensors, so dropping the mmap handles lets them unmap now.
+    moe._dsv41_spill_host_ctor_mms = None  # type: ignore[attr-defined]
+    gc.collect()
+    _ref_census(moe, layer_ordinal)
+    logger.info(
+        "DSV4.1 spill mirror L%s: %.0f MiB pinned (plain CUDA allocator, "
+        "no NUMA placement)",
+        layer_ordinal,
+        total / (1024**2),
+    )
+    return True
+
+
 def pin_spill_host_numa(moe: nn.Module, layer_ordinal: int) -> Optional[int]:
     """WO-13 D1: move the packed host mirror into node-local THP mappings and
     ``cudaHostRegister`` them (mapped).
@@ -462,6 +955,33 @@ def pin_spill_host_numa(moe: nn.Module, layer_ordinal: int) -> Optional[int]:
         return None
     if getattr(moe, "_dsv41_spill_host_pinned", False):
         return getattr(moe, "_dsv41_spill_host_node", None)
+    if spill_landing_slots() <= 0:
+        # Without the landing pool nothing reads the mirror through UVA: the
+        # D4-G page-in kernel is the only device-side consumer and D4-H's host
+        # GEMV reads the rows on the CPU. A pageable mirror is enough, and on
+        # hosts where a fresh pinned allocation bills 2x its size in RSS
+        # (measured on the 4xV100 RAM bring-up) pinning a full 19 GiB/rank
+        # mirror would double the footprint and lose to the OOM killer. The
+        # LRU then swaps through pageable staging (slower swaps, same results).
+        moe._dsv41_spill_host_pinned = False  # type: ignore[attr-defined]
+        moe._dsv41_spill_host_node = None  # type: ignore[attr-defined]
+        # NOTE: ctor mms are left alone -- the mirror tensors still view that
+        # memory (no replacement happened here), so the handles must outlive
+        # them.
+        gc.collect()
+        _rss_probe(moe, "pin-skipped-pageable")
+        logger.info(
+            "DSV4.1 spill mirror L%s: kept pageable (%.0f MiB, landing pool "
+            "disabled -> Python LRU swaps)",
+            layer_ordinal,
+            sum(h.numel() * h.element_size() for h in hosts.values()) / (1024**2),
+        )
+        return None
+    if not bool(envs.SGLANG_ENABLE_DSV41_EXPERT_SPILL_NUMA.get()):
+        if _register_spill_hosts_inplace(moe, layer_ordinal):
+            return None
+        _plain_pin_spill_hosts(moe, layer_ordinal)
+        return None
     preferred = getattr(moe, "_dsv41_spill_numa_node", None)
     if preferred is None:
         nodes = _spill_numa_nodes()
@@ -493,9 +1013,11 @@ def pin_spill_host_numa(moe: nn.Module, layer_ordinal: int) -> Optional[int]:
                 e,
             )
     if last_err is not None or pinned is None:
-        raise last_err or EngramNumaError(
-            f"spill mirror L{layer_ordinal}: no NUMA node accepted the pin"
-        )
+        # Containers without CAP_SYS_NICE cannot set_mempolicy(BIND). The
+        # mirror still must be pinned: the D4-G landing page-in kernel reads
+        # host rows through UVA, which pageable memory cannot serve.
+        _plain_pin_spill_hosts(moe, layer_ordinal)
+        return None
     moe._dsv41_spill_host = pinned  # type: ignore[attr-defined]
     moe._dsv41_spill_host_mms = mms  # type: ignore[attr-defined]
     moe._dsv41_spill_host_pinned = registered == total  # type: ignore[attr-defined]
@@ -566,6 +1088,9 @@ def spill_placement(moe: nn.Module) -> tuple[List[int], List[int]]:
     path = envs.SGLANG_DSV41_EXPERT_SPILL_COLD_SET.get()
     if path and plan.n_spilled > 0:
         table = _load_cold_set_table(path)
+        # Rows are indexed by model layer_id (same space as the upstream
+        # expert-distribution recorder); layers before first_k_dense_replace
+        # are dense and never consulted.
         layer = int(getattr(moe, "layer_id", -1))
         rank = int(getattr(moe, "moe_ep_rank", 0))
         if table is not None and 0 <= layer < table.shape[0] and rank < table.shape[1]:
@@ -740,6 +1265,7 @@ class RoutedExpertLru:
         self.n_swaps = 0
         # Last-resort evictions when unique(batch) > n_kept_routed (intra-batch thrash).
         self.n_thrash = 0
+        self._swap_row_bytes: Optional[int] = None
 
     def _alloc_host(self, weight: torch.Tensor, *, pin_memory: bool) -> torch.Tensor:
         """Host holds only spilled routed rows (logical n_kept .. n_routed-1)."""
@@ -758,22 +1284,38 @@ class RoutedExpertLru:
             node = int(envs.SGLANG_DSV41_ENGRAM_NUMA_NODE.get())
             if node < 0:
                 node = DEFAULT_GPU_NUMA_NODE
-            host_mm = mmap_numa_thp(host_bytes, node=node)
-            if getattr(self, "_host_mms", None) is None:
-                self._host_mms = []
-            self._host_mms.append(host_mm)
-            host = torch.frombuffer(
-                host_mm, dtype=weight.dtype, count=n_host * row_numel
-            ).view(n_host, *row_shape)
-            err = torch.cuda.cudart().cudaHostRegister(
-                host.data_ptr(), host_bytes, _CUDA_HOST_REGISTER_MAPPED
-            )
-            if int(err) != 0:
+            try:
+                host_mm = mmap_numa_thp(host_bytes, node=node)
+            except EngramNumaError:
+                # No CAP_SYS_NICE (containers): plain allocator, no pin.
                 logger.warning(
-                    "cudaHostRegister expert-spill %s bytes failed err=%s; "
-                    "NUMA bind still holds",
-                    host_bytes,
-                    int(err),
+                    "DSV4.1 LRU host NUMA bind failed; using pageable rows"
+                )
+                host_mm = None
+            if host_mm is not None:
+                if getattr(self, "_host_mms", None) is None:
+                    self._host_mms = []
+                self._host_mms.append(host_mm)
+                host = torch.frombuffer(
+                    host_mm, dtype=weight.dtype, count=n_host * row_numel
+                ).view(n_host, *row_shape)
+                err = torch.cuda.cudart().cudaHostRegister(
+                    host.data_ptr(), host_bytes, _CUDA_HOST_REGISTER_MAPPED
+                )
+                if int(err) != 0:
+                    logger.warning(
+                        "cudaHostRegister expert-spill %s bytes failed err=%s; "
+                        "NUMA bind still holds",
+                        host_bytes,
+                        int(err),
+                    )
+            else:
+                host = torch.empty(
+                    n_host,
+                    *row_shape,
+                    dtype=weight.dtype,
+                    device="cpu",
+                    pin_memory=pin_memory and device.type == "cuda",
                 )
         else:
             host = torch.empty(
@@ -798,6 +1340,14 @@ class RoutedExpertLru:
     @property
     def gpu_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self._gpus)
+
+    def swap_row_bytes(self) -> int:
+        """Per-swap bytes moved in each direction (one host row, all attrs)."""
+        if self._swap_row_bytes is None:
+            self._swap_row_bytes = sum(
+                int(h[0].numel()) * int(h.element_size()) for h in self._hosts
+            )
+        return self._swap_row_bytes
 
     def _shrink_one(self, tensor: torch.Tensor) -> torch.Tensor:
         kept = tensor[self._kept_ids].clone()
@@ -953,7 +1503,10 @@ class RoutedExpertLru:
             return slot
         raise RuntimeError("every GPU expert slot is needed by this batch")
 
-    def ensure(self, logical_ids: Iterable[int]) -> None:
+    def ensure(
+        self,
+        logical_ids: Iterable[int],
+    ) -> None:
         """Make each routed id resident in a GPU slot, spilling LRU victims."""
         ids = [int(i) for i in logical_ids]
         batch = {i for i in ids if 0 <= i < self.n_routed}
@@ -989,6 +1542,7 @@ class RoutedExpertLru:
                         self.n_kept_routed,
                     )
             del self._lru[victim_slot]
+            hs = self._id_to_host_slot.pop(logical)
             staging = self._ensure_staging()
             for gpu, host, st in zip(self._gpus, self._hosts, staging):
                 self._swap_row(
@@ -999,7 +1553,6 @@ class RoutedExpertLru:
                     victim_id=victim_id,
                     logical=logical,
                 )
-            hs = self._id_to_host_slot.pop(logical)
             self._id_to_host_slot[victim_id] = hs
             self._host_slot_to_id[hs] = victim_id
             del self._id_to_slot[victim_id]
@@ -1015,7 +1568,6 @@ class RoutedExpertLru:
             if host_table is not None:
                 host_table[logical] = -1
                 host_table[victim_id] = hs
-
     def gather_rows(self, logical_ids: Iterable[int]) -> torch.Tensor:
         self.ensure(logical_ids)
         ids = list(logical_ids)
@@ -1051,16 +1603,21 @@ def _expert_dim_params(moe: nn.Module) -> Dict[str, torch.nn.Parameter]:
 
 
 # Per-rank swap-rate telemetry:
-# (layer-calls, swaps, decode layer-calls, decode swaps, intra-batch thrash swaps).
-_SWAP_STATS = [0, 0, 0, 0, 0]
+# (layer-calls, swaps, decode layer-calls, decode swaps, intra-batch thrash
+# swaps, swap bytes per direction; PCIe traffic is twice that: HtoD page-in
+# plus the DtoH write-back of the victim).
+_SWAP_STATS = [0, 0, 0, 0, 0, 0]
 _SWAP_LOG_EVERY = 40 * 200  # ~200 forward passes of 40 MoE layers
 
 
-def _note_swaps(swaps: int, n_tokens: int, thrash: int = 0) -> None:
+def _note_swaps(
+    swaps: int, n_tokens: int, thrash: int = 0, row_bytes: int = 0
+) -> None:
     s = _SWAP_STATS
     s[0] += 1
     s[1] += swaps
     s[4] += thrash
+    s[5] += swaps * row_bytes
     if n_tokens <= 2:  # decode-shaped (bs 1-2 at np=1)
         s[2] += 1
         s[3] += swaps
@@ -1068,12 +1625,14 @@ def _note_swaps(swaps: int, n_tokens: int, thrash: int = 0) -> None:
         n_layers = 40
         logger.info(
             "DSV4.1 spill swaps: %d over %d layer-calls (%.2f/layer-call); decode-shaped "
-            "%d over %d (%.1f swaps per %d-layer token); intra-batch thrash %d",
+            "%d over %d (%.1f swaps per %d-layer token); intra-batch thrash %d; "
+            "swapped %.2f GiB per direction",
             s[1], s[0], s[1] / max(s[0], 1),
             s[3], s[2], n_layers * s[3] / max(s[2], 1), n_layers,
             s[4],
+            s[5] / (1024**3),
         )
-        s[0] = s[1] = s[2] = s[3] = s[4] = 0
+        s[:] = [0] * len(s)
 
 
 def spill_landing_slots() -> int:
@@ -1084,15 +1643,41 @@ def spill_landing_slots() -> int:
         return 0
 
 
+def spill_decode_landing_active() -> bool:
+    """Whether decode-time landing page-in is in play at all.
+
+    True only when experts were actually spilled to the host
+    (SGLANG_DSV41_EXPERT_SPILL_APPLY) and the landing pool is enabled. The
+    graph-capture width filter and landing warmup must not engage otherwise:
+    a model that never spilled (e.g. Qwen3.8 with SGLANG_DSV41_SPILL_LANDING
+    left at its default) has no page-in and no drop hazard, and filtering
+    would strip every spec capture shape and refuse to boot.
+    """
+    return (
+        bool(envs.SGLANG_DSV41_EXPERT_SPILL_APPLY.get())
+        and spill_landing_slots() > 0
+    )
+
+
 def _decode_shaped_max_tokens() -> int:
     """Max T that still uses landing page-in instead of the prefill LRU.
 
-    Greedy pads T to 2. DSpark target-verify is γ+1; D15-0 sizes landing to
-    ``6 * (γ+1)``, so ``slots // 6`` recovers that width. Landing=6 stays T≤2.
+    Correctness bound: the assign kernel silently drops every expert past
+    ``min(n_landing, kMaxLanding)`` unique misses, so a T is landing-safe only
+    when ``landing >= T * topk`` (GLM-5.3 routed top-k is 8; P0 measured
+    active drops at landing=12 with T=2 already). ``slots // 8`` encodes that,
+    capped at 6 by the decode graph width. The 2-token floor keeps bs=2 greedy
+    decode on the captured path only while 2*8 still fits the pool; below 16
+    slots those shapes must go eager, and below 8 slots nothing fits -- 0
+    routes every batch to the eager path (captured shapes then fail loudly at
+    the width guard instead of dropping experts silently).
     """
     slots = spill_landing_slots()
-    verify_t = max(slots // 6, 1) if slots else 1
-    return max(2, verify_t)
+    if slots < 8:
+        return 0
+    if slots < 16:
+        return 1
+    return max(2, min(slots // 8, 6))
 
 
 def _decode_shaped_topk(topk_ids: torch.Tensor) -> bool:
@@ -1104,6 +1689,24 @@ def _cuda_graph_capturing() -> bool:
         return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
     except Exception:
         return False
+
+
+def _prefill_landing_ready(moe: nn.Module) -> bool:
+    """Wide (prefill/extend) batches may route through the landing pool.
+
+    Only when the pool holds every logical expert of a layer: a wide batch
+    can request all of them in one call, so anything narrower would silently
+    drop experts -- exactly what the decode gate exists to prevent. When the
+    gate holds, one device-side assign+copy per layer call replaces the host
+    LRU (its per-slice syncs, swap churn, and 1:1 write-back).
+    """
+    if not envs.SGLANG_DSV41_SPILL_PREFILL_LANDING.get():
+        return False
+    pool = getattr(moe, "_dsv41_landing_pool", None)
+    lru = getattr(moe, "_dsv41_expert_lru", None)
+    if pool is None or lru is None:
+        return False
+    return spill_landing_slots() >= int(lru.n_experts)
 
 
 @dataclass
@@ -1118,12 +1721,313 @@ class SpillLandingPool:
     slot_host_row: torch.Tensor
     land_ids: Optional[torch.Tensor]
     quant_info: object
+    # Persistent global LRU cache state (P1): the landing pool stops being a
+    # per-call scratch and becomes a rank-global expert cache keyed
+    # (layer, expert) -> slot. All device-side; safe under CUDA graphs.
+    cache_lut: Optional[torch.Tensor] = None
+    cache_slot_key: Optional[torch.Tensor] = None
+    cache_epoch: Optional[torch.Tensor] = None
+    cache_clock: Optional[torch.Tensor] = None
 
 
 _LANDING_POOLS: Dict[int, SpillLandingPool] = {}
 
 
-def _attach_landing_pool(moe: nn.Module, n_landing: int) -> None:
+# ===== P2: whole-layer prefill bank =====
+#
+# Wide batches have union coverage (~every spilled expert of a layer is
+# routed), so their page-in set per layer is static -- exactly the rows the
+# cold-set placement put in the host mirror. The bank copies those rows into
+# dedicated landing slots with one contiguous pinned HtoD per tensor and
+# remaps topk ids through static tables, replacing the per-claim assign
+# kernel. Two banks alternate across layers, so after the first forward both
+# already hold the right rows: steady-state prefill issues no page-in at all
+# until a decode landing claim evicts a bank slot (host-tracked dirty flag).
+
+
+class _PrefillBank:
+    """Rank-global state of the two alternating whole-layer banks."""
+
+    def __init__(
+        self,
+        *,
+        n_cold: int,
+        mods: List[nn.Module],
+        tables: List[torch.Tensor],
+    ):
+        self.n_cold = n_cold
+        self.n_mods = len(mods)
+        self.mods = mods
+        # Per module: int32 [n_logical], cold expert -> bank slot, else -1.
+        self.tables = tables
+        # Which module each bank currently holds (-1 = nothing valid yet).
+        self.bank_module = [-1, -1]
+        # Fill-completion event per bank (guard for the Marlin stream).
+        self.events: List[Optional[torch.cuda.Event]] = [None, None]
+        self.stream: Optional[torch.cuda.Stream] = None
+        self.dirty = True
+        # Host-side fill accounting: bank fills bypass spill_assign_cached,
+        # so the cache-clock ledger cannot see them.
+        self.fills = 0
+        self.fill_rows = 0
+
+
+_PREFILL_BANK: Optional[_PrefillBank] = None
+
+# Modules with an attached landing pool, in enumeration order; the bank
+# sorts them by layer_id on first use.
+_SPILL_BANK_REGISTRY: List[nn.Module] = []
+
+
+def _prefill_bank_enabled() -> bool:
+    try:
+        return bool(envs.SGLANG_DSV41_SPILL_PREFILL_BANK.get())
+    except Exception:
+        return False
+
+
+def _mark_spill_bank_dirty() -> None:
+    """A dynamic landing claim may have overwritten a bank slot.
+
+    Host-tracked on purpose: the assign kernel runs data-dependent on the
+    device, so the host cannot know which slots were claimed. Decode cannot
+    interleave with a prefill forward, so the flag only needs to be
+    conservative across batch boundaries.
+    """
+    bank = _PREFILL_BANK
+    if bank is not None:
+        bank.dirty = True
+
+
+def _prefill_bank_slot_table(moe: nn.Module, parity: int) -> torch.Tensor:
+    """Static remap table: cold expert -> landing slot in its bank."""
+    lru: RoutedExpertLru = moe._dsv41_expert_lru  # type: ignore[attr-defined]
+    spill_placement(moe)
+    host_slot = moe._dsv41_spill_host_slot  # type: ignore[attr-defined]
+    off = parity * int(lru.n_spilled)
+    tab = torch.full((int(lru.n_experts),), -1, dtype=torch.int32)
+    for e, row in host_slot.items():
+        tab[e] = int(row) + off
+    return tab.to(moe.w13_weight.device)
+
+
+def _bank_fill(moe: nn.Module, bank_idx: int, state: _PrefillBank) -> None:
+    """Copy one module's spilled half into its bank on the copy stream."""
+    if state.stream is None:
+        state.stream = torch.cuda.Stream()
+    pool: SpillLandingPool = moe._dsv41_landing_pool  # type: ignore[attr-defined]
+    hosts: Dict[str, torch.Tensor] = moe._dsv41_spill_host  # type: ignore[attr-defined]
+    n = state.n_cold
+    lo = bank_idx * n
+    with torch.cuda.stream(state.stream):
+        for attr in pool.attrs:
+            pool.tensors[attr][lo : lo + n].copy_(
+                hosts[attr][:n], non_blocking=True
+            )
+        ev = torch.cuda.Event()
+        ev.record(state.stream)
+        state.events[bank_idx] = ev
+    state.fills += 1
+    state.fill_rows += n
+
+
+def _prefill_bank_dispatch(moe: nn.Module, topk_ids: torch.Tensor) -> bool:
+    """Static-bank page-in for one wide MoE call. False = caller falls back.
+
+    Consumes topk_ids in place (kept/shared -> LRU slot, spilled -> -1) and
+    publishes ``_dsv41_land_ids`` (spilled -> bank slot, else -1), the same
+    contract the landing assign kernel fulfills for the two-run Marlin join.
+    """
+    global _PREFILL_BANK
+    state = _PREFILL_BANK
+    if state is None:
+        return False
+    mod = int(getattr(moe, "_dsv41_bank_mod", -1))
+    if not 0 <= mod < state.n_mods:
+        return False
+    lru: RoutedExpertLru = moe._dsv41_expert_lru  # type: ignore[attr-defined]
+    pool: SpillLandingPool = moe._dsv41_landing_pool  # type: ignore[attr-defined]
+    n_tok, k = int(topk_ids.shape[0]), int(topk_ids.shape[1])
+    buf = pool.land_ids
+    if (
+        buf is None
+        or buf.dtype != topk_ids.dtype
+        or buf.device != topk_ids.device
+        or int(buf.shape[1]) < k
+        or int(buf.shape[0]) < n_tok
+    ):
+        if _cuda_graph_capturing():
+            return False
+        pool.land_ids = torch.empty(
+            (max(_decode_shaped_max_tokens(), n_tok), k),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        buf = pool.land_ids
+    land_ids = buf[:n_tok, :k]
+    topk_ids = topk_ids.contiguous()
+    flat = topk_ids.view(-1).long()
+    # Negative ids (EP remote / padding) pass through untouched; torch would
+    # wrap them as python-style indices into the tables.
+    neg = (flat < 0).view(n_tok, k)
+    safe = flat.clamp(min=0)
+    # Main run: kept/shared -> LRU slot, spilled -> -1 (Marlin skips).
+    topk_ids.copy_(
+        torch.where(
+            neg,
+            topk_ids,
+            lru._map_table[safe].view(n_tok, k).to(topk_ids.dtype),
+        )
+    )
+    # Landing run: spilled -> bank slot, else -1.
+    land_ids.copy_(
+        torch.where(
+            neg,
+            torch.full_like(topk_ids, -1),
+            state.tables[mod][safe].view(n_tok, k).to(topk_ids.dtype),
+        )
+    )
+    moe._dsv41_land_ids = land_ids  # type: ignore[attr-defined]
+
+    cur = torch.cuda.current_stream()
+    # Overwrite guard: banks are filled on the side stream, so a fill into
+    # the bank last used by module mod-1 must not start until that module's
+    # landing run (already enqueued on the current stream) has finished.
+    guard = torch.cuda.Event()
+    guard.record(cur)
+
+    need_cur = state.dirty or state.bank_module[mod % 2] != mod
+    # Prefetch the next module's bank behind this module's compute. The last
+    # module fills module 0 for the next chunk; a single-module stack just
+    # refills at its next dispatch instead (the guard above cannot protect
+    # its only bank from its own in-flight Marlin).
+    nxt = (mod + 1) % state.n_mods
+    need_nxt = nxt != mod and (state.dirty or state.bank_module[nxt % 2] != nxt)
+    if need_cur or need_nxt:
+        if state.stream is None:
+            state.stream = torch.cuda.Stream()
+        state.stream.wait_event(guard)
+    if need_cur:
+        _bank_fill(moe, mod % 2, state)
+        state.bank_module[mod % 2] = mod
+    ev = state.events[mod % 2]
+    if ev is not None:
+        cur.wait_event(ev)
+    if need_nxt:
+        _bank_fill(state.mods[nxt], nxt % 2, state)
+        state.bank_module[nxt % 2] = nxt
+    state.dirty = False
+    return True
+
+
+def _maybe_route_prefill_bank(moe: nn.Module, topk_ids: torch.Tensor) -> bool:
+    """Gate + lazy init for the bank path; True means it handled the call."""
+    global _PREFILL_BANK
+    if not _prefill_bank_enabled() or _cuda_graph_capturing():
+        return False
+    # Decode-shaped calls stay on the dynamic assign: refilling a whole
+    # bank per decode step would re-fetch the full spilled half for a
+    # handful of experts.
+    if _decode_shaped_topk(topk_ids):
+        return False
+    lru: Optional[RoutedExpertLru] = getattr(moe, "_dsv41_expert_lru", None)
+    pool: Optional[SpillLandingPool] = getattr(moe, "_dsv41_landing_pool", None)
+    if lru is None or pool is None or lru.n_spilled <= 0:
+        return False
+    if not _prefill_landing_ready(moe):
+        return False
+    if spill_landing_slots() < 2 * int(lru.n_spilled):
+        return False
+    if _PREFILL_BANK is None:
+        mods = _SPILL_BANK_REGISTRY
+        if len(mods) < 2:
+            return False
+        ordered = sorted(mods, key=lambda m: int(getattr(m, "layer_id", 0)))
+        n_cold = int(ordered[0]._dsv41_expert_lru.n_spilled)  # type: ignore[attr-defined]
+        if any(
+            int(m._dsv41_expert_lru.n_spilled) != n_cold  # type: ignore[attr-defined]
+            for m in ordered
+        ):
+            logger.warning(
+                "DSV4.1 P2 prefill bank disabled: uneven spilled counts"
+            )
+            return False
+        for i, m in enumerate(ordered):
+            m._dsv41_bank_mod = i  # type: ignore[attr-defined]
+        _PREFILL_BANK = _PrefillBank(
+            n_cold=n_cold,
+            mods=ordered,
+            tables=[
+                _prefill_bank_slot_table(m, i % 2)
+                for i, m in enumerate(ordered)
+            ],
+        )
+        logger.info(
+            "DSV4.1 P2 prefill bank: %d modules x 2 banks x %d rows "
+            "(static slot mapping, zero write-back)",
+            len(ordered),
+            n_cold,
+        )
+    return _prefill_bank_dispatch(moe, topk_ids)
+
+
+def _start_cache_stats_monitor(pool: SpillLandingPool) -> None:
+    """Log cache_counter deltas every 30 s (env-gated; 4-int D2H sync)."""
+
+    import threading
+    import time as _time
+
+    # Every claimed slot copies the full row of every pooled tensor exactly
+    # once (spill_copy_kernel), so claims x row_bytes is the exact HtoD bytes;
+    # the landing path issues no DtoH at all. Pool tensors are slot-major
+    # ([n_slots, ...]); sum(numel) alone would count the whole pool per claim
+    # (measured as a 12x overcount at n_landing=12 before this division).
+    row_bytes = sum(
+        int(t.numel()) // int(t.shape[0]) * int(t.element_size())
+        for t in pool.tensors.values()
+    )
+    prev = {"calls": 0, "hits": 0, "claims": 0, "drops": 0, "fills": 0, "frows": 0}
+
+    def _loop() -> None:
+        while True:
+            _time.sleep(30.0)
+            try:
+                c = pool.cache_clock.cpu()
+                calls, hits, claims, drops = int(c[1]), int(c[2]), int(c[3]), int(c[4])
+                d_claims = claims - prev["claims"]
+                gib = d_claims * row_bytes / (1024**3)
+                msg = (
+                    "DSV4.1 cache stats: calls=%d (+%d) lut_hits=%d (+%d) "
+                    "slot_claims=%d (+%d) drops=%d (+%d) pagein=%.2f GiB "
+                    "(%.1f GB/s avg)"
+                )
+                args = [
+                    calls, calls - prev["calls"],
+                    hits, hits - prev["hits"],
+                    claims, d_claims,
+                    drops, drops - prev["drops"],
+                    gib,
+                    gib * (1024**3) / 30e9,
+                ]
+                bank = _PREFILL_BANK
+                if bank is not None:
+                    # Bank fills are whole cold halves, not per-row claims;
+                    # report them separately so the ledger stays honest.
+                    d_fills = bank.fills - prev["fills"]
+                    msg += " bank_fills=%d (+%d) bank_rows=%d"
+                    args += [bank.fills, d_fills, bank.fill_rows]
+                    prev["fills"] = bank.fills
+                    prev["frows"] = bank.fill_rows
+                logger.info(msg, *args)
+                prev.update(calls=calls, hits=hits, claims=claims, drops=drops)
+            except Exception as _e:  # noqa: BLE001
+                logger.warning("DSV4.1 cache stats reader stopped: %s", _e)
+                return
+
+    threading.Thread(target=_loop, daemon=True, name="dsv41-cache-stats").start()
+
+
+def _attach_landing_pool(moe: nn.Module, n_landing: int, layer_ordinal: int) -> None:
     if n_landing <= 0:
         return
     hosts: Optional[Dict[str, torch.Tensor]] = getattr(moe, "_dsv41_spill_host", None)
@@ -1180,16 +2084,27 @@ def _attach_landing_pool(moe: nn.Module, n_landing: int) -> None:
             is_k_full=True,
             w13_bias=tensors.get("w13_weight_bias"),
             w2_bias=tensors.get("w2_weight_bias"),
+            # NVFP4: the landing rows carry the fold-down global scales too;
+            # without them the Marlin kernel underflows (same as passing raw
+            # checkpoint scales) and every paged-in expert computes ~zero.
+            w13_global_scale=tensors.get("w13_scale2"),
+            w2_global_scale=tensors.get("w2_scale2"),
             expert_map=None,
             global_num_experts=-1,
+            # Landing ids are -1 wherever the main run covers the expert, so
+            # the Marlin kernel must skip those blocks (see MarlinMoeQuantInfo
+            # .is_expert_parallel).
+            is_expert_parallel=True,
         )
-        nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
-        logger.info(
-            "DSV4.1 D4-G landing pool: %d slots attrs=%s %.1f MiB (shared across layers)",
-            n_landing,
-            attrs,
-            nbytes / (1024 * 1024),
+        lru = getattr(moe, "_dsv41_expert_lru", None)
+        map_tab = getattr(lru, "_map_table", None)
+        if map_tab is None:
+            return  # no device tables yet: landing unusable anyway
+        n_logical = int(map_tab.shape[0])
+        n_layers = int(
+            envs.SGLANG_DSV41_EXPERT_SPILL_N_LAYERS.get() or N_LAYERS
         )
+        dev = tensors[attrs[0]].device
         pool = SpillLandingPool(
             n_landing=n_landing,
             tensors=tensors,
@@ -1199,15 +2114,64 @@ def _attach_landing_pool(moe: nn.Module, n_landing: int) -> None:
             slot_host_row=slot_host_row,
             land_ids=None,
             quant_info=quant_info,
+            # 48 KiB per rank at 42x288: a direct (layer, expert) index, no
+            # hash. epoch starts at 0 with clock at 0, so every slot is
+            # older than the first call's epoch (1) and the pool fills LRU.
+            cache_lut=torch.full(
+                (n_layers * n_logical,), -1, dtype=torch.int32, device=dev
+            ),
+            cache_slot_key=torch.full(
+                (n_landing,), -1, dtype=torch.int32, device=dev
+            ),
+            cache_epoch=torch.zeros(n_landing, dtype=torch.int32, device=dev),
+            # [epoch, calls, lut-hits, slots-claimed, drops, 0, 0, 0]
+            cache_clock=torch.zeros(8, dtype=torch.int32, device=dev),
         )
         _LANDING_POOLS[key] = pool
+        if os.environ.get("SGLANG_DSV41_SPILL_CACHE_STATS") == "1":
+            _start_cache_stats_monitor(pool)
+        logger.info(
+            "DSV4.1 D4-G landing pool: %d slots attrs=%s %.1f MiB "
+            "(persistent cache: lut %dx%d)",
+            n_landing,
+            attrs,
+            sum(t.numel() * t.element_size() for t in tensors.values())
+            / (1024 * 1024),
+            n_layers,
+            n_logical,
+        )
     moe._dsv41_landing_pool = pool  # type: ignore[attr-defined]
+    if _prefill_bank_enabled() and moe not in _SPILL_BANK_REGISTRY:
+        _SPILL_BANK_REGISTRY.append(moe)
+    # Per-layer LUT slice; the kernel needs no layer_id argument.
+    lru = getattr(moe, "_dsv41_expert_lru", None)
+    map_tab = getattr(lru, "_map_table", None)
+    if pool.cache_lut is not None and map_tab is not None:
+        # Flat (layer, expert) key space: cache_slot_key stores flat LUT
+        # indices so eviction back-invalidates the OWNING layer's entry. (A
+        # per-layer slice view would corrupt other layers' LUTs on evict.)
+        n_logical = int(map_tab.shape[0])
+        moe._dsv41_cache_lut = pool.cache_lut  # type: ignore[attr-defined]
+        moe._dsv41_cache_lut_offset = int(layer_ordinal * n_logical)  # type: ignore[attr-defined]
     src = [int(hosts[a].data_ptr()) for a in pool.attrs]
     moe._dsv41_uva_src_ptrs = torch.tensor(src, dtype=torch.int64, device=device)  # type: ignore[attr-defined]
 
 
 def page_in_spill_experts(moe: nn.Module, topk_ids: torch.Tensor) -> torch.Tensor:
     """D4-G: UVA copy of spilled hits into the landing pool; remap topk in place."""
+    # ROUTEPROBE: raw per-call topk tables for the cold-set/route-stability
+    # probes (scripts/glm53_cold_set_from_route_probe.py).
+    _pp = envs.SGLANG_SPILL_ROUTE_PROBE.get()
+    if _pp and not _cuda_graph_capturing():
+        os.makedirs(_pp, exist_ok=True)
+        _n = getattr(page_in_spill_experts, "_probe_n", 0)
+        if _n < 6000:
+            _r = int(topk_ids.device.index or 0)
+            torch.save(
+                topk_ids.detach().to("cpu", torch.int32),
+                f"{_pp}/call_r{_r}_{_n:05d}.pt",
+            )
+            page_in_spill_experts._probe_n = _n + 1
     lru: RoutedExpertLru = moe._dsv41_expert_lru  # type: ignore[attr-defined]
     pool: SpillLandingPool = moe._dsv41_landing_pool  # type: ignore[attr-defined]
     if topk_ids.dtype != torch.int32 or topk_ids.dim() != 2:
@@ -1226,7 +2190,7 @@ def page_in_spill_experts(moe: nn.Module, topk_ids: torch.Tensor) -> torch.Tenso
         or buf.dtype != topk_ids.dtype
         or buf.device != topk_ids.device
         or buf.dim() != 2
-        or int(buf.shape[1]) != k
+        or int(buf.shape[1]) < k
         or int(buf.shape[0]) < n_tok
     ):
         if _cuda_graph_capturing():
@@ -1236,25 +2200,51 @@ def page_in_spill_experts(moe: nn.Module, topk_ids: torch.Tensor) -> torch.Tenso
             )
         # Pad T to decode-shaped max (2 greedy, γ+1 when landing is 6*(γ+1))
         # so T=1 capture and a later T=verify eager/capture share storage.
+        # k only ever grows the buffer: the warmup allocator may have guessed
+        # the routing width from hf config defaults.
         pool.land_ids = torch.empty(
-            (max(_decode_shaped_max_tokens(), n_tok), k),
+            (
+                max(_decode_shaped_max_tokens(), n_tok),
+                max(k, int(buf.shape[1]) if buf is not None and buf.dim() == 2 else 0),
+            ),
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
         buf = pool.land_ids
-    land_ids = buf[:n_tok]
-    from sglang.kernels.ops.moe.sm70_dsv41_spill_pagein import spill_page_in
-
-    spill_page_in(
-        topk_ids,
-        land_ids,
-        pool.slot_host_row,
-        lru._map_table,
-        lru._host_map_table,
-        moe._dsv41_uva_src_ptrs,
-        pool.dst_ptrs,
-        pool.row_bytes,
+    land_ids = buf[:n_tok, :k]
+    from sglang.kernels.ops.moe.sm70_dsv41_spill_pagein import (
+        spill_page_in,
+        spill_page_in_cached,
     )
+
+    lut = getattr(moe, "_dsv41_cache_lut", None)
+    if os.environ.get("SGLANG_DSV41_SPILL_CACHE", "1") != "0" and lut is not None:
+        spill_page_in_cached(
+            topk_ids,
+            land_ids,
+            pool.slot_host_row,
+            lru._map_table,
+            lru._host_map_table,
+            moe._dsv41_uva_src_ptrs,
+            pool.dst_ptrs,
+            pool.row_bytes,
+            lut,
+            pool.cache_slot_key,
+            pool.cache_epoch,
+            pool.cache_clock,
+            int(getattr(moe, "_dsv41_cache_lut_offset", 0)),
+        )
+    else:
+        spill_page_in(
+            topk_ids,
+            land_ids,
+            pool.slot_host_row,
+            lru._map_table,
+            lru._host_map_table,
+            moe._dsv41_uva_src_ptrs,
+            pool.dst_ptrs,
+            pool.row_bytes,
+        )
     moe._dsv41_land_ids = land_ids  # type: ignore[attr-defined]
     return topk_ids
 
@@ -1272,7 +2262,15 @@ def warmup_spill_landing_for_capture(
     if spill_landing_slots() <= 0:
         return
     pad_t = max(int(n_tok), _decode_shaped_max_tokens(), 2)
+    # The routing width lives on the layer (hf config keys vary per model
+    # family -- mini-GLM has no num_experts_per_tok at all), so read it from
+    # the FusedMoE itself. The width must land exactly on k: page_in slices
+    # buf[:n_tok, :k], and a wider buffer would make that slice
+    # non-contiguous (the page-in kernel's TensorMatcher rejects strides).
     pad_k = max(int(k), 1)
+    for moe in model.modules():
+        if getattr(moe, "_dsv41_landing_pool", None) is not None:
+            pad_k = max(pad_k, int(getattr(moe, "top_k", 0) or 0))
     for moe in model.modules():
         pool = getattr(moe, "_dsv41_landing_pool", None)
         if pool is None:
@@ -1312,6 +2310,7 @@ def ensure_spill_experts(moe: nn.Module, topk_ids: torch.Tensor) -> torch.Tensor
             lru.n_swaps - before,
             int(topk_ids.shape[0]),
             lru.n_thrash - before_thrash,
+            lru.swap_row_bytes(),
         )
     if envs.SGLANG_DSV41_PREFILL_SYNC.get() and topk_ids.numel():
         table = lru._map_table
@@ -1344,10 +2343,18 @@ def _host_gemv_hosts_ready(moe: nn.Module) -> bool:
     hosts: Optional[Dict[str, torch.Tensor]] = getattr(moe, "_dsv41_spill_host", None)
     if not hosts:
         return False
-    return all(
+    if not all(
         k in hosts
         for k in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
-    )
+    ):
+        return False
+    # D4-H decodes raw MXFP4 codes (e8m0 scale bytes) on the CPU. The NVFP4
+    # mirror carries Marlin-repacked int32 codes with e4m3-encoded block
+    # scales, which the host GEMV cannot decode -- decode falls back to the
+    # D4-G landing pool / prefill LRU instead.
+    if hosts["w13_weight_scale"].dtype == torch.float8_e4m3fn:
+        return False
+    return True
 
 
 def _attach_host_gemv_bases(moe: nn.Module) -> bool:
@@ -1459,16 +2466,164 @@ def remap_dispatch_for_expert_spill(moe: nn.Module, dispatch_output):
             spill_request_host_gemv(moe, ids, weights, hidden)
             return dispatch_output
     pool = getattr(moe, "_dsv41_landing_pool", None)
+    # P2: wide batches take the static whole-layer bank (zero per-claim
+    # assign, contiguous fills, steady-state page-in free). Decode-shaped
+    # calls keep the dynamic assign and mark the banks dirty -- a claim may
+    # have evicted a bank slot, and the next prefill forward refills.
+    if pool is not None and _maybe_route_prefill_bank(moe, ids):
+        return dispatch_output
+    # Landing owns decode-shaped batches: T is bounded by the pool width
+    # (_decode_shaped_topk), which encodes landing >= T*topk. This also gates
+    # capture -- the old "capture always takes landing" baked over-width
+    # verify graphs (MTP bs>=2, T up to bs*(draft+1)) into a pool that cannot
+    # hold their unique experts, and spill_assign_cached then silently drops
+    # them (P0: 29 -> 5065 drops on the MTP arm). Over-width shapes are
+    # filtered out of capture_bs by the graph runner; this guard only fires
+    # if one still gets here, where baking drops would be silent and the
+    # eager host LRU would read back the device mid-capture (illegal).
     if (
         pool is not None
         and spill_landing_slots() > 0
-        and _decode_shaped_topk(ids)
+        and (_decode_shaped_topk(ids) or _prefill_landing_ready(moe))
     ):
         page_in_spill_experts(moe, ids)
+        # Every dynamic claim (decode, or a wide call the bank gate refused)
+        # may land on a bank slot; the next prefill forward refills.
+        if _prefill_bank_enabled():
+            _mark_spill_bank_dirty()
+    elif pool is not None and spill_landing_slots() > 0 and _cuda_graph_capturing():
+        raise RuntimeError(
+            f"D4-G landing width {_decode_shaped_max_tokens()} tokens cannot "
+            f"hold this captured batch (T={int(ids.shape[0])}, topk="
+            f"{int(ids.shape[1])}): it would silently drop experts. Filter "
+            "the shape out of capture_bs or raise SGLANG_DSV41_SPILL_LANDING."
+        )
     else:
         moe._dsv41_land_ids = None  # type: ignore[attr-defined]
         ensure_spill_experts(moe, ids)
     return dispatch_output
+
+
+def spill_chunk_slices(moe: nn.Module, dispatch_output):
+    """Greedy token chunks whose resident working set fits the GPU expert slots.
+
+    A batch whose unique expert set exceeds ``n_kept_routed`` makes the
+    host-LRU path thrash: experts evicted mid-batch remap to -1 and Marlin
+    skips them, silently dropping their contribution. Running token chunks
+    one at a time (ensure -> remap -> run per chunk) keeps every requested
+    expert resident when the runner sees it, so results stay exact.
+
+    Returns ``None`` when the whole batch fits (or decode-shaped / landing
+    paths own it) and the caller should keep the single-run path; otherwise
+    ``[(start, end), ...]`` covering ``[0, T)``.
+    """
+    lru: Optional[RoutedExpertLru] = getattr(moe, "_dsv41_expert_lru", None)
+    if lru is None or not lru.applied:
+        return None
+    try:
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+
+        if not isinstance(dispatch_output, StandardDispatchOutput):
+            return None
+    except ImportError:
+        return None
+    topk_output = getattr(dispatch_output, "topk_output", None)
+    if topk_output is None or not hasattr(topk_output, "topk_ids"):
+        return None
+    ids = topk_output.topk_ids
+    if ids.dtype != torch.int32 or ids.dim() != 2:
+        return None
+    if getattr(dispatch_output, "hidden_states_pre_quant", None) is not None:
+        # Pre-quantized activation pairs with the full token axis; slicing it
+        # is not implemented here, so keep the single-run path.
+        return None
+    n_slots = int(getattr(moe, "_dsv41_gpu_expert_slots", 0))
+    if n_slots <= 0:
+        return None
+    n_tok = int(ids.shape[0])
+    if n_tok <= _decode_shaped_max_tokens():
+        return None
+    if bool(envs.SGLANG_DSV41_EXPERT_SPILL_NO_CHUNK.get()):
+        return None
+    if _cuda_graph_capturing():
+        # Every decision below is a host readback (illegal while capturing).
+        # Captured decode replays take the landing page-in path instead.
+        return None
+    if _prefill_landing_ready(moe):
+        # The landing pool covers every logical expert (see
+        # _prefill_landing_ready), so the batch needs no chunking: one
+        # device-side page-in owns it and the host-LRU slice loop below
+        # would only add its syncs and swap churn.
+        return None
+
+    # One single sync: pull the whole topk table to the host and do the
+    # expert-set math there (a per-token unique()+tolist() loop would sync
+    # once per token).
+    per_tok = [[v for v in row if v >= 0] for row in ids.tolist()]
+    unique_all = {v for row in per_tok for v in row}
+    if len(unique_all) <= n_slots:
+        return None
+
+    slices = []
+    start = 0
+    resident: set = set()
+    for t in range(n_tok):
+        need = set(per_tok[t])
+        if resident and len(resident | need) > n_slots:
+            slices.append((start, t))
+            start = t
+            resident = set()
+        resident |= need
+        if len(resident) > n_slots:
+            # Single token whose top-k alone exceeds the slots: isolate it and
+            # accept the bounded (-1 = skipped) behavior for the overflow.
+            slices.append((start, t + 1))
+            start = t + 1
+            resident = set()
+    if start < n_tok:
+        slices.append((start, n_tok))
+    if len(slices) <= 1:
+        return None
+    logger.info(
+        "DSV4.1 spill chunked prefill: %d tokens -> %d chunks (slots=%d, unique=%d)",
+        n_tok,
+        len(slices),
+        n_slots,
+        len(unique_all),
+    )
+    return slices
+
+
+def slice_dispatch_for_spill_chunk(dispatch_output, start: int, end: int):
+    """Row slice a StandardDispatchOutput for one spill chunk."""
+    topk_output = dispatch_output.topk_output
+    sliced_topk = topk_output._replace(
+        topk_ids=topk_output.topk_ids[start:end],
+        topk_weights=(
+            None
+            if getattr(topk_output, "topk_weights", None) is None
+            else topk_output.topk_weights[start:end]
+        ),
+        router_logits=(
+            None
+            if getattr(topk_output, "router_logits", None) is None
+            else topk_output.router_logits[start:end]
+        ),
+    )
+    pre_quant = getattr(dispatch_output, "hidden_states_pre_quant", None)
+    if pre_quant is not None:
+        sliced_pre_quant = tuple(x[start:end] for x in pre_quant)
+    else:
+        sliced_pre_quant = None
+    scale = getattr(dispatch_output, "hidden_states_scale", None)
+    return dispatch_output._replace(
+        hidden_states=dispatch_output.hidden_states[start:end],
+        hidden_states_scale=None if scale is None else scale[start:end],
+        topk_output=sliced_topk,
+        hidden_states_pre_quant=sliced_pre_quant,
+    )
 
 
 def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertSpillPlan]:
@@ -1482,6 +2637,14 @@ def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertS
     spill_gib = float(envs.SGLANG_DSV41_EXPERT_SPILL_GB.get() or 0.0)
     if spill_gib <= 0:
         return None
+    if envs.SGLANG_SM70_U2_EXPERT_POOL.get():
+        # The u2b2 pool keeps every expert resident in VRAM; the layer params
+        # are uint2b2, not NVFP4, so a spill plan would have nothing to pack.
+        raise ValueError(
+            "SGLANG_DSV41_EXPERT_SPILL_GB is incompatible with "
+            "SGLANG_SM70_U2_EXPERT_POOL=1: the u2b2 resident pool has no "
+            "spill plan. Unset SGLANG_DSV41_EXPERT_SPILL_GB."
+        )
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     moes = [m for m in model.modules() if isinstance(m, FusedMoE)]
@@ -1522,15 +2685,31 @@ def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertS
         if apply
         else "Plan only (SGLANG_DSV41_EXPERT_SPILL_APPLY=0); GPU tensors unchanged.",
     )
-    pin_mirror = bool(envs.SGLANG_ENABLE_DSV41_EXPERT_SPILL_NUMA.get())
     for layer_ordinal, moe in enumerate(moes):
         moe._dsv41_expert_spill_plan = plan  # type: ignore[attr-defined]
         if not (apply and plan.n_spilled):
             continue
+        if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+            with open("/proc/self/status") as _f:
+                _st = {
+                    ln.split(":")[0]: ln.split(":")[1].strip()
+                    for ln in _f
+                    if ln.startswith(("VmRSS", "VmHWM", "VmSwap"))
+                }
+            logger.info(
+                "DSV4.1 spill RSS L%d pre : VmRSS=%s VmHWM=%s VmSwap=%s",
+                layer_ordinal,
+                _st.get("VmRSS"),
+                _st.get("VmHWM"),
+                _st.get("VmSwap"),
+            )
         if getattr(moe, "_dsv41_spill_host", None) is not None:
             repack_spill_host_for_sm70_marlin(moe)
-            if pin_mirror:
-                pin_spill_host_numa(moe, layer_ordinal)
+            # Always pin: the D4-G landing page-in kernel reads the mirror
+            # through UVA, which requires device-accessible (pinned) memory.
+            # pin_spill_host_numa degrades to plain pinning without the NUMA
+            # env and to plain pinning again if mbind/set_mempolicy fails.
+            pin_spill_host_numa(moe, layer_ordinal)
         else:
             logger.warning(
                 "DSV4.1 spill APPLY: no _dsv41_spill_host on %s; "
@@ -1571,7 +2750,21 @@ def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertS
                 lru._ensure_device_tables(
                     torch.empty(1, dtype=torch.int32, device=w13.device)
                 )
-            _attach_landing_pool(moe, spill_landing_slots())
+            _attach_landing_pool(moe, spill_landing_slots(), layer_ordinal)
+            if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+                with open("/proc/self/status") as _f:
+                    _st = {
+                        ln.split(":")[0]: ln.split(":")[1].strip()
+                        for ln in _f
+                        if ln.startswith(("VmRSS", "VmHWM", "VmSwap"))
+                    }
+                logger.info(
+                    "DSV4.1 spill RSS L%d post: VmRSS=%s VmHWM=%s VmSwap=%s",
+                    layer_ordinal,
+                    _st.get("VmRSS"),
+                    _st.get("VmHWM"),
+                    _st.get("VmSwap"),
+                )
             continue
         siblings = [p.data for attr, p in params.items() if attr != "w13_weight"]
         lru = RoutedExpertLru(
@@ -1597,7 +2790,21 @@ def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertS
             lru._ensure_device_tables(
                 torch.empty(1, dtype=torch.int32, device=w13.device)
             )
-        _attach_landing_pool(moe, spill_landing_slots())
+        _attach_landing_pool(moe, spill_landing_slots(), layer_ordinal)
+        if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
+            with open("/proc/self/status") as _f:
+                _st = {
+                    ln.split(":")[0]: ln.split(":")[1].strip()
+                    for ln in _f
+                    if ln.startswith(("VmRSS", "VmHWM", "VmSwap"))
+                }
+            logger.info(
+                "DSV4.1 spill RSS L%d post: VmRSS=%s VmHWM=%s VmSwap=%s",
+                layer_ordinal,
+                _st.get("VmRSS"),
+                _st.get("VmHWM"),
+                _st.get("VmSwap"),
+            )
     if apply and plan.n_spilled:
         n_table = sum(
             1 for m in moes if getattr(m, "_dsv41_spill_cold_source", None) == "table"

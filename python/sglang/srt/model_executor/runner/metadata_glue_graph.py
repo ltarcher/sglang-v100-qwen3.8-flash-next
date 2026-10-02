@@ -85,7 +85,12 @@ class MetadataGlueGraph:
             self._capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         try:
-            with torch.cuda.graph(graph, stream=self._capture_stream):
+            # thread_local: background threads (spill stats reader) may D2H
+            # while this lazily fires mid-decode; "global" would let that
+            # invalidate the capture.
+            with torch.cuda.graph(
+                graph, stream=self._capture_stream, capture_error_mode="thread_local"
+            ):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
         except Exception:
             logger.warning(
