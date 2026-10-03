@@ -1169,6 +1169,25 @@ target verify 图 119.5s、draft decode 21.6s、draft extend 2.3s 全部捕获
 | needle 墙钟 | 1k 28.4s → 11.9s |
 
 一致性判据(AGENTS.md:target-only 与 --spec 输出一致性 + accept)满足:
-top-1 三臂逐位一致,分歧止步于前 8 token 的同义措辞。P5-a 全链验收完毕;
-生产 compose 仍保持 mtp(triton 全注意力)模式,切 DSA 前按 H.5.6 附注以
-镜像形态(.so)重测 dsa-mtp 一轮。
+top-1 三臂逐位一致,分歧止步于前 8 token 的同义措辞。P5-a 全链验收完毕。
+
+#### H.5.9 镜像形态复测与生产切换(2026-10-03)
+
+镜像自 P5-a 后的 `dev-ltarcher` 重建(`docker/v100.cn.Dockerfile`,12.9.1
+base,重活层全缓存,~18 min),`sglang-v100-unified:latest` 原位替换(旧镜像
+id b19d7c586570 留档可回滚)。镜像形态(无 python bind mount)dsa-mtp boot
+跑 H.5.8 同款门,与 WIP 树逐项一致:
+
+| 项 | H.5.8(WIP 树) | H.5.9(镜像形态) |
+| --- | --- | --- |
+| top-1 vs u2/dsa 臂 | 24/24 | **24/24** |
+| top-8 | 21/24(近 tie 措辞) | **21/24(同签名)** |
+| needle 1k / 2.5k | 5/5 / 5/5 | **5/5 / 5/5** |
+| decode 单流 | 43.9 tok/s | **43.9 tok/s** |
+| accept len | 2.02–3.85 | **2.08–3.88** |
+
+**生产 compose(`~/vllm-Qwen3.8/docker-compose-sglang-v100-glm53.yaml`)切为
+dsa-mtp 模式**:attention-backend 换 dsa 四旗标,新增
+`SGLANG_DSA_FUSE_TOPK=1`、`SGLANG_OPT_USE_TOPK_V2=0` 两个 env(镜像未烤,
+脚本 dsa 段导出);文件头注明回退方法(四旗标换回 triton + 删两 env)。
+decode 12.2 → 43.9 tok/s(+260%),8k prefill 254 → ~1390 tok/s。
