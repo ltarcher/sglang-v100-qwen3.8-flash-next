@@ -731,14 +731,11 @@ unique suffix;decode 170 tok ×3(`ignore_eos`)。
 - C=1 交互建议更新:u2 池 + MTP(29.5 tok/s)即为推荐形态,不再需要退回
   target-only。
 
-### G.9 长上下文与 DFlash 评估(2026-10-02;纸面评估,P5 规划输入)
-
-两项均未实测;数字来自 config 维度与本附录实测外推。引擎侧精确值(boot 日志的
-KV 池 GiB 与 `max_total_num_tokens`)待首次相应 boot 回填。
+### G.9 长上下文与 DFlash 评估(2026-10-02 纸面评估;2026-10-03 长上下文实测回填)
 
 **长上下文(目标 262,144;`max_position_embeddings` = 1,048,576,架构合法)**
 
-显存账(每 rank 32 GiB,u2 池形态不变):
+纸面显存账(每 rank 32 GiB,u2 池形态不变):
 
 | 项 | 每 rank |
 | --- | ---: |
@@ -748,16 +745,36 @@ KV 池 GiB 与 `max_total_num_tokens`)待首次相应 boot 回填。
 
 (34 层 KDA 为固定循环状态,~17 MB/rank/seq,fp32 下 ~35 MB,可忽略。)
 
-- 单条 262k 请求 ≈ **2.9 GiB/rank > 2.5 GiB 池:0.92 装不下**(差 ~15%)。
-  0.95(+~1 GiB)可装一条流,但零并发/零前缀缓存余量,且 capture 阶段对
-  mem-fraction 敏感(见 serve 脚本 OOM 注记)。
-- P5-a 启用 indexer 后其 key 池在 262k 再加 ~2.9 GiB/rank——届时要在 u2 池与
-  上下文长度之间做一次显式取舍,不是调参问题。
-- 性能墙(G.5 实测外推):DSA 层 triton full-attention 24.25 s @8k,二次方
-  增长 → 262k 单次 prefill ≈ **6.9 h**;decode 每步 11 层全注意力 ~32× 于 8k,
-  预计个位数 tok/s。
-- **结论:262k 的唯一前提是 P5-a。P5-a 落地前现实的阶梯是 32k(分钟级
-  prefill)→ 64k。**
+**实测回填(2026-10-03;P5-a dsa target-only,4 rung 三次 boot)**
+
+| rung | prompt tok | prefill | prefill tok/s | needle | decode |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 8k(P5-a 门) | 8,192 | 5.9 s | 1,390 | 5/5 | 23.8 |
+| 32k | 31,665 | 22.4 s | 1,414 | 5/5 | 22.9 |
+| 64k | 64,155 | 41.9 s | 1,531 | 5/5 | 22.9 |
+| ~190k | — | — | ~1,470(逐 chunk 日志) | — | — |
+
+- **性能墙证伪:稀疏路径 prefill 吞吐随上下文持平且略升**(1390→1414→1531),
+  decode 恒定 ~23 tok/s。旧 G.5 的"262k prefill 6.9 h / decode 个位数"是
+  full-attention triton 路径的外推,对 P5-a 稀疏路径不成立;262k 线性外推
+  prefill ≈ **3 分钟**。
+- **池账实测**:KV 池 cell = **11.85 KB/token/rank**(11×512×2B latent ≈
+  11.26 KB + indexer fp8 key ~0.7 KB,kpool 同池)。0.92 下池 =
+  **112,192 tokens / 1.33 GiB**,不是纸面的 ~244k——池不由显存上限决定,
+  由 sizer 的 runtime slack(mem-fraction 决定,0.92 → 2.50 GiB)决定。
+  `--max-total-tokens` 只能降不能升(`config_from_budget` 断言容量不升)。
+- **边界实测**:0.98 boot 池 = **195,392 tokens**、capture 后余 0.57 GiB;
+  ~190k 请求 prefill 到 ~107k token 时 eager attention(KDA/DSA 层
+  self_attn)workspace OOM(80 MiB 申请、46 MiB 余)。64k 在 2.42 GiB 余量下
+  无感;**eager prefill workspace 随上下文增长,墙在 64k 与 190k 之间**。
+- **262k = 双条件,不是调参**:① 池还差 ~0.8–1.0 GiB/rank(0.98 池 195k,
+  slack 归零也只有 ~247k)——要 fp8 latent KV(cell 减半,0.92 即可装下,
+  需过质量门)或 u2 池削减 ~5%(回到 spill 形态,decode 倒退);② prefill
+  workspace 需要更大余量(降 mem-fraction 与 ① 冲突,或减 chunked-prefill
+  + 收敛 workspace 本身)。两条件都要动 u2/量化形态,需按本节质量门逐项
+  验证,非单 boot 参数问题。
+- **结论修正:262k 的前提 P5-a 已成立,性能不再是墙;墙只剩显存双条件。**
+  现实阶梯 32k→64k 已实测可用(质量 5/5、吞吐持平),可直接进生产形态评估。
 
 **DFlash(draft = `/data/models/GLM-5.3-Flash-DFlash`,2.6 GB)**
 
