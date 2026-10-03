@@ -17,6 +17,8 @@
 #   bash scripts/serve_glm53_flash_v100.sh mtp        # u2 pool + NEXTN MTP-3/4
 #   bash scripts/serve_glm53_flash_v100.sh spill      # u4 + host spill (P1.6 form)
 #   bash scripts/serve_glm53_flash_v100.sh spill-mtp  # u4 + spill + MTP
+#   bash scripts/serve_glm53_flash_v100.sh dsa        # u2 pool + DSA sparse path
+#   bash scripts/serve_glm53_flash_v100.sh dsa-mtp    # u2 pool + DSA + MTP
 #
 # The spill modes are the pre-P4 deployment shape, kept for A/B: experts
 # split resident-half / host-spill with page-in per forward (decode ~4.6x
@@ -35,7 +37,7 @@
 set -euo pipefail
 
 MODE="${1:-target}"
-case "$MODE" in target|mtp|spill|spill-mtp) ;; *) echo "mode must be target|mtp|spill|spill-mtp" >&2; exit 1;; esac
+case "$MODE" in target|mtp|spill|spill-mtp|dsa|dsa-mtp) ;; *) echo "mode must be target|mtp|spill|spill-mtp|dsa|dsa-mtp" >&2; exit 1;; esac
 
 VENV="${SGLANG_V100_VENV:-$HOME/sglang-v100-venv}"
 [[ -x "$VENV/bin/python" ]] || VENV="${VIRTUAL_ENV:-$VENV}"
@@ -114,10 +116,30 @@ else
   SPEC=()
 fi
 
-if [[ "$MODE" == mtp || "$MODE" == spill-mtp ]]; then
+if [[ "$MODE" == mtp || "$MODE" == spill-mtp || "$MODE" == dsa-mtp ]]; then
   SPEC+=(--speculative-algorithm NEXTN --speculative-num-steps 3
          --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
          --enable-linear-replayssm-spec --max-running-requests 4)
+fi
+
+# P5-a: light up the 11 DSA layers' indexer + topk + sparse attention on the
+# sm70 TileLang kernels (the triton default runs them as full attention).
+# The kpool fused topk emits topk + pool_size-1 = 2051 columns for GLM
+# (index_kpool=4 with always_select_tail), so the kpool decode path MUST run
+# the fused JIT topk with the sgl-kernel identity page-table consumer: the
+# torch transform path asserts the non-kpool 2048 width and is a composition
+# upstream never executes. SGLANG_OPT_USE_TOPK_V2=0 keeps the folded topk-v2
+# plan off (zero sm70 coverage, shrinks the capture surface). This exact
+# composition passed the A4 gate (tops 24/24, needles 5/5, prefill 8k
+# 1390 tok/s vs 717 full-attn baseline).
+ATTN_ARGS=(--attention-backend triton)
+if [[ "$MODE" == dsa || "$MODE" == dsa-mtp ]]; then
+  export SGLANG_DSA_FUSE_TOPK="${SGLANG_DSA_FUSE_TOPK:-1}"
+  export SGLANG_OPT_USE_TOPK_V2="${SGLANG_OPT_USE_TOPK_V2:-0}"
+  ATTN_ARGS=(--attention-backend dsa
+             --dsa-prefill-backend tilelang
+             --dsa-decode-backend tilelang
+             --dsa-topk-backend sgl-kernel)
 fi
 
 args=(
@@ -126,7 +148,7 @@ args=(
   --served-model-name glm53-flash-nvfp4
   --dtype float16
   --quantization modelopt_fp4
-  --attention-backend triton
+  "${ATTN_ARGS[@]}"
   --tensor-parallel-size 4
   --host "${SGLANG_V100_HOST:-0.0.0.0}"
   --port "${SGLANG_V100_PORT:-11435}"

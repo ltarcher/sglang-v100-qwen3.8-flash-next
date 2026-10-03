@@ -740,6 +740,9 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if deep_gemm is None:
+            # SM70: the fp16 paged-MQA path needs no schedule metadata.
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -1089,10 +1092,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and deep_gemm is not None
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1446,10 +1453,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and deep_gemm is not None
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -2986,6 +2997,24 @@ class DeepseekSparseAttnBackend(
                     page_table_1.new_full((*page_table_1.shape[:-1], padding), -1),
                 ),
                 dim=-1,
+            )
+
+        # Upstream's TileLang sparse kernels are Hopper-sized (~140KB+ smem,
+        # bf16-typed) and cannot launch on Volta; dispatch to the fp16
+        # sm70-resized port. Argument shapes are identical.
+        from sglang.kernels.ops.attention.dsa.tilelang_sparse_sm70 import is_sm70
+
+        if is_sm70(q_all.device.index or torch.cuda.current_device()):
+            from sglang.kernels.ops.attention.dsa.tilelang_sparse_sm70 import (
+                tilelang_sparse_fwd_sm70,
+            )
+
+            return tilelang_sparse_fwd_sm70(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
             )
 
         return tilelang_sparse_fwd(

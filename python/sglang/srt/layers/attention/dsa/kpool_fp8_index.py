@@ -3,10 +3,31 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@triton.jit
+def _f32_to_e4m3_u8(x):
+    """RNE encode of a finite fp32 to one e4m3fn byte, bit-identical to the
+    fp8-typed store cast on sm90+ (verified against torch on the whole
+    |x| <= 448 domain). sm70 triton has no fp8e4nv type, so the pooled-cache
+    kernels take the buffer as uint8 and store bytes; callers clamp to
+    +-448 before every store, which is this encoder's domain."""
+    u = tl.abs(x)
+    bits = u.to(tl.int32, bitcast=True)
+    e = ((bits >> 23) & 0xFF) - 127
+    p = tl.maximum(e - 3, -9)
+    q = libdevice.rint(u * tl.exp2((-p).to(tl.float32))).to(tl.int32)
+    ov = q >= 16
+    e2 = tl.where(ov, e + 1, e)
+    q2 = tl.where(ov, 8, q)
+    byte = tl.where(e2 < -6, q2, (e2 + 7) * 8 + (q2 - 8))
+    sign = (x.to(tl.int32, bitcast=True) >> 24) & 0x80
+    return (byte & 0x7F | sign).to(tl.uint8)
 
 
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
@@ -694,7 +715,8 @@ def kpool_softmax_rotate_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # The kernels take the pooled cache as raw uint8 bytes (they encode
+    # e4m3 in-kernel; sm70 triton has no fp8e4nv type).
     buf_fp32 = buf.view(torch.float32)
     if return_compressed:
         compressed_k = torch.empty(
@@ -706,17 +728,17 @@ def kpool_softmax_rotate_write_cache(
             (slot_k.shape[0],), dtype=torch.float32, device=slot_k.device
         )
     else:
-        compressed_k = buf_fp8
+        compressed_k = buf
         compressed_scale = buf_fp32
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
-        buf_fp8,
+        buf,
         buf_fp32,
         slot_k,
         slot_score,
         ape,
         loc,
         write_mask,
-        compressed_k,
+        compressed_k.view(torch.uint8),
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -791,10 +813,9 @@ def kpool_decode_update_and_maybe_write_cache(
     assert block_tables.ndim == 2
     assert block_tables.shape[0] >= batch
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
-        buf_fp8,
+        buf,
         buf_fp32,
         tail_k,
         tail_score,
@@ -853,7 +874,7 @@ def _hadamard128(x):
 
 @triton.jit
 def _kpool_softmax_rotate_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     slot_k_ptr,
     slot_score_ptr,
@@ -958,12 +979,12 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_u8(quantized), mask=mask)
         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
-            quantized,
+            _f32_to_e4m3_u8(quantized),
             mask=offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
@@ -971,7 +992,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
 
 @triton.jit
 def _kpool_decode_update_and_maybe_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     tail_k_ptr,
     tail_score_ptr,
@@ -1123,7 +1144,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+        tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_u8(quantized), mask=dim_mask)
         tl.store(buf_fp32_ptr + out_s_offset, scale)
 
     tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs
@@ -1153,7 +1174,7 @@ def _hadamard_quantize_fp8(acc, denom, ROUND_SCALE: tl.constexpr):
 
 @triton.jit
 def _kpool_assemble_softmax_rotate_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     chunk_k_ptr,
     chunk_score_ptr,
@@ -1231,7 +1252,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+    tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_u8(quantized), mask=mask)
     tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1267,12 +1288,11 @@ def kpool_assemble_softmax_rotate_write_cache(
         write_mask = write_mask.contiguous()
         has_write_mask = True
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     slots_per_page = pool.slots_per_page
 
     _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
-        buf_fp8,
+        buf,
         buf_fp32,
         chunk_k,
         chunk_score,
@@ -1521,7 +1541,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     write_loc_ptr,
     out_cache_loc_ptr,
     effective_n_ptr,
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     key_stride_0,
     score_stride_0,
@@ -1611,7 +1631,9 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(
+                buf_u8_ptr + out_k_offsets, _f32_to_e4m3_u8(quantized), mask=dim_mask
+            )
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1665,7 +1687,6 @@ def kpool_write_tail_and_maybe_compress(
         effective_n_per_batch = effective_n_per_batch.contiguous()
 
     slots_per_page = pool.slots_per_page
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
         key,
@@ -1679,7 +1700,7 @@ def kpool_write_tail_and_maybe_compress(
         write_loc,
         out_cache_loc,
         effective_n_per_batch,
-        buf_fp8,
+        buf,
         buf_fp32,
         key.stride(0),
         score.stride(0),

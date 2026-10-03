@@ -8,7 +8,7 @@
 
 **DeepSeek-V4.1-Flash** (official mixed MXFP8+MXFP4, DSpark, 8× V100-32GB, 256k, one stream) — short code ~9 tok/s, warm prefill ~560 tok/s.
 
-**GLM-5.3-Flash** (320B/18B MoE, 34× KDA linear attention + 11× DSA, NVFP4 checkpoint requantized to a 2-bit resident expert pool, 4× V100-32GB) — decode ~21 tok/s per stream, 8k prefill ~254 tok/s; 8k validated of 1M native.
+**GLM-5.3-Flash** (320B/18B MoE, 34× KDA linear attention + 11× DSA, NVFP4 checkpoint requantized to a 2-bit resident expert pool, 4× V100-32GB) — ship shape (Triton full attention): decode ~21 tok/s per stream, 8k prefill ~254 tok/s; `dsa` mode (sparse indexer + sm70 TileLang sparse attention, 2026-10-03): 8k prefill 1390 tok/s (+94%), decode 43.9 tok/s with MTP (accept 2.0–3.85); 8k validated of 1M native.
 
 A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang). Those three models are the supported ones. Others may load; they are untested here.
 
@@ -337,9 +337,23 @@ The validated checkpoint is the modelopt NVFP4 export of GLM-5.3-Flash (safetens
 
 Honest reading of those numbers:
 
-- **Prefill falls with context** (598 → 254 tok/s from 2k to 8k). A GPU trace of the 8k request shows why: the 11 DSA layers currently run FULL attention through the Triton backend (the sparse indexer is not enabled in this tree), and that one kernel is 75% of prefill busy time. The 2-bit MoE itself is 5% — the expert side is no longer on any critical path. A faster or sparser DSA prefill path is the next lever and has ~3–5× of headroom behind it (appendix G.5).
+- **Prefill falls with context** (598 → 254 tok/s from 2k to 8k). A GPU trace of the 8k request shows why: in this table's shape the 11 DSA layers run FULL attention through the Triton backend, and that one kernel is 75% of prefill busy time. The 2-bit MoE itself is 5% — the expert side is no longer on any critical path. The sparse DSA path (next section) removes that wall: 1390 tok/s at 8k, and its 2k→8k prefill rate is flat.
 - **MTP accepts well but nets −42% at one stream** (12.2 vs 21.1 tok/s): target decode got 5.7× faster while the fixed draft+verify cost (~195 ms/step) did not move, and accept 2.3 needs ≤ ~108 ms/step to break even. That step cost contains a known ~114 ms unlocated item from the earlier decode survey; until that probe lands, use `target` mode for interactive single-stream work. MTP on this engine still beats every spill-era MTP number by 2.4–3×.
 - One engine per host still applies; this binds the same `SGLANG_V100_HOST`/`SGLANG_V100_PORT` address as the other two.
+
+### DSA sparse attention mode (P5-a, 2026-10-03)
+
+`bash scripts/serve_glm53_flash_v100.sh dsa` (or `dsa-mtp`) lights up the 11 DSA layers' indexer + fused topk + sparse attention on sm70: the indexer writes the pooled fp8 cache through uint8-pointer Triton kernels (in-kernel e4m3 encode; sm70 Triton has no fp8e4nv), selection goes through the JIT fused group-topk (GLM emits 2051 columns = topk 2048 + pool_size−1 tail, consumed only via the fused page-table path: `SGLANG_DSA_FUSE_TOPK=1 --dsa-topk-backend sgl-kernel`, `SGLANG_OPT_USE_TOPK_V2=0`), and attention runs the `tilelang_sparse_sm70` kernel (GLM runs tail_dim=0, guarded at trace time).
+
+Same protocol as the table above (flushed radix, temperature 0), 2-bit u2 pool weights, WIP-tree boot:
+
+| check | triton full-attn (ship) | dsa mode |
+|---|---:|---:|
+| prefill ~7.6k tokens | 254 tok/s | **1390** tok/s (gate ≥800; +94% vs the 717 same-day full-attn baseline) |
+| decode, 1 stream, target-only | 21.1 tok/s | 23.8 tok/s |
+| decode, 1 stream, dsa-mtp NEXTN-3/4 | 12.2 tok/s | **43.9 tok/s** (accept 2.0–3.85) |
+
+Correctness gates, all passed: 24-prompt greedy top-1 identical to the triton arm (top-8 differences are meta-preamble near-tie phrasings only), needle 5/5 at ~1k (full-select regime) and ~2.5k (discriminative group-topk regime), prefix cache intact, llama-glm5 CPU oracle same-family text, and the Qwen3.8 NVFP4 regression gate clean (the six-file diff is bit-identical in Qwen throughput vs the image baseline; a full-tree bind-mount arm reads −15% prefill purely from dev-checkout artifact drift — stale local Marlin `.so` + hidden compiled rust extensions — see `docs/v100/GLM53_FLASH_PLAN.md` H.5.6). Production compose stays on the `mtp` (triton) mode until one image-form re-validation boot; the numbers above are from the WIP-tree boot.
 
 ### Reference recipe
 

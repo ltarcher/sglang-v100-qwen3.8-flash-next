@@ -109,8 +109,20 @@ class IndexerKPool(MultiPlatformOp):
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
         )
+        # Upstream hardcodes bf16 for this gate. Volta runs it against fp16
+        # activations (same predicate as the SM70_FORCE_FP16 model downgrade),
+        # so keep the parameter in fp16 there; checkpoint bf16 values are
+        # exact in fp16.
+        gate_dtype = torch.bfloat16
+        if (
+            is_cuda()
+            and torch.cuda.get_device_capability()[0] < 8
+            and envs.SGLANG_SM70_FORCE_FP16.get()
+        ):
+            gate_dtype = torch.float16
+
         self.index_kpool_compress_gate = nn.Parameter(
-            torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
+            torch.empty(self.head_dim, self.hidden_size, dtype=gate_dtype)
         )
 
         if is_cuda() and self.alt_stream is not None:
@@ -536,7 +548,7 @@ class IndexerKPool(MultiPlatformOp):
             return None
 
         if gate_score is None:
-            gate_score = F.linear(x, self.index_kpool_compress_gate)
+            gate_score = self._compress_gate_score(x)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._compress_write_decode(
@@ -564,12 +576,19 @@ class IndexerKPool(MultiPlatformOp):
             )
         return None
 
+    def _compress_gate_score(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool-selection score. The pooled write kernels contract bf16
+        scores (the decode kernel merges them with the bf16 tail buffers),
+        so cast the fp16 product here on fp16-only devices; a no-op where
+        the gate product is already bf16."""
+        return F.linear(x, self.index_kpool_compress_gate).to(torch.bfloat16)
+
     def _compute_gate_score_if_missing(
         self, x: torch.Tensor, gate_score: Optional[torch.Tensor]
     ) -> torch.Tensor:
         if gate_score is not None:
             return gate_score
-        return F.linear(x, self.index_kpool_compress_gate)
+        return self._compress_gate_score(x)
 
     def _get_q_k_bf16(
         self,
@@ -617,7 +636,7 @@ class IndexerKPool(MultiPlatformOp):
 
             if precompute_compress_gate:
                 with torch.cuda.stream(self.compress_gate_stream):
-                    gate_score = F.linear(x, self.index_kpool_compress_gate)
+                    gate_score = self._compress_gate_score(x)
 
             current_stream.wait_stream(self.alt_stream)
         else:
@@ -641,6 +660,11 @@ class IndexerKPool(MultiPlatformOp):
         if apply_rope or not enable_dual_stream:
             query = rotate_activation(query)
 
+        # The compress kernels contract bf16 keys (their asserts and the
+        # in-kernel Hadamard rounding); fp16-only devices cast once here.
+        # A no-op where key is already bf16.
+        key = key.to(torch.bfloat16)
+
         return query, key, gate_score, head_weights
 
     def _get_k_bf16(
@@ -657,7 +681,8 @@ class IndexerKPool(MultiPlatformOp):
         if not self.skip_rope:
             _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
             key[..., : self.rope_head_dim] = k_rope
-        return key
+        # Same bf16 compress-kernel contract as _get_q_k_bf16.
+        return key.to(torch.bfloat16)
 
     def _full_topk_for_short_sequence(
         self, metadata: BaseIndexerMetadata, device: torch.device
@@ -820,6 +845,92 @@ class IndexerKPool(MultiPlatformOp):
         num_heads = q_fp8.shape[2]
         return arch_major == 9 and num_heads not in (32, 64)
 
+    @staticmethod
+    def _should_use_fp16_logits(q: torch.Tensor) -> bool:
+        # SM70 (Volta) has no FP8 tensor cores and no loadable deep_gemm,
+        # so the logits run through the fp16 head-folded kernels instead.
+        # On that path the `q_fp8` argument slots carry q_eff [n, head_dim]
+        # fp16 and `weights` is None; see _quantize_q_for_logits.
+        if not is_cuda():
+            return False
+        arch_major, _ = torch.cuda.get_device_capability(q.device)
+        return arch_major == 7
+
+    def _quantize_q_for_logits(
+        self,
+        query: torch.Tensor,
+        x: torch.Tensor,
+        head_weights: Optional[torch.Tensor],
+        act_quant,
+    ):
+        """Quantize q and resolve the head gates for the logits paths.
+
+        Returns the (query, weights) pair the topk helpers consume: the
+        upstream (q_fp8 [n, H, D] fp8, weights [n, H, 1] fp32) pair, or
+        on SM70 the head-folded q_eff [n, D] fp16 with weights=None --
+        the gate (fp32, already carrying softmax_scale) is folded into
+        the query before its single fp16 rounding.
+        """
+        if self._should_use_fp16_logits(query):
+            gate = head_weights
+            if gate is None:
+                gate = self._project_and_scale_head_gates(x)
+            from sglang.kernels.ops.attention.dsa.fp16_mqa_logits import gate_fold
+
+            return gate_fold(query, gate * self.softmax_scale), None
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        return q_fp8, self._resolve_head_gate_weights(x, q_scale, head_weights)
+
+    def _get_topk_paged_fp16(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_eff: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """SM70 variant of _get_topk_paged: no fp8 tensor cores and no
+        deep_gemm, so the paged logits run through the fp16 kernel against
+        the same fp8 pooled cache buffer (e4m3 decoded in-kernel). The fp16
+        kernel needs no deep_gemm schedule metadata."""
+        pool = get_token_to_kv_pool()
+        block_tables = metadata.get_page_table_64()
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            seqlens_32 = metadata.get_seqlens_expanded()
+        else:
+            seqlens_32 = metadata.get_seqlens_int32()
+        n_real = seqlens_32.shape[0]
+        q_eff = q_eff[:n_real]
+        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
+        pool_seqlens, _, pool_block_tables, _ = self._get_kpool_decode_metadata(
+            metadata,
+            block_tables,
+            seqlens_32,
+            pool.page_size,
+            build_schedule_metadata=False,
+        )
+        from sglang.kernels.ops.attention.dsa.fp16_mqa_logits import (
+            fp16_paged_mqa_logits_fp8kcache,
+        )
+
+        logits = fp16_paged_mqa_logits_fp8kcache(
+            q_eff,
+            kv_cache_fp8,
+            pool_seqlens,
+            pool_block_tables,
+            pool_block_tables.shape[1] * pool.page_size,
+        )
+        page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
+        return self._topk_from_kpool_logits(
+            logits,
+            pool_seqlens,
+            seq_lens=seqlens_32,
+            page_table=page_table_1,
+            topk_offsets=topk_offsets,
+        )
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -830,6 +941,9 @@ class IndexerKPool(MultiPlatformOp):
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
+
+        if self._should_use_fp16_logits(q_fp8):
+            return self._get_topk_paged_fp16(forward_batch, layer_id, q_fp8, metadata)
 
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
@@ -941,8 +1055,10 @@ class IndexerKPool(MultiPlatformOp):
 
         plan = metadata.attn_metadata.kpool_extend_plan
         assert plan is not None, "kpool extend plan is required"
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(-1)
+        use_fp16_logits = self._should_use_fp16_logits(q_fp8)
+        if not use_fp16_logits:
+            assert len(weights.shape) == 3
+            weights = weights.squeeze(-1)
 
         device = q_fp8.device
         total_q = q_fp8.shape[0]
@@ -971,14 +1087,30 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
+            if use_fp16_logits:
+                # SM70: no fp8 GEMM; dequantize the gathered pooled rows
+                # to fp16 (fp8 -> fp32 * scale -> one fp16 rounding) and
+                # run the grouped cuBLAS ragged GEMM. q_fp8 carries q_eff.
+                from sglang.kernels.ops.attention.dsa.fp16_mqa_logits import (
+                    fp16_ragged_mqa_logits,
+                )
+
+                k_f16 = (k_fp8.float() * k_scale[:, None]).to(torch.float16)
+                logits = fp16_ragged_mqa_logits(
+                    q_fp8[:n_real].contiguous(),
+                    k_f16,
+                    ks_per_q,
+                    ke_per_q,
+                )
+            else:
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[:n_real].contiguous(),
+                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    weights[:n_real].contiguous(),
+                    ks_per_q,
+                    ke_per_q,
+                    clean_logits=True,
+                )
         else:
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
@@ -1277,6 +1409,12 @@ class IndexerKPool(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
+        if self._should_use_fp16_logits(q_fp8):
+            raise NotImplementedError(
+                "SM70 fp16 indexer topk requires the kpool extend plan; "
+                "the per-batch fallback still calls deep_gemm fp8"
+            )
+
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
@@ -1389,16 +1527,18 @@ class IndexerKPool(MultiPlatformOp):
                 assert self.compress_gate_stream is not None
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, weights = self._quantize_q_for_logits(
+                    query, x, head_weights, act_quant
+                )
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
         else:
             _compress_write()
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, weights = self._quantize_q_for_logits(
+                    query, x, head_weights, act_quant
+                )
 
         if not return_indices:
             return None
@@ -1566,15 +1706,16 @@ class IndexerKPool(MultiPlatformOp):
             with torch.cuda.stream(self.alt_stream):
                 kpool_extend_cache = compress_write()
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, weights = self._quantize_q_for_logits(
+                    query, x, head_weights, act_quant
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, weights = self._quantize_q_for_logits(
+                    query, x, head_weights, act_quant
+                )
             kpool_extend_cache = compress_write()
-            if return_indices:
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
 
         if not return_indices:
             return None

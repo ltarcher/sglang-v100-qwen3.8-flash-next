@@ -71,8 +71,13 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
+        # Only the deep_gemm paged-MQA kernel consumes the schedule
+        # metadata; it exists on sm90+ only. sm70 runs the fp16 logits
+        # kernel, which needs no scheduler.
         if self.device_sm_major == 9:
             return self.num_q_heads in (32, 64)
+        if self.device_sm_major < 9:
+            return False
         return True
 
     def _init_kpool_metadata(

@@ -839,3 +839,290 @@ W4A16" 零输出回退(23.2 tok/s、专家输出垃圾),smoke 类检测不可省
 方法论教训(比数字更重要):**A/B 与基线对比必须冻结整条 launch 配置——通信环境
 变量(NCCL_P2P_LEVEL / custom AR 开关)与代码、venv 同级**,只对齐代码和 .so 不够;
 README 性能口径以生产 compose 为准,bench 变体 boot 只用于相对比较。
+
+## 附录 H:P5-a DSA 稀疏路径设计(2026-10-02 开题)
+
+目标:点亮 11 层 DSA 的 indexer + topk + 稀疏注意力(M4 欠账),替换 triton
+absorbed-MLA 全注意力(G.8 后仍是 prefill 8k 的 ~75% GPU)。门:prefill 8k
+≥800 tok/s(此前 C.4 的门在 indexer 未启用时"非法",此路径修完才合法)。
+
+### H.1 现状链路(已定位,代码在树)
+
+- GLM `use_dsa=True`(`glm5_next.py:1216` → `is_deepseek_dsa`),**IndexerKPool
+  模块与权重已加载**(`deepseek_v2.py:2023-2061`,`index_kpool=4>1` → kpool 类),
+  但 `--attention-backend triton` 下 MLA 层走 absorbed 全注意力,triton 后端以
+  `supports_dsa_indexer=False`(`triton_backend.py:153`)声明不吃 indexer;
+  eagle-worker 的 draft-backend 门(`eagle_worker_v2.py:438-468`)同源。
+- 激活开关 = `--attention-backend dsa`(`DeepseekSparseAttnBackend`,
+  `attention_registry.py:140`)。稀疏核经 `dsa_impl` 分派
+  (`dsa_backend.py:2009/2023/2318/2332`,extend/decode 各有 tilelang 与 triton 分支)。
+
+### H.2 SM70 缺口清单(全部静态定位完毕)
+
+| # | 缺口 | 位置 | 方案 |
+| --- | --- | --- | --- |
+| 1 | 索引器 logits 内核全是 FP8:extend ragged `deep_gemm.fp8_mqa_logits`;decode paged `deep_gemm.fp8_paged_mqa_logits`(tilelang 变体限 arch==9) | `dsa_indexer_kpool.py:874-905, 974, 1206` | 新增 fp16 triton 内核(ragged + pooled-paged 两形态),**fp32 累加(llama-glm5 红线)**;fp16 直存比上游 fp8+scale 更precise |
+| 2 | 索引器 K 缓存 fp8+scale 布局(head_dim_with_sf=132) | `kpool_fp8_index.py` 写入/读取 | SM70 分支:fp16 直存无 scale;池分配 dtype 已有 Volta fp16 注记(`kv_cache_dtype.py:66`) |
+| 3 | 稀疏核选择受门约束:`triton` 仅 ROCm、tilelang(CUDA)需 bf16 KV、kpool>1 的 tail 只认 fa3/tilelang/trtllm | `overrides.py:_check_dsa_backend_constraints`、`dsa_backend_kpool.py:35-52` | 走 triton 稀疏核:扩 `triton_sparse_mla*.py`(DSv4 血统,单 pass+split-K,fp8/bf16 已有)支持 fp16;门以 env 开关放开(遵循 env-var-conventions);kpool tail 先验证索引空间再定是否需扩核 |
+| 4 | kpool tail 语义 | 已确认:`n_select=(topk/kpool+1)*kpool-1`(512 池+1 边界池展开 → 2051 真实 token 格),llama-glm5 同式(`glm5next.cpp:11-17`) | 最终 index 在真实 token 空间 → gather 型稀疏核可消费;A2 步实测确认 |
+| 5 | 顶层调度三处 `deep_gemm.get_paged_mqa_logits_metadata` 硬调用(deep_gemm 在 Volta=None) | `dsa_backend.py:743/1106/1457`、`dsa_indexer_kpool.py:787` | sm70 分支:fp16 内核自带 metadata 或不需要 |
+| 6 | 杂项 | indexer `params_dtype=bf16`(weights_proj 等)、`--dsa-topk-backend` 默认 sgl-kernel | bf16→fp16(SM70_FORCE_FP16 机器约定);topk 先用 `torch`(正确性优先,`SGLANG_DSA_FUSE_TOPK=0`),再测 sgl-kernel |
+
+tilelang d512 稀疏核不选:三次编译失败(LayoutInference/smem/`T.alloc_global`,
+MoE4All §5),修复设想(dim-half)是独立高风险工程;triton 是本 fork 主场。
+
+### H.3 执行增量(每步独立可验证)
+
+- **A1 fp16 索引器 logits 内核**:ragged(extend)+ pooled-paged(decode/verify)
+  两个 triton 内核;torch 参照单元测试 → llama-glm5 logits 对齐(3k ctx,
+  >2051 强制 indexer 路径)。
+- **A2 稀疏核 fp16 + 门放开**:`triton_sparse_mla*.py` 加 fp16;
+  `_check_dsa_backend_constraints` 的 CUDA-triton 禁令以 sm70 env 开关豁免;
+  kpool tail 消费实测。
+- **A3 接线**:K 缓存 fp16 直存、调度 metadata sm70 分支、indexer 参数 dtype、
+  serve 脚本/compose 增 dsa 参数组(`--attention-backend dsa
+  --dsa-prefill-backend triton --dsa-decode-backend triton
+  --dsa-topk-backend torch`)。
+- **A4 验收**:oracle 门(同 prompt ≤2051 vs >2051 一致性、needle、与
+  llama-glm5 的 logits/same-top1)→ **Qwen3.8 NVFP4 回归硬门(基础设施改动
+  前置纪律)** → prefill 2k/8k 重测(对照 254/717)。
+
+预算观感:decode/verify 的 indexer logits FLOPs(32h×128d×pooled 4:1)远小于
+被替换的全注意力;8k prefill 索引 logits ~55 GFLOP/层 ×11 层,V100 fp16 实测
+带内。P5-b 的 NEXTN skip_topk(nextn 层复用 target 索引)不受影响。
+
+### H.4 A1/A2 实测定案(2026-10-02,修订 A2/A3 路线)
+
+两个决定性实验事实,改写了 H.3 预设的路线:
+
+| 事实 | 证据 |
+| --- | --- |
+| **Triton 在 sm70 没有 MMA 路径**:`tl.dot` 全部降级为标量 `fma.rn.f32`(PTX 0 条 mma.sync / 8192 条 fma),GEMM 形核实测 0.2 TFLOPS | p5a-test 容器 PTX dump + 计时 |
+| **TileLang 0.1.8 在 sm70 走 WMMA**:内核源含 `nvcuda::wmma::mma_sync`,fp16 GEMM 实测 49.2 TFLOPS;且自带 `gemm_mma_sm70` emitter | 同容器 `T.gemm` 探针 |
+
+- **A1 完成(已过单元测试,未提交)**:`python/sglang/kernels/ops/attention/dsa/fp16_mqa_logits.py`
+  ——头折叠线性化(gate 为每头标量,`Σ_h gate·(q_h·k) = (Σ_h gate·q_h)·k`,
+  fp32 折叠、一次 fp16 舍入、fp32 累加;比上游 per-head FP8 还多 ~2^8 精度)+
+  分组 cuBLAS ragged GEMM(`out_dtype=float32`)+ 免 tl.dot 的 paged triton 内核。
+  测试 `test/registered/kernels/test_fp16_mqa_logits.py` 5/5;实测:extend 全管线
+  2.60ms @8k pooled,paged ≤0.114ms(16k pooled 含)。
+- **A2 完成(已过 oracle,未提交)**:上游稀疏核 v2 为 Hopper 尺寸(warp 专用化
+  384 线程、~170KB smem),v1 全宽 KV 双缓冲也超 Volta 96KB/块上限,且
+  QK(trans_B)与 PV(非 trans_B)对同一缓冲要求不同 Volta swizzle
+  (即 M4 的 "Get different layout" 失败签名)。`tilelang_sparse_sm70.py`
+  以 v1 骨架重排:128 线程(4 warp——sm70 emitter 要求每 warp 整 16×16 tile,
+  M=16 时 256 线程会切 M 触发断言)、fp16、K/V 半宽 [64,256] 双角色缓冲
+  (buf_K 只做 QK、buf_V 只做 PV)、num_stages=1、免 O_shared。
+  **数值:vs fp32 参照 max rel 4.3e-3、cos 1.000000;性能:5.21ms/chunk-1024
+  (随机 indices 最坏情形,~880GB/s 已顶 HBM 上限),8k×11 层 ≈ 0.46s/rank
+  vs 现状 24.25s ≈ 53×**。接线:`dsa_backend._forward_tilelang` 按 sm major
+  分发(参数形状与上游逐位一致)。
+- **A3 路线修订(最小 diff)**:**索引 K 缓存维持 fp8+scale 布局与全部写入核
+  不动**(P4 质量门语义逐位继承;且省 ~20GB 池内存),只改读侧:
+  1. extend:现有 gather 内核不动 → gather 出的 k_u8/k_scale 反量化为 fp16 →
+     A1 ragged GEMM。
+  2. decode/verify:A1 paged 内核加 fp8-cache 变体(核内 u8→fp8→fp32×scale
+     反量化,页内 132B 布局)。
+  3. q 侧:sm70 跳过 act_quant(query 保持 fp16),head gate 乘 q_scale=1;
+     Hadamard 两侧保留(q 的 rotate_activation 与写核内 _hadamard128,点积差
+     常数 √128 不改排序)。
+  4. `build_schedule_metadata=False` 绕开 deep_gemm metadata 硬调用;
+     group_topk=2048/4=512 走 fused JIT topk(tvm_ffi JIT,sm70 可编译),
+     `sgl_kernel.fast_topk_v2` 仅 group_topk=2048 才触达,GLM 配置不经过。
+- 后续优化储备(不阻塞验收):spill 同款 smem→smem K→V 复制省一半 gather;
+  L2 局部性在真实 topk 下优于随机 indices 探针。
+
+### H.5 A3 落地定案(2026-10-03;A4 引擎验证进行中)
+
+A3 全部代码已落地(未提交),关键事实与偏离 H.3 预设的修订:
+
+| 项 | 定案 |
+| --- | --- |
+| 索引 K 缓存 | **维持 fp8+scale 布局与写入管线逐位不动**(132B/token);读侧反量化 |
+| q 侧 | sm70 跳过 act_quant(`_quantize_q_for_logits` seam):`gate_fold(query, gate·softmax_scale)` → q_eff [n,D] fp16;gate 融入 `weights_proj·n_heads^-0.5·softmax_scale`(q_scale≡1) |
+| extend logits | gather 出的 k_u8/k_scale → torch 反量化 fp16 → `fp16_ragged_mqa_logits`(分组 cuBLAS,fp32 out) |
+| decode/verify logits | `fp16_paged_mqa_logits_fp8kcache`(triton,核内 e4m3 位运算解码 × fp32 scale;NEXT_N constexpr 支持 MTP verify;输出 256 对齐 stride 兼容 fused topk ABI) |
+| 调度 metadata | `_build_kpool_paged_mqa_schedule_metadata` sm<9 → False;dsa_backend.py 两处 metadata 构建加 `deep_gemm is not None` 守卫(deep_gemm 在 Volta 导入失败 = None/Exception) |
+| topk | group_topk=512 → `fast_kpool_topk_transform_fused`(tvm_ffi JIT .cuh)**sm70 实测可编译且数值正确**;`SGLANG_DSA_FUSE_TOPK=0` 时 torch 路径(正确性优先);`fast_topk_v2` 仅 group_topk=2048,GLM 不经过 |
+| topk 语义实测 | 输出 = 绝对真实 token 位置 ∈ [0, seq_len);短序(<2051)全选;`row_starts=ks` 把 ragged 列映射回绝对池行;判别性 oracle:8k 序 hot/warm 组入选、cold(<160 分)入选 0 |
+| 非目标路径 | `_get_topk_ragged`(无 plan 兜底)改为 fail-fast NotImplementedError;triton 全注意力路径(triton backend)不触达 indexer,保持不变 |
+
+- 单元测试 `test/registered/kernels/test_fp16_mqa_logits.py` 8/8(gate_fold、
+  ragged 共享/交错范围、paged、ABI stride、fp8 缓存逐位一致 max rel 0.000e+00、
+  MTP bs=2×next_n=3 表行折叠)。
+- **A4 已启动**:`p5a-engine` 容器,`--attention-backend dsa
+  --dsa-prefill-backend tilelang --dsa-decode-backend tilelang
+  --dsa-topk-backend torch`(fp16 KV 自动解析确认);serve 脚本增 dsa/dsa-mtp
+  模式。验收清单同 H.3 A4。
+
+#### H.5.1 首次 boot capture 失败与修复(2026-10-03)
+
+第一次 A4 boot 在 decode CUDA graph capture 崩溃,暴露一个比 logits 内核更深的
+事实:**triton backend 下 metadata=None 提前返回,连 compress write 都从未在
+Volta 上执行过**——整个 kpool fp8 写管线(含其 bf16 断言)对 sm70 是零覆盖,
+"写入管线逐位不动"的说法不成立,它只是从未被运行。逐雷修复:
+
+| 雷 | 位置 | 修复 |
+| --- | --- | --- |
+| `index_kpool_compress_gate` 硬编码 `dtype=torch.bfloat16`(H.2 #6,A3 漏项) | `dsa_indexer_kpool.py` 建参处 | 参数按机器规则选 fp16(`major<8 && SGLANG_SM70_FORCE_FP16`,同 dtype 降级 hook 谓词;checkpoint bf16 值在 fp16 范围内无损) |
+| 写核 bf16 断言链(`slot_k/tail_k/key`):`kpool_softmax_rotate_write_cache`、`kpool_decode_update_and_maybe_write_cache`、`kpool_write_tail_and_maybe_compress` | `kpool_fp8_index.py`(不改) | `_get_q_k_bf16`/`_get_k_bf16` 返回前 `key.to(torch.bfloat16)`——函数名即上游契约,sm80+ 是 no-op;fp16→bf16 精度回到上游水平 |
+| decode 写核 `slot_score.dtype == tail_score.dtype`(tail 缓冲硬编码 bf16) | 同上 | 新增 `_compress_gate_score(x)` helper 统一 3 处 gate 乘积并 `.to(torch.bfloat16)`(选择分与上游同为 bf16 精度;extend/verify 断言本就接受多型) |
+
+伴随探针(p5a-test,免 boot 验证):fp16 Hadamard JIT 可编译且 roundtrip
+err≈1e-3(fp16 舍入级);`torch.compile(dynamic=True)` fp32 head-gate 链在
+sm70 inductor 可编译(~3.4s 首编)。`k_norm` LayerNorm(fp32 参)走 native
+路径自动 cast,安全。附带确认:weights_proj 保持 fp32 是红线设计(调用侧
+`x.float()`),ape fp32 由写核契约要求,均不动。
+
+修复后重启同一 docker run(env/参数全同)。A4 后续验收以本次 boot 为准。
+
+#### H.5.2 第二次 boot 失败:sm70 triton 无 fp8e4nv,写核改 uint8 + 核内编码(2026-10-03)
+
+第二次 boot 在 decode capture 崩于 `_kpool_decode_update_and_maybe_write_cache_kernel`
+编译:`ValueError("type fp8e4nv not supported in this architecture…")`——sm70 triton
+仅支持 `fp8e4b15`/`fp8e5`,而上游写核把 fp8 缓冲以 `torch.float8_e4m3fn` 视图传入,
+launch 时指针元素类型即 fp8e4nv。修法(仅 `kpool_fp8_index.py`):
+
+- 四个写核的池缓冲参数统一收 **uint8 裸字节指针**(入口既有
+  `buf.dtype == torch.uint8` 断言,池缓冲本就是 uint8 分配;fp32 视图传 scale 不变)。
+- 核内 RNE 编码 `_f32_to_e4m3_u8`:abs→指数字段→`p=max(e-3,-9)`→`rint(u·2^-p)`
+  (libdevice.rint=RNE)→尾数溢出规格化→字节拼装+符号位。五个 store 全部只写不读,
+  store 前 `quantized` 已 clamp ±448,故编码定义域即 |x|≤448。
+- **位级验证**:对 |x|≤448 全域 32804 个采样值(含全部 binade 边界与 RNE ties)
+  与 torch `.to(float8_e4m3fn)` 逐位一致(0 mismatch);域外 torch 溢出为 NaN
+  (0x7f)不饱和,但核内不可达。
+- 编译+写路径探针(p5a-test 免 boot):四个写核入口以生产 dtype 组合(req/chunk_src
+  int64、n_from_tail/tail_logical_base int32、write_loc int64)全部编译通过;核 1
+  encode store 落位 128/128 非零字节 + fp32 scale 正确。**生产 dtype 组合本身是
+  编译正确性的一部分**:assemble 核 slot 循环两分支对 `off` 的类型必须一致
+  (int64),混合 i32/i64 探针即触发 triton type-join 报错——生产全 int64 布局
+  无此问题。
+- 伴随排查:dsa 目录其余 fp8 视图(`dsa_indexer_kpool.py:1091/1303/1332`)均在
+  torch 域(view+`.float()` 反量化或拷贝),无 triton 指针;per-batch deep_gemm
+  回退有 sm70 fail-fast 守卫(A3);`dsa_indexer.py`(非 kpool)不在 GLM 路径。
+
+修复后第三次 boot(同一 docker run)。A4 验收以本次 boot 为准。
+
+#### H.5.3 第三次 boot 失败定位:kpool 解码必须走 fused topk(H.5.2 修复后)(2026-10-03)
+
+第三次 boot 越过写核(H.5.2 修复有效),崩在 `transform_index_page_table_decode`
+的 `assert topk_indices.shape[1] == 2048`:实际 2051。根因是**启动组合,不是内核**:
+
+- kpool fused topk JIT 核(`kpool_topk_transform.cuh`,`-DSGL_GROUP_TOPK=512`,
+  radix topk,无 fp8/wmma,TVM-FFI 包装)的输出列数 = topk + (pool_size-1 且传
+  seq_lens)= 2048+3:KPOOL 语义里最后不满池的 1-3 个尾 token
+  (`index_kpool_always_select_tail=True`)恒被追加为额外列。
+- 该 2051 宽输出的合法消费者只有 fused 页表路径(`use_fused_topk=True`,
+  `_get_fused_topk_page_table` 恒等返回——fused 核已经按 token 级 page_table_1
+  gather 过)。`transform_index` 按契约只吃 2048 宽,是给非 kpool(indexer
+  nsa)路径的。`SGLANG_DSA_FUSE_TOPK=0 + --dsa-topk-backend torch` 对 kpool
+  decode 是上游从未执行的组合(上游默认 FUSE_TOPK=True;torch 后端只用于非
+  kpool 计数路径)。
+- **sm70 探针全绿**(`docker exec p5a-test`,`TORCH_CUDA_ARCH_LIST=7.0` JIT 编译):
+  PAGED 全选/部分尾池(6/5/1)/判别式(top-512 组精确集合)、RAGGED offsets、
+  RAGGED+row_starts(+seq_lens→2051)。注意核把 page_table_1 当 **token 级表**
+  直接索引(raw_token→KV 槽),探针误传池级表会 OOB 读零,不是内核 bug。
+- 第四次 boot 改上游原生组合:`SGLANG_DSA_FUSE_TOPK=1` +
+  `--dsa-topk-backend sgl-kernel` + `SGLANG_OPT_USE_TOPK_V2=0`(v2 折叠计划
+  零 sm70 覆盖,关掉以收敛 capture 面到唯一新内核)。tilelang 稀疏消费侧
+  (`_forward_tilelang`)本就为 2051 宽设计(pad 到 64 倍数,-1 填充)。
+
+#### H.5.4 第四次 boot 失败定位:tilelang sm70 稀疏核 tail_dim=0 布局崩溃(2026-10-03)
+
+第四次 boot 越过 fused topk(H.5.3 组合生效),崩在
+`tilelang_sparse_fwd_sm70` 首编:`tvm InternalError: no available layout found`
+(LayoutInference pass)。参数矩阵(p5a-repro 容器,引擎同 env):
+
+| (dim, tail) | 对应模型 | 结果 |
+| --- | --- | --- |
+| (256, 0) / (512, 0) | tail_dim=0 | **LayoutInference 崩**(零宽 `T.alloc_shared([H,0])` 无法分配寄存器布局) |
+| (256, 256) | q_all=512, v_head=256 | OK |
+| (512, 64) | DSV 式 q_all=576 | OK(探针 kv 宽度笔误,非内核问题) |
+
+GLM-5.3-Flash 实际参数:`attn_mqa` RadixAttention 以 kv_lora_rank(512)为
+v_head_dim、qk_rope_head_dim=0 → d_v=512、tail=0,此前探针只测过 tail=64
+(DSV 形状),零尾是首遇。修复:核内 D_tail 以 host 常量在 trace 期分支,
+零尾时跳过 `Q_tail_shared`/`K_tail_shared` 分配与 Q-tail copy(K-tail gemm
+本就有 `if D_tail > 0`)。GLM 真形状复验:编译 ~11s、vs fp32 参
+cos=1.000000(max abs 1.15e-05)、decode bs=4 0.56ms、chunk-1024 5.09ms。
+
+#### H.5.5 A4 验收通过:DSA 稀疏路径点亮(2026-10-03)
+
+第五次 boot(H.5.2 + H.5.3 + H.5.4 三修复齐上)健康:capture 145.9s /
+0.40 GB,`fired up and ready to roll`。A4 门(/tmp/p5a_gate.py,对照
+/tmp/p4_gate_u2.json u2-triton 臂,同 u2 池权重):
+
+| 项 | 结果 | 判据 |
+| --- | --- | --- |
+| sanity | "Paris" 在 128 tok 窗内出现(GLM 风格是先复述题面再作答,16 tok 窗误报) | 通过 |
+| 24-prompt top-1 vs u2 臂 | **24/24 逐 token 一致**(前 8 top 序列亦逐位一致) | 通过 |
+| needle ~1k(全选域,prompt 1542) | **5/5** | 通过 |
+| needle ~2.5k(判别 topk 域,prompt 3651 > 2051) | **5/5** | 通过(判别式组 topk 数值正确) |
+| prefill ~2k flushed | 1913 tok,1369 tok/s | — |
+| **prefill ~8k flushed** | 7619 tok,**1390/1393 tok/s**(u2 基线 717) | **≥800 门:通过(+94%)** |
+| prefix cache | 重复请求 `#cached-token: 2304`(仅 3 新 token),文本一致 | 通过(该 build `prompt_tokens_details` 为 null,以服务端 radix 日志为准) |
+| decode 单流 | 23.8 tok/s(@330 ctx)/ 22.2 tok/s(@1.5k ctx),无 MTP boot | 记录项 |
+
+判别域通过意味着 indexer → fp8 池写 → fused JIT topk → tilelang 稀疏注意力
+整链在 sm70 上数值正确;2k→8k prefill 速率几乎持平(1369→1390)是稀疏选择
+的签名(全注意力随长度退化,基线 717@8k)。u2 requant + stage 缓存 boot
+~20 min。引擎日志无错误(仅内核 preload 建议),49 请求全 200。
+
+待办:Qwen3.8 NVFP4 回归硬门(下一节记录)→ llama-glm5 CPU 抽查 →
+serve 脚本/compose 镜像 `SGLANG_DSA_FUSE_TOPK=1 + --dsa-topk-backend
+sgl-kernel + SGLANG_OPT_USE_TOPK_V2=0`。
+
+#### H.5.6 Qwen3.8 NVFP4 回归硬门:通过(三臂 A/B 定案,2026-10-03)
+
+同日同协议三臂(unified 镜像,冻结 qwen38next 配置,bench = flushed
+prefill ~4k/8k max_tokens=1 + 384-token 贪心 decode + 服务端 accept):
+
+| 臂 | prefill 8k (tok/s) | decode (tok/s) | accept |
+| --- | --- | --- | --- |
+| 镜像内 python(基线) | 2878 / 2947 / 2840 | 81.3 / 82.5 / 82.5 | 1.95–2.58 |
+| WIP 全树 bind-mount | 2358 / 2556 / **2374**(−15%) | 75.5 / 80.9 / 81.1 | 1.95–2.58 |
+| 仅 P5-a 六个 DSA 文件挂载 | **2946 / 2947 / 2877** | 81.7 / 80.6 / **82.7** | 1.95–2.58 |
+
+- **P5-a diff 对 Qwen 零影响,硬门通过。** 六个变更文件(4 改 2 新)全在
+  DSA 路径,文件级挂载臂与镜像内臂差 <2.4%(噪声内),accept 逐位一致。
+- **全树 bind-mount 的 −15% prefill 是仪器假象,不是代码回归**:dev 检出树
+  遮住了镜像内编译工件(rust_extensions `*.so`),且自带本地陈旧
+  Marlin `prebuilt/*.so`(树内 02:31/10:52 构建字节级 ≠ 镜像 10:36 构建)。
+  教训入库:**Qwen 回归仪用文件级挂载变体**
+  (`docker-compose-sglang-v100-qwen38next-p5a-dsaonly.yaml`),基线臂 =
+  `-p5a-inimage.yaml`(去挂载);compose 头部已记三臂数据。
+- 历史 "decode 93.2" 带与协议绑定(本次协议下两臂都读 ~82),跨协议数字
+  不可比;有效对比只有同日同协议 A/B。
+- 附注:GLM A4(boot 5)跑在 WIP 树(树内 Marlin .so)上;生产 compose 用
+  镜像内 .so,P5-a 数字可能有小幅平移,方向未知——生产化前的 dsa-mtp 验收
+  以镜像形态重测为准。
+
+#### H.5.7 llama-glm5 CPU oracle 抽查(2026-10-03)
+
+glm53-f16.gguf llama-server(CPU,56 线程,~3.3 min 载入)对拍:sanity
+"Paris" 一致;两条 A4 prompt 的 oracle `reasoning_content` 与引擎臂文本同
+族(中国的首都→Beijing 推理锚一致;注意力机制解释的 reasoning 开头近乎
+逐句同构)。锚链闭合:llama-glm5 CPU 参考 ↔ u2 臂(P4 门 + 本次)↔ DSA
+臂(A4 tops 24/24 + 前 8 top 逐位一致)。注意:该 oracle 模板默认
+reasoning-preserve,`content` 为空时答案在 `reasoning_content`。
+
+#### H.5.8 dsa-mtp 组合验收:NEXTN 投机解码跑通 DSA 稀疏路径(2026-10-03)
+
+第六次 boot(boot-5 组合 + 生产 mtp spec 旗标 NEXTN 3/1/4 +
+`--enable-linear-replayssm-spec --max-running-requests 4`)一次通过:
+target verify 图 119.5s、draft decode 21.6s、draft extend 2.3s 全部捕获
+(NextN 头含一个 DSA 层,稀疏路径在 draft 同样执行,零额外修复)。
+
+| 项 | 结果 |
+| --- | --- |
+| 24-prompt top-1 vs u2/dsa 臂 | **24/24** |
+| 24-prompt top-8 | 21/24;3 处分歧全是 meta-preamble 措辞近 tie 翻转("The user asks:" vs "The user is asking"),batched verify 的预期签名 |
+| needle 1k / 2.5k | **5/5 / 5/5**(硬门) |
+| decode 单流(384 tok essay) | **43.9 tok/s**(target-only 23.8 → +84%) |
+| accept len(服务端) | 2.02–3.85 |
+| needle 墙钟 | 1k 28.4s → 11.9s |
+
+一致性判据(AGENTS.md:target-only 与 --spec 输出一致性 + accept)满足:
+top-1 三臂逐位一致,分歧止步于前 8 token 的同义措辞。P5-a 全链验收完毕;
+生产 compose 仍保持 mtp(triton 全注意力)模式,切 DSA 前按 H.5.6 附注以
+镜像形态(.so)重测 dsa-mtp 一轮。
