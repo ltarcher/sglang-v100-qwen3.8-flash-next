@@ -424,8 +424,15 @@ def compute_spec_logprobs(
         )
     gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
 
+    # Spec block tails can hold tokens that verify rejected; those may not be
+    # valid vocab ids (drafted garbage), so clamp before the gather instead of
+    # device-asserting on positions the commit never used.
+    spec_ids = accepted_token_ids.long().clamp_(
+        0, gathered_logprobs.shape[1] - 1
+    ).view(-1, 1)
+
     logits_output.next_token_logprobs = gathered_logprobs.gather(
-        1, accepted_token_ids.long().view(-1, 1)
+        1, spec_ids
     ).view(bs, max_accept)
 
     if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):

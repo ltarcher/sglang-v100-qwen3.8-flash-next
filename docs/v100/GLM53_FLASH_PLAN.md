@@ -770,16 +770,45 @@ target 第 23/27/31/35/39/43 层 hidden states,target 逐步 verify;与 NEXTN �
   `_handle_dflash` 校验(强制 num_steps=topk=1)。启用只需换 spec 段旗标。
 - V100 适配缺口:draft 注意力后端须 triton(README 推荐 `trtllm_mha` 为
   sm80+);draft config bf16 → 必须 fp16(README 警告降精度伤 accept);draft
-  KV 直接 fp16(窗口仅 4096,不值得上 fp8);capture×mHC 分支行为待 boot 验证。
+  KV 直接 fp16(窗口仅 4096,不值得上 fp8)。capture×mHC 分支已 boot 验证:
+  结构生效不报错,但见下方实测,未走到能检验其质量的程度。
 - 显存:draft 权重 ÷TP4 ≈ 0.65 GiB/rank + 图/KV ~0.2 → KV 池 2.5 → ~1.6 GiB
   (8k 运行无感,长上下文更紧)。
-- 吞吐期望:verify 8 token → target 步长 ~90–105 ms → **打平点 accept ≈ 3.1**
-  (NEXTN 现状 29.5 tok/s @ accept 1.7、步 ~58 ms)。论文口径 accept 3.5–4.5,
-  但被两个本机因素夹击:u2 噪声(capture 特征带 2-bit 专家噪声,draft 训练于
-  干净 bf16 target,正确性无损——verify 从 target 分布采样——但 agreement
-  可能缩水)、MoE target 步长抬高门槛。
+- 吞吐期望(纸面,已被实测推翻,见下):verify 8 token → target 步长 ~90–105 ms
+  → **打平点 accept ≈ 3.1**(NEXTN 现状 29.5 tok/s @ accept 1.7、步 ~58 ms)。
+  论文口径 accept 3.5–4.5,但被两个本机因素夹击:u2 噪声(capture 特征带 2-bit
+  专家噪声,draft 训练于干净 bf16 target,正确性无损——verify 从 target 分布
+  采样——但 agreement 可能缩水)、MoE target 步长抬高门槛。
 - 长上下文形态优势:sliding-window draft 成本不随 ctx 增长(NEXTN 的 draft 是
   全注意力),真做长上下文时 DFlash 是更对的 spec 形态。
+
+**DFlash 实测回填(2026-10-03;G.9 判决:accept 1.00 << 3.1,不替换 NEXTN)**
+
+在 P5-a dsa target 组合上两轮 boot(图捕获采样器 + `SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1`
+对照),`--speculative-dflash-block-size 8 --speculative-draft-attention-backend triton
+--speculative-draft-model-quantization unquant`:
+
+- **accept len 1.00 / accept rate 0.00,每一步、两种采样器模式全部如此**:draft
+  8 token 提案从未有一次被 verify 接受,decode 仅 **11.9 tok/s**(对照 NEXTN
+  43.9 @ accept 2.0–3.85、target-only 23.8)——纯 verify 开销,比无 spec 慢一倍。
+- 输出正确性不受影响(verify 全拒,提交输出 = 贪心 target):tops 21/24 top-8
+  对 u2 参照(3 处近平局,与 dsa-mtp 臂同签名);needle 1k 5/5、2.5k 5/5。
+- 两个 boot 陷阱:① draft 量化继承——`speculative_draft_model_quantization`
+  默认继承 target 的 `modelopt_fp4`(serving_hook),纯 bf16 draft 检查点会被
+  loader 在线重量化,必须显式 `unquant`;② `logprobs=true` 请求首步 device
+  assert——`compute_spec_logprobs` 用垃圾 draft id 做 gather(logprob_processor
+  现有 clamp 防御,拒绝位本不进 commit)。
+- 根因排查到此为止的结论:**不是 Volta 内核问题**。flashinfer top_k、selector
+  walk(eager+graph)、accept-bonus、prepare-block 四个内核在产线形状下隔离
+  probe 全部 20/20 干净;mHC handoff 结构上已接通
+  (`dflash_use_aux_hidden_state` 无条件 True → `hc_contract` 每 forward 应用)。
+  指纹证据:`out_tokens` 第 1–5 列恒为 **7168(= hidden_size)**,跨请求、跨
+  采样器模式不变;第 0 列是真 token;第 6 列未初始化。真扩散提案应逐位变化,
+  这是引擎侧 draft block 构造路径(candidate/lattice 缓冲)的集成 bug,内核
+  probe 覆盖不到。修复重启此线时,从该缓冲泄漏查起,boot 配方与本节记录可直接复用。
+- **判决:维持 NEXTN。** DFlash 在本引擎当前状态下无任何吞吐收益;其长上下文
+  形态优势(此节上文)保留为未来重启的理由,重启前置条件是修掉 block 构造 bug
+  并让 accept 脱离 1.0。
 - **决策:排 P5-a 之后实测;accept > 3.1 才替换 NEXTN;测后无论正负回填本节。**
 
 ## 附录:Qwen3.8 NVFP4 回归(2026-10-02,GLM 结项补跑)
