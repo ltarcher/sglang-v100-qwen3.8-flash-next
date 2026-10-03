@@ -744,6 +744,21 @@ class PrefillAdder:
         # up to chunked_prefill_size // threshold requests can be mid-prefill
         # concurrently. 0 disables the cap (one request may drain the pool).
         self.long_prefill_token_threshold = long_prefill_token_threshold
+        # Dynamic widening (2026-10-03): a fixed 2048 cap at C=1 splits a long
+        # prompt into 4x more chunks than the pass budget allows, and each
+        # extra chunk pays a per-layer TP allreduce round trip on PCIe/UPI —
+        # measured 130k TTFT 70.0s -> 61.5s when the ceiling widens to the
+        # pass budget. Widen the ceiling when few requests compete for the
+        # budget; fall back to the user's cap as concurrency grows so the
+        # budget spreads fairly and concurrent prefill keeps its parallelism.
+        # rem_chunk_tokens is already assigned above (full pass budget).
+        if long_prefill_token_threshold > 0:
+            self.effective_prefill_ceiling = max(
+                long_prefill_token_threshold,
+                self.rem_chunk_tokens // max(1, self.waiting_queue_len),
+            )
+        else:
+            self.effective_prefill_ceiling = 0
         # How many requests may be mid-prefill at once. Mid-prefill requests
         # pin their computed KV and cannot be retracted, so the bound also
         # caps the reserved-but-uncomputed KV held for them.
@@ -1268,7 +1283,7 @@ class PrefillAdder:
                     # make progress and release the request's pinned KV.)
                     self._reserve_completion_for_parked_req(req)
                     return req
-                _rem_tokens = min(_rem_tokens, self.long_prefill_token_threshold)
+                _rem_tokens = min(_rem_tokens, self.effective_prefill_ceiling)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1428,7 +1443,7 @@ class PrefillAdder:
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
             chunk_tokens_limit = min(
-                chunk_tokens_limit, self.long_prefill_token_threshold
+                chunk_tokens_limit, self.effective_prefill_ceiling
             )
 
         if self.dllm_config is not None:
@@ -1699,7 +1714,7 @@ class PrefillAdder:
             # threshold still admits whole rather than being chunked by
             # the ceiling.
             chunk_tokens_limit = min(
-                chunk_tokens_limit, self.long_prefill_token_threshold
+                chunk_tokens_limit, self.effective_prefill_ceiling
             )
 
         # Without chunking, allow the first request even above the input cap.
