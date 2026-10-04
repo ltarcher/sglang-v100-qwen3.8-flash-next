@@ -212,6 +212,10 @@ def match_prefix_for_req(
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if envs.SGLANG_DEBUG_DISABLE_BRANCH_TRACK.get():
+        # #34 diagnostic: drop the branching-point forced track while keeping the
+        # (zero-length) serve, to bisect forced-track writes vs serve itself.
+        req.mamba_branching_seqlen = None
     if match_result.cache_protected_len is not None:
         req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result

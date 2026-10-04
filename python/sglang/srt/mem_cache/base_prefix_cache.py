@@ -281,6 +281,7 @@ def zero_match_result(
         swa_host_hit_length=0,
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
+        mamba_branching_seqlen=None,
         full_kv_hit_length=0,
     )
 

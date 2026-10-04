@@ -556,6 +556,15 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if envs.SGLANG_DEBUG_MAMBA_RADIX.get() and params.key is not None:
+            tk = params.key.token_ids
+            logger.info(
+                "[radix-dbg] req key_len=%d first=%s mid=%s last=%s",
+                len(params.key),
+                tk[0] if len(tk) else -1,
+                tk[len(tk) // 2] if len(tk) else -1,
+                tk[-1] if len(tk) else -1,
+            )
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -1117,6 +1126,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
+        # get_fill_ids() ends at extend_range.end, but under the overlap
+        # scheduler this stash can run while the chunk covering
+        # [extend_range.start, extend_range.end) is still in flight, so that
+        # window has no KV row content yet. Publishing it -- insert, post-insert
+        # dedup match, rebind -- put phantom pages into the tree and then into
+        # req.prefix_indices, silently corrupting the next chunk's attention.
+        # Cap what the stash caches at the committed extent; the in-flight
+        # chunk is cached by a later stash once its result is resolved.
+        # token_ids itself stays full-length: kv_indices_orig / prefix_indices
+        # describe the row the next chunk builds on and must not shrink.
+        committed_len = len(token_ids)
+        if chunked:
+            committed_len = min(committed_len, req.extend_range.start)
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1137,12 +1159,12 @@ class UnifiedRadixCache(BasePrefixCache):
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
+        effective_cache_len = committed_len
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
-                token_ids_len=len(token_ids),
+                token_ids_len=committed_len,
                 is_finished=False,
             )
             if cl is not None:

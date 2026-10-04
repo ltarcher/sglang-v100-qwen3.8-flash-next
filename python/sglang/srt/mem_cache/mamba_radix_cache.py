@@ -70,6 +70,12 @@ logger = logging.getLogger(__name__)
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 
+def _mamba_radix_debug() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DEBUG_MAMBA_RADIX.get()
+
+
 class TreeNode:
     counter = 0
     last_access_time_counter_float = float64(1.0)
@@ -525,6 +531,17 @@ class MambaRadixCache(BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
+        if _mamba_radix_debug():
+            logger.info(
+                "[mamba-radix-dbg] match key_len=%d raw_matched=%d best_value_len=%d "
+                "last_node_is_root=%s last_node_mamba=%s tree_children=%d",
+                len(key),
+                sum(len(v) for v in value),
+                best_value_len,
+                last_node is self.root_node,
+                last_node.mamba_value is not None,
+                len(self.root_node.children),
+            )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -541,6 +558,17 @@ class MambaRadixCache(BasePrefixCache):
         prefix_len, mamba_exist = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
+        if _mamba_radix_debug():
+            logger.info(
+                "[mamba-radix-dbg] insert key_len=%d chunked=%s mamba_value=%s "
+                "prev_prefix_len=%s -> prefix_len=%d mamba_exist=%s",
+                len(key),
+                params.chunked,
+                mamba_value is None,
+                prev_prefix_len,
+                prefix_len,
+                mamba_exist,
+            )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
     def cache_finished_req(
@@ -589,6 +617,15 @@ class MambaRadixCache(BasePrefixCache):
                         mamba_pool.replayssm_is_flush[cursor_idx] = 0
             if cache_len is None:
                 cache_len = 0
+            if _mamba_radix_debug():
+                logger.info(
+                    "[mamba-radix-dbg] finish token_ids=%d cache_len=%d "
+                    "extra_buffer=%s protected=%s",
+                    len(token_ids),
+                    cache_len,
+                    self.enable_mamba_extra_buffer,
+                    req.kv.cache_protected_len,
+                )
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.kv.cache_protected_len)
                 self.token_to_kv_pool_allocator.free_segment(

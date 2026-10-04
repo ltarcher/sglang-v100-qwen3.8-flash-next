@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -54,6 +56,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -144,8 +149,17 @@ class MambaComponent(TreeComponent):
     ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
         if match_device_only:
-            return lambda node: node.component_data[ct].value is not None
-
+            # A device match boundary must not require mamba state. The split
+            # fragment at a divergence point carries no mamba data (leaf-only,
+            # see redistribute_on_node_split), and a long warm prefill gets its
+            # donated states evicted, so vetoing mamba-less nodes truncates the
+            # served prefix below the tree's real Full-KV coverage. A truncated
+            # boundary desyncs the chunked stash: insert frees the request's
+            # duplicate live pages over the full overlap while the rebind only
+            # rewrites the row up to the vetoed boundary, leaving freed pages
+            # referenced by the row. COW handles a mamba-less boundary via
+            # src=None (full recompute).
+            return lambda node: True
         # HiCache: evicted + backuped (host_value present) is also a valid match
         return lambda node: (
             node.component_data[ct].value is not None
@@ -193,6 +207,14 @@ class MambaComponent(TreeComponent):
         src_index = self.tree_core.get_component_device_value(
             result.best_match_node, self.component_type
         )
+        if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+            logger.info(
+                "[radix-dbg] cow req=%s serve=%d full_hit=%d src=%s",
+                params.req.rid if params.req is not None else "-",
+                len(result.device_indices),
+                result.full_kv_hit_length,
+                "None" if src_index is None else int(src_index.reshape(-1)[0]),
+            )
         if src_index is None:
             return result
         req = params.req

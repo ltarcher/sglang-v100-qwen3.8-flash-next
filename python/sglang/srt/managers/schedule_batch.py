@@ -1652,6 +1652,11 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            if envs.SGLANG_DEBUG_DISABLE_BRANCH_TRACK.get():
+                # #34 diagnostic: drop the branching-point forced track at the
+                # batch-path unpack; the schedule_policy gate is bypassed by
+                # this re-assignment.
+                self.mamba_branching_seqlen = None
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
@@ -3078,6 +3083,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
+                    if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+                        logger.info(
+                            "[radix-dbg] branch-track fire rid=%s branching=%d "
+                            "prefix=%d track=%d",
+                            req.rid,
+                            req.mamba_branching_seqlen,
+                            len(req.prefix_indices),
+                            mamba_track_seqlen,
+                        )
                     # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                     # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                     # See _force_track_h() for more details.

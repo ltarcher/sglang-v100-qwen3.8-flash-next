@@ -1901,6 +1901,51 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_chunked_stash_never_keys_past_committed_extent(self):
+        """Bug regression: mid-prefill stash keyed past the committed extent.
+
+        Under the overlap scheduler the chunked stash can run while the chunk
+        covering [extend_range.start, extend_range.end) is still in flight, so
+        get_fill_ids() (which ends at extend_range.end) reaches past the KV the
+        request has actually computed. Keying the insert there published phantom
+        tree pages that the post-insert match then rebound into the request's
+        row, silently corrupting the next chunk's attention. The stash must key
+        at most the committed extent.
+        """
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        committed = len(tokens) // 2
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        # Overlap: the next chunk was admitted before this stash ran, so
+        # extend_range covers one not-yet-computed chunk.
+        req.set_extend_range(committed, len(tokens))
+        kv_indices = self._alloc(allocator, committed)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, committed)), kv_indices)
+        req.kv.kv_committed_len = committed
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        if self.cfg.has_mamba:
+            req.kv.mamba_last_track_seqlen = committed
+
+        cache.cache_unfinished_req(req, chunked=True)
+
+        # No tree content may exist past the committed extent, and neither the
+        # protected prefix nor the rebind may cache one. prefix_indices stays
+        # full-length: it is the row view the next chunk builds on.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertLessEqual(len(m.device_indices), committed)
+        self.assertLessEqual(req.kv.cache_protected_len, committed)
+        self.assertEqual(len(req.prefix_indices), len(tokens))
+
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.sanity_check()
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
@@ -8389,11 +8434,13 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
 
 
 class TestMambaCheckpointGrid(CustomTestCase):
-    """A donated mamba checkpoint is only reusable at a depth the tree can name.
+    """A mamba-less node must not truncate the device match boundary.
 
     ``tree_page_size`` simulates DCP: it widens the page the tree allocates on
     while ``page_size`` and the mamba chunk grid stay where they are, which is
     exactly the split that lets a checkpoint land between two node boundaries.
+    The mamba state stays leaf-only data; serving the Full-KV chain through a
+    node without one is COW's src=None recompute path.
     """
 
     cfg = CacheConfig(
@@ -8404,7 +8451,7 @@ class TestMambaCheckpointGrid(CustomTestCase):
         max_context_len=1024,
     )
 
-    def _branching_seqlen(self, *, tree_page_size: int, full_hit_length: int):
+    def _mambaless_leaf_match(self, *, tree_page_size: int, full_hit_length: int):
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
             tree_page_size=tree_page_size,
@@ -8436,20 +8483,147 @@ class TestMambaCheckpointGrid(CustomTestCase):
         cache.tree_core.set_component_device_value_raw(leaf, ComponentType.MAMBA, None)
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(result.full_kv_hit_length, full_hit_length)
-        self.assertEqual(len(result.device_indices), tree_page_size)
-        return result.mamba_branching_seqlen
+        return result
 
-    def test_grid_follows_the_widened_tree_page(self):
-        # lcm(chunk=64, tree page=96) is 192. Chunk-only alignment would
-        # incorrectly report 256, which is not a radix-node boundary.
+    def test_mambaless_leaf_does_not_truncate_device_serve(self):
+        # A mamba-less node (split fragment or evicted state) must not veto the
+        # device match boundary: the Full-KV pages it covers are real. Serving
+        # the whole chain also pushes mamba_branching_seqlen to None, because
+        # the aligned branching point no longer lies beyond the mamba boundary;
+        # the grid math now only fires for host-backed (HiCache) hits.
         self.assertEqual(
-            self._branching_seqlen(tree_page_size=96, full_hit_length=288), 192
+            len(
+                self._mambaless_leaf_match(
+                    tree_page_size=96, full_hit_length=288
+                ).device_indices
+            ),
+            288,
+        )
+        self.assertIsNone(
+            self._mambaless_leaf_match(
+                tree_page_size=96, full_hit_length=288
+            ).mamba_branching_seqlen
         )
 
-    def test_grid_is_the_chunk_size_without_widening(self):
+    def test_mambaless_leaf_covers_widened_pages_without_widening(self):
         self.assertEqual(
-            self._branching_seqlen(tree_page_size=32, full_hit_length=160), 128
+            len(
+                self._mambaless_leaf_match(
+                    tree_page_size=32, full_hit_length=160
+                ).device_indices
+            ),
+            160,
         )
+
+
+class TestChunkedStashDedupFreeRebindConsistency(CustomTestCase):
+    """Bug regression: the chunked stash freed live pages the rebind never
+    replaced, leaving the request's row referencing freed pool pages.
+
+    During a chunked stash the insert walk frees the request's own duplicate
+    pages over the full overlap with the tree (only ``prev_prefix_len`` is
+    exempt), and the post-insert match + rebind is what rewrites the row onto
+    the tree's pages. When the mamba validator vetoed the split fragment at the
+    divergence point (mamba state is leaf-only, so a split leaves it None),
+    the rebind stopped short of the freed range and the row kept referencing
+    freed pages; the next chunks then read recycled slots and silently corrupt
+    attention. A device match boundary must not require mamba state, so the
+    rebind always covers everything the insert freed.
+    """
+
+    cfg = CacheConfig(
+        page_size=64,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        mamba_cache_size=16,
+        kv_size=8192,
+        max_context_len=8192,
+    )
+
+    _rid = 0
+
+    def _make_req(self, req_to_token_pool):
+        req = Req(
+            rid=f"stash-consistency-{self._rid}",
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        self._rid += 1
+        req_to_token_pool.alloc([req])
+        return req
+
+    def _insert_with_mamba(self, cache, allocator, req_to_token_pool, tokens):
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        req = self._make_req(req_to_token_pool)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value[: len(tokens)],
+                mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+    def test_stash_rebind_covers_insert_freed_overlap(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        # Warm chain of three 512-token stash nodes. The mamba pool is tiny,
+        # so a long warm prefill gets its donated states evicted: drop the
+        # chain's mamba data to the post-eviction shape (Full-KV only), which
+        # is exactly what the production repro serves to the next request.
+        warm = list(range(1, 1537))
+        for end in (512, 1024, 1536):
+            self._insert_with_mamba(cache, allocator, req_to_token_pool, warm[:end])
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", warm)))
+        ).last_device_node
+        mid = cache.tree_core.get_parent_node_id(leaf)
+        head = cache.tree_core.get_parent_node_id(mid)
+        for node_id in (leaf, mid, head):
+            result = cache.tree_core.evict_component(
+                node_id, ComponentType.MAMBA, EvictLayer.DEVICE
+            )
+            cache._free_values(result.device_frees, result.host_frees)
+
+        # Diverging request pinned at the state of the stash that runs while
+        # chunk 4 [1536:2048) is in flight: chunks 1-3 committed (row 2048
+        # pages, last stash rebound the row onto the tree up to 1024), and the
+        # fill ids already reach the in-flight chunk's end.
+        tokens = warm[:1088] + list(range(10_000, 10_960))
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(1536, len(tokens))
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = 1536
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 1024
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        req.kv.mamba_last_track_seqlen = 1536
+
+        cache.cache_unfinished_req(req, chunked=True)
+
+        # The insert walk frees the request's duplicate live pages over the
+        # overlap past prev_prefix_len -- here the 64 pages [1024:1088), split
+        # out of the warm chain's last node. The rebind must rewrite at least
+        # that range onto the tree (the tail leaf the same insert added lets
+        # the rematch run past the divergence point), leaving no row reference
+        # to a freed page.
+        self.assertGreaterEqual(req.kv.cache_protected_len, 1088)
+        row = req.prefix_indices[:1088].tolist()
+        fresh = allocator.alloc(1088)
+        self.assertIsNotNone(fresh)
+        self.assertEqual(len(set(fresh.tolist()) & set(row)), 0)
+
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.sanity_check()
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):

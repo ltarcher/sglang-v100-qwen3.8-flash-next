@@ -91,6 +91,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _unified_radix_debug() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DEBUG_MAMBA_RADIX.get()
+
 # 42 bits: digest * 1000003 (< 2^20) stays under 2^62, so the update never
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
 # the TP consistency check can still all_reduce [digest, -digest] in int64.
@@ -892,6 +898,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 break
 
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
+            if _unified_radix_debug():
+                logger.info(
+                    "[radix-dbg] walk off=%d child_key_len=%d child_first=%d "
+                    "key_first=%d prefix_len=%d",
+                    key_offset,
+                    len(child.key),
+                    child.key.token_ids[0] if len(child.key) else -1,
+                    key.token_ids[key_offset],
+                    prefix_len,
+                )
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -977,6 +993,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_indices = torch.cat(value[:best_match_device_value_len])
         else:
             device_indices = self._empty_match_result.device_indices
+        if _unified_radix_debug():
+            logger.info(
+                "[radix-dbg] match done req_key_len=%d full_kv_hit=%d best_len=%d "
+                "serve=%d value_chunks=%s",
+                len(params.key) if params.key is not None else -1,
+                full_kv_hit_length,
+                best_match_device_value_len,
+                len(device_indices),
+                [len(v) for v in value],
+            )
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=best_match_device_node,
