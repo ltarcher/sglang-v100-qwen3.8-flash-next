@@ -34,6 +34,16 @@
 #   GLM53_CONTEXT=8192          (validated ceiling so far; see flag comment)
 #   GLM53_U2_GROUP=128          (u2 scale group; 64/32 are the kernel fallbacks)
 #   GLM53_U2_STAGE_DIR=/path    (boot-time requant staging; MUST be real disk)
+#   GLM53_U2_CACHE=1            (persist converted u2 pools under the stage dir;
+#                                boots of the same model/TP skip the ~22 min
+#                                requant AND skip reading the ~150 GB of
+#                                checkpoint expert bytes the pools replace --
+#                                expert weight/weight_scale tensors are not
+#                                read from the checkpoint at all on a hit; a
+#                                missing cache file at process time fails the
+#                                boot loudly instead of loading zero experts;
+#                                ~76 GB on disk, auto-rebuilt on model or TP
+#                                change)
 set -euo pipefail
 
 MODE="${1:-target}"
@@ -112,6 +122,7 @@ else
   export SGLANG_SM70_U2_EXPERT_POOL=1
   export SGLANG_DSV41_SPILL_LANDING=0
   export SGLANG_SM70_U2_STAGE_DIR="${GLM53_U2_STAGE_DIR:-$HOME/.cache/sglang-glm53-u2-stage}"
+  export SGLANG_SM70_U2_CACHE="${GLM53_U2_CACHE:-0}"
   mkdir -p "$SGLANG_SM70_U2_STAGE_DIR"
   SPEC=()
 fi

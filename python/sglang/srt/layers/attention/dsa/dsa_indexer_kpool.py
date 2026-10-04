@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -48,10 +49,159 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+
+# Per-device fp16 workspace for the SM70 extend-path K dequant (see
+# grow_2d_workspace for why it must not be re-allocated per chunk).
+_k_f16_ws: dict = {}
+
+# fp32 rows per dequant tile: bounds the fresh fp32 footprint to 16 MiB
+# regardless of context length.
+_DEQUANT_TILE_ROWS = 8192
+
+# Query rows per extend logits/top-k slice: the fp32 logits workspace is
+# rows x 262k-span x 4B, and 128 rows (128 MiB at 262k) is what fits next
+# to the V100's ~0.3 GiB boot-time headroom.
+_EXTEND_LOGIT_ROWS = 128
+
+
+def _context_token_ceiling() -> int:
+    """Forced KV-pool token ceiling for workspace pre-sizing; 0 when the
+    schedule bag is not published (standalone kernel tests) or the pool is
+    not token-forced, in which case workspaces fall back to growth."""
+    try:
+        return get_schedule().max_total_tokens or 0
+    except ValueError:
+        return 0
+
+
+_paged_probe_calls = 0
+_paged_probe_total = 0
+_capture_probe_count = 0
+
+# Probe scaffolding: host-side refs to the graph-owned verify buffers,
+# stashed at capture so the out-of-graph replay probe can read the
+# buffers' actual runtime contents (the graph rewrites them in place).
+_GRAPH_PROBE_STATE = {}
+
+# Probe scaffolding: same technique for the sparse-attention call
+# (dsa_backend tilelang branch) — output, gather table, pool tensor.
+_SPARSE_PROBE_STATE = {}
+
+# [sparse-probe] eager census of the prefill topk page table; prints per-row
+# validity around the failing row boundary (rows >= 128 of a >128-row chunk).
+_KPOOL_TOPK_PROBE = {"n": 0}
+
+
+def _kpool_topk_prefill_probe(result, is_plain_extend: bool) -> None:
+    if (
+        os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") != "1"
+        or not is_plain_extend
+        or not torch.is_tensor(result)
+        or result.dim() != 2
+        or result.shape[0] < 129
+        or result.shape[0] > 256
+        or _KPOOL_TOPK_PROBE["n"] >= 12
+    ):
+        return
+    _KPOOL_TOPK_PROBE["n"] += 1
+    k = _KPOOL_TOPK_PROBE["n"]
+    try:
+        r = result.to(torch.int64)
+        valid = r >= 0
+        per_row = valid.sum(dim=-1)
+        n = r.shape[0]
+        all_neg = int((per_row == 0).sum().item())
+        parts = [
+            f"[kpool-topk-probe] fired={k} rows={n} topk={r.shape[1]}"
+            f" allneg_rows={all_neg}"
+            f" min_valid={int(per_row.min().item())}"
+            f" max_valid={int(per_row.max().item())}"
+        ]
+        for rr in sorted({0, min(127, n - 1), min(128, n - 1), n - 1}):
+            rv = r[rr][valid[rr]]
+            p0 = int(((r[rr] >= 0) & (r[rr] < 64)).sum().item())
+            parts.append(
+                f"r{rr}[v={int(rv.numel())}"
+                + (
+                    f" min={int(rv.min().item())} max={int(rv.max().item())}"
+                    if rv.numel()
+                    else ""
+                )
+                + f" p0={p0}]"
+            )
+        print(" ".join(parts), flush=True)
+    except Exception as e:  # probe only
+        print(f"[kpool-topk-probe] err {e!r}", flush=True)
+
+
+def _capture_probe_should_fire() -> bool:
+    """First-calls gate for the capture-time wiring print (data_ptr identity
+    between the captured kernels and the out-of-graph plan buffers)."""
+    global _capture_probe_count
+    if _capture_probe_count >= 12:
+        return False
+    if not torch.cuda.is_current_stream_capturing():
+        return False
+    _capture_probe_count += 1
+    return True
+
+
+_paged_probe_mode_counts = {}
+
+
+def _paged_probe_should_fire(forward_mode, seqlens_32=None) -> bool:
+    """First-calls gate for the SGLANG_SM70_SPARSE_PROBE paged-path print:
+    skip CUDA-graph capture (dummy inputs) and warmup (tiny seq lens), fire
+    on the first real-request calls, sampled across forward modes.
+
+    Capture and budget checks precede any tensor sync -- a `.item()` inside
+    a capturing region invalidates the capture."""
+    global _paged_probe_total
+    if _paged_probe_total >= 8:
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    if seqlens_32 is None or int(seqlens_32.max().item()) <= 64:
+        return False
+    key = "verify" if forward_mode.is_target_verify() else str(forward_mode)
+    if _paged_probe_mode_counts.get(key, 0) >= 4:
+        return False
+    _paged_probe_mode_counts[key] = _paged_probe_mode_counts.get(key, 0) + 1
+    _paged_probe_total += 1
+    return True
+
+
+def _dequant_k_rows_tiled(k_fp8, k_scale):
+    """(k_fp8 * k_scale) -> fp16 into a persistent workspace, fixed row tiles.
+
+    Same fp32 math and single fp16 rounding as the direct expression, whose
+    two [rows, dim] fp32 intermediates grew with the prefix every chunk and
+    stranded allocator blocks toward the 262k OOM. The workspace may be
+    wider than ``dim`` (shared across calls), so every slice clips columns.
+    """
+    from sglang.kernels.ops.attention.dsa.fp16_mqa_logits import (
+        grow_2d_workspace,
+    )
+
+    rows, dim = k_fp8.shape
+    buf = grow_2d_workspace(
+        _k_f16_ws,
+        k_fp8.device,
+        rows,
+        dim,
+        torch.float16,
+        reserve=(_context_token_ceiling(), 0),
+    )
+    buf = buf[:rows, :dim]
+    for t0 in range(0, rows, _DEQUANT_TILE_ROWS):
+        t1 = min(t0 + _DEQUANT_TILE_ROWS, rows)
+        buf[t0:t1].copy_(k_fp8[t0:t1].float().mul_(k_scale[t0:t1, None]))
+    return buf
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -923,13 +1073,71 @@ class IndexerKPool(MultiPlatformOp):
             pool_block_tables.shape[1] * pool.page_size,
         )
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
-        return self._topk_from_kpool_logits(
+        result = self._topk_from_kpool_logits(
             logits,
             pool_seqlens,
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
         )
+        if (
+            os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") == "1"
+            and _capture_probe_should_fire()
+        ):
+            plan0 = metadata.attn_metadata.kpool_write_plan
+            # Host-side identity only: any tensor read here would sync inside
+            # the capturing region and invalidate the graph.
+            print(
+                f"[capture-probe] mode={forward_batch.forward_mode} layer={layer_id} "
+                f"md_id={id(metadata.attn_metadata)} "
+                f"q_ptr={q_eff.data_ptr():#x} kbuf_ptr={kv_cache_fp8.data_ptr():#x} "
+                f"pool_seqlens_ptr={pool_seqlens.data_ptr():#x} "
+                f"plan_ptr={None if plan0 is None or plan0.pool_seqlens_per_q is None else plan0.pool_seqlens_per_q.data_ptr():#x} "
+                f"pool_bt_ptr={pool_block_tables.data_ptr():#x} "
+                f"logits_ptr={logits.data_ptr():#x} result_ptr={result.data_ptr():#x} "
+                f"shapes q={tuple(q_eff.shape)} bt={tuple(pool_block_tables.shape)} "
+                f"logits={tuple(logits.shape)}",
+                flush=True,
+            )
+            if forward_batch.forward_mode.is_target_verify():
+                _GRAPH_PROBE_STATE[(id(metadata.attn_metadata), layer_id)] = {
+                    "logits": logits,
+                    "result": result,
+                    "pool_bt": pool_block_tables,
+                    "pool_seqlens": pool_seqlens,
+                    "kbuf": kv_cache_fp8,
+                    "q": q_eff,
+                    "layer": layer_id,
+                }
+        if (
+            os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") == "1"
+            and _paged_probe_should_fire(forward_batch.forward_mode, seqlens_32)
+        ):
+            plan = metadata.attn_metadata.kpool_write_plan
+            rank = int(os.environ.get("SGLANG_TP_RANK", "0"))
+            if rank == 0:
+                print(
+                    f"[paged-probe] mode={forward_batch.forward_mode} layer={layer_id} "
+                    f"q={tuple(q_eff.shape)} seqlens32={seqlens_32.tolist()} "
+                    f"plan_id={None if plan is None else id(plan)} "
+                    f"md_id={id(metadata.attn_metadata)} "
+                    f"plan_per_q={None if plan is None or plan.pool_seqlens_per_q is None else plan.pool_seqlens_per_q[:n_real].tolist()} "
+                    f"fallback_pooled={None if metadata.attn_metadata.pooled_cache_seqlens_int32 is None else metadata.attn_metadata.pooled_cache_seqlens_int32[:n_real].tolist()} "
+                    f"pool_seqlens={pool_seqlens.tolist()} "
+                    f"pool_bt={tuple(pool_block_tables.shape)} row0={pool_block_tables[0, :6].tolist()} "
+                    f"kbuf={tuple(kv_cache_fp8.shape)} "
+                    f"kbuf_nz={(kv_cache_fp8[: max(1, int(pool_seqlens.max().item()) * 64 + 64)] != 0).float().mean().item():.4f} "
+                    f"logits={tuple(logits.shape)} "
+                    f"logits_absmax={logits.float().abs().max().item():.4f} "
+                    f"logits_nan={int(torch.isnan(logits.float()).sum().item())} "
+                    f"logits_zero_frac={(logits == 0).float().mean().item():.3f} "
+                    f"pt1={None if page_table_1 is None else tuple(page_table_1.shape)} "
+                    f"topk_off={None if topk_offsets is None else tuple(topk_offsets.shape)} "
+                    f"result_neg={int((result < 0).sum().item())}/{result.numel()} "
+                    f"result_row0={result[0, :8].tolist()}",
+                    flush=True,
+                )
+        return result
 
     def _get_topk_paged(
         self,
@@ -1090,27 +1298,28 @@ class IndexerKPool(MultiPlatformOp):
             if use_fp16_logits:
                 # SM70: no fp8 GEMM; dequantize the gathered pooled rows
                 # to fp16 (fp8 -> fp32 * scale -> one fp16 rounding) and
-                # run the grouped cuBLAS ragged GEMM. q_fp8 carries q_eff.
-                from sglang.kernels.ops.attention.dsa.fp16_mqa_logits import (
-                    fp16_ragged_mqa_logits,
+                # run the grouped cuBLAS ragged GEMM per row slice
+                # (_fp16_ragged_topk_sliced). q_fp8 carries q_eff.
+                k_f16 = _dequant_k_rows_tiled(k_fp8, k_scale)
+                return self._fp16_ragged_topk_sliced(
+                    q_fp8=q_fp8[:n_real],
+                    k_f16=k_f16,
+                    ks_per_q=ks_per_q,
+                    ke_per_q=ke_per_q,
+                    pool_lens=pool_lens,
+                    seq_lens_expanded=seq_lens_expanded,
+                    plan=plan,
+                    metadata=metadata,
+                    total_q=total_q,
                 )
-
-                k_f16 = (k_fp8.float() * k_scale[:, None]).to(torch.float16)
-                logits = fp16_ragged_mqa_logits(
-                    q_fp8[:n_real].contiguous(),
-                    k_f16,
-                    ks_per_q,
-                    ke_per_q,
-                )
-            else:
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8[:n_real].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
-                    weights[:n_real].contiguous(),
-                    ks_per_q,
-                    ke_per_q,
-                    clean_logits=True,
-                )
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8[:n_real].contiguous(),
+                (k_fp8.contiguous(), k_scale.contiguous()),
+                weights[:n_real].contiguous(),
+                ks_per_q,
+                ke_per_q,
+                clean_logits=True,
+            )
         else:
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
@@ -1136,6 +1345,99 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
         )
+
+    def _fp16_ragged_topk_sliced(
+        self,
+        *,
+        q_fp8: torch.Tensor,
+        k_f16: torch.Tensor,
+        ks_per_q: torch.Tensor,
+        ke_per_q: torch.Tensor,
+        pool_lens: torch.Tensor,
+        seq_lens_expanded: torch.Tensor,
+        plan,
+        metadata: BaseIndexerMetadata,
+        total_q: int,
+    ) -> torch.Tensor:
+        """Row-sliced SM70 extend logits + top-k, single-call-equivalent.
+
+        The [rows, span] fp32 logits workspace is the single largest
+        long-context allocation, and V100's ~0.3 GiB headroom cannot hold
+        [chunk, 262k] = 512 MiB as one block (Boot H: 512 MiB requested
+        against 284 MiB free while all 2.0 GiB of free segments were
+        smaller). Top-k is per-row independent, so run logits+top-k per
+        row slice and concat; the -1 tail for total_q > n_real matches the
+        single-call out_rows padding. The deep_gemm fp8 branch above keeps
+        its single-call shape.
+        """
+        topk_method = metadata.topk_transform_method
+        attn_metadata = metadata.attn_metadata
+        page_table_all = None
+        page_table_row_index_all = None
+        topk_offsets_all = None
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
+            if topk_method == TopkTransformMethod.PAGED:
+                page_table_all = plan.ragged_paged_page_table
+                page_table_row_index_all = plan.ragged_paged_page_table_row_index
+            elif topk_method == TopkTransformMethod.RAGGED:
+                topk_offsets_all = attn_metadata.topk_indices_offset
+
+        from sglang.kernels.ops.attention.dsa.fp16_mqa_logits import (
+            fp16_ragged_mqa_logits,
+        )
+
+        ceiling = (_EXTEND_LOGIT_ROWS, _context_token_ceiling())
+        parts = []
+        n_real = q_fp8.shape[0]
+        for r0 in range(0, n_real, _EXTEND_LOGIT_ROWS):
+            r1 = min(r0 + _EXTEND_LOGIT_ROWS, n_real)
+            logits = fp16_ragged_mqa_logits(
+                q_fp8[r0:r1].contiguous(),
+                k_f16,
+                ks_per_q[r0:r1],
+                ke_per_q[r0:r1],
+                ceiling=ceiling,
+            )
+            # ragged_paged_page_table is req-indexed (req_to_token); the
+            # kernel picks the row via page_table_row_index, so the table
+            # must be passed whole. Slicing it by Q-row yields an empty
+            # view once r0 passes max_reqs (2 on this deployment), the
+            # wrapper then drops the mapping and the topk emits raw pooled
+            # positions instead of pool slots.
+            if page_table_all is not None and page_table_row_index_all is None:
+                page_table_blk = page_table_all[r0:r1]
+            else:
+                page_table_blk = page_table_all
+            parts.append(
+                self._topk_from_kpool_logits(
+                    logits,
+                    pool_lens[r0:r1],
+                    seq_lens=seq_lens_expanded[r0:r1],
+                    page_table=page_table_blk,
+                    topk_offsets=(
+                        topk_offsets_all[r0:r1]
+                        if topk_offsets_all is not None
+                        else None
+                    ),
+                    row_starts=ks_per_q[r0:r1],
+                    page_table_row_index=(
+                        page_table_row_index_all[r0:r1]
+                        if page_table_row_index_all is not None
+                        else None
+                    ),
+                )
+            )
+        result = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        if total_q > result.shape[0]:
+            padded = torch.full(
+                (total_q, result.shape[1]),
+                -1,
+                dtype=result.dtype,
+                device=result.device,
+            )
+            padded[: result.shape[0]] = result
+            result = padded
+        return result
 
     def _get_topk_ragged_kpool(
         self,
@@ -1575,10 +1877,18 @@ class IndexerKPool(MultiPlatformOp):
             bcg_kpool_indexer_prefill_with_output(
                 self, x, q_lora, positions, output, layer_id
             )
+            _kpool_topk_prefill_probe(
+                output if return_indices else None,
+                forward_batch.forward_mode.is_extend_without_speculative(),
+            )
             return output if return_indices else None
-        return self._forward_cuda_impl(
+        result = self._forward_cuda_impl(
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
+        _kpool_topk_prefill_probe(
+            result, forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        return result
 
     def _forward_cuda_impl(
         self,

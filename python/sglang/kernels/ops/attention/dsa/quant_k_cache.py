@@ -1,6 +1,28 @@
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
+
+
+@triton.jit
+def _f32_to_e4m3_u8(x):
+    """RNE encode of a finite fp32 to one e4m3fn byte, bit-identical to the
+    fp8-typed store cast on sm90+ (verified against torch on the whole
+    |x| <= 448 domain). sm70 triton has no fp8e4nv type, so on sm70 the
+    kernel takes the output buffer as uint8 and stores bytes; callers clamp
+    to +-448 before every store, which is this encoder's domain. Mirrors
+    ``kpool_fp8_index._f32_to_e4m3_u8`` (proven in production there)."""
+    u = tl.abs(x)
+    bits = u.to(tl.int32, bitcast=True)
+    e = ((bits >> 23) & 0xFF) - 127
+    p = tl.maximum(e - 3, -9)
+    q = libdevice.rint(u * tl.exp2((-p).to(tl.float32))).to(tl.int32)
+    ov = q >= 16
+    e2 = tl.where(ov, e + 1, e)
+    q2 = tl.where(ov, 8, q)
+    byte = tl.where(e2 < -6, q2, (e2 + 7) * 8 + (q2 - 8))
+    sign = (x.to(tl.int32, bitcast=True) >> 24) & 0x80
+    return (byte & 0x7F | sign).to(tl.uint8)
 
 
 def gather_dsa_kv_scales(
@@ -241,6 +263,7 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
         DIM_ROPE=dim_rope,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        SM70=False,
     )
 
     return output
@@ -291,7 +314,14 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     # Create typed views for the kernel to write into
     # Fixed byte layout for nope_part: [nope_fp8 (dim_nope bytes) | scales_fp32 (num_tiles*4 bytes)]
     # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
-    nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
+    # sm70 triton cannot lower fp8e4nv stores, so the kernel gets the raw
+    # uint8 slice and encodes e4m3 bytes itself (_f32_to_e4m3_u8).
+    is_sm70 = torch.cuda.get_device_capability(k_nope.device)[0] < 8
+    nope_q_view = (
+        nope_part_u8[:, :dim_nope]
+        if is_sm70
+        else nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
+    )
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
     if dim_rope > 0:
         rope_view = rope_part_u8.view(torch.bfloat16)
@@ -322,6 +352,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
         DIM_ROPE=dim_rope,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        SM70=is_sm70,
     )
 
     # Add middle dimension for compatibility with set_mla_kv_buffer_triton
@@ -346,6 +377,7 @@ def _quantize_k_cache_fast_kernel(
     DIM_ROPE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    SM70: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
@@ -363,16 +395,18 @@ def _quantize_k_cache_fast_kernel(
         # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here
         y_s = tl.max(tl.abs(y)) / FP8_MAX
         y_s_inv = 1.0 / y_s
-        y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(
-            output_nope_q_ptr.dtype.element_ty
-        )
+        y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX)
 
         dst_q_ptr = output_nope_q_ptr + token_id * output_nope_q_stride_0 + offs
         dst_s_ptr = (
             output_nope_s_ptr + token_id * output_nope_s_stride_0 + effective_block_id
         )
 
-        tl.store(dst_q_ptr, y_q, mask=mask)
+        if SM70:
+            # output buffer is raw uint8; encode the e4m3 byte pattern
+            tl.store(dst_q_ptr, _f32_to_e4m3_u8(y_q), mask=mask)
+        else:
+            tl.store(dst_q_ptr, y_q.to(output_nope_q_ptr.dtype.element_ty), mask=mask)
         tl.store(dst_s_ptr, y_s)
     else:
         # b. copy rope

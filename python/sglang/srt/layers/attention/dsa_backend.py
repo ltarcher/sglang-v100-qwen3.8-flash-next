@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -271,6 +272,146 @@ class DSAMetadata:
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
+
+
+# [sparse-probe] prefill: fire-limited census of the layer-3 tilelang extend
+# call. For the first NaN row: the page indices it gathered (min/max/count)
+# and an e4m3-NaN byte census over exactly those pool rows -- garbage indices
+# convict the indexer/topk upstream; clean indices with NaN output convict
+# the kernel. Saves tensors to /tmp/u2probe for offline replay.
+_DSA_PREFILL_PROBE_FIRED = {"n": 0}
+
+
+def _probe_prefill_graph_stash(fire_id: int) -> None:
+    """Read the capture-stashed PREFILL sparse-call buffers (rewritten in
+    place by each prefill graph replay, so they hold the last chunk's real
+    data) and convict pool contents vs kernel on the NaN rows."""
+    from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+        _SPARSE_PROBE_STATE,
+    )
+
+    for (md_id, lay), st in list(_SPARSE_PROBE_STATE.items()):
+        try:
+            q = st["q"]
+            if q.dim() != 3 or not (129 <= q.shape[0] <= 1024):
+                continue
+            out_g = st["out"]
+            pt1_g = st["pt1"]
+            pool_g = st["pool"]
+            rows = q.shape[0]
+            of = out_g.reshape(rows, -1).float()
+            row_nan = torch.isnan(of).any(dim=-1)
+            n_nan = int(row_nan.sum().item())
+            parts = [
+                f"[prefill-graph-stash] fire={fire_id} md={md_id} L{lay}"
+                f" rows={rows} nan_rows={n_nan}/{rows}"
+                f" pool_rows={pool_g.shape[0]} pt1={tuple(pt1_g.shape)}"
+            ]
+            if n_nan:
+                pb = pool_g.view(torch.uint8).reshape(pool_g.shape[0], -1)
+                pt = pt1_g.reshape(-1, pt1_g.shape[-1])
+                first_nan = int(row_nan.nonzero()[0].item())
+                last_fin = int((~row_nan).nonzero()[-1].item())
+                for tag, r in (("nanrow", first_nan), ("finerow", last_fin)):
+                    pages = pt[r].to(torch.int64)
+                    uniq = torch.unique(pages[pages >= 0])
+                    if not uniq.numel():
+                        parts.append(f"{tag}{r}: no-valid-pages")
+                        continue
+                    pr = pb[uniq]
+                    nanb = int(((pr == 0x7F) | (pr == 0xFF)).sum().item())
+                    parts.append(
+                        f"{tag}{r}: pages={int(uniq.numel())}"
+                        f" span=[{int(uniq.min().item())},{int(uniq.max().item())}]"
+                        f" e4m3_nan={nanb}/{pr.numel()}"
+                    )
+                os.makedirs("/tmp/u2probe", exist_ok=True)
+                torch.save(
+                    {
+                        "out": of.cpu(),
+                        "pt1": pt.cpu(),
+                        "q": q.reshape(rows, -1).float().cpu(),
+                        "nan_row": first_nan,
+                        "fin_row": last_fin,
+                    },
+                    f"/tmp/u2probe/prefill_graph_L{lay}_{fire_id}.pt",
+                )
+            print(" ".join(parts), flush=True)
+        except Exception as e:  # probe only
+            print(f"[prefill-graph-stash] err L{lay}: {e!r}", flush=True)
+
+
+def _dsa_prefill_sparse_probe(out, pt1, pool, q, layer_id: int = -1, fb=None) -> None:
+    q_rows = q.shape[0]
+    if not 129 <= q_rows <= 512 or _DSA_PREFILL_PROBE_FIRED["n"] >= 24:
+        return
+    _DSA_PREFILL_PROBE_FIRED["n"] += 1
+    n = _DSA_PREFILL_PROBE_FIRED["n"]
+    try:
+        _probe_prefill_graph_stash(n)
+        of = out.reshape(q_rows, -1).float()
+        row_nan = torch.isnan(of).any(dim=-1)
+        row_inf = torch.isinf(of).any(dim=-1)
+        n_nan = int(row_nan.sum().item())
+        n_inf = int(row_inf.sum().item())
+        lo = torch.arange(q_rows, device=out.device) < 128
+        parts = [
+            f"[dsa-prefill-probe] fired={n} L{layer_id} rows={q_rows}"
+            f" nan_rows={n_nan}/{q_rows} inf_rows={n_inf}"
+            f" lo_nan={int((row_nan & lo).sum().item())}"
+            f" hi_nan={int((row_nan & ~lo).sum().item())}"
+        ]
+        # page-0 pool forensics: is the first page written, and what holds
+        # row 0's scale field (bytes 512-527)?
+        pb = pool.view(torch.uint8).reshape(pool.shape[0], -1)
+        p0 = pb[:64]
+        p0_zero = int(((p0 == 0).all(dim=1)).sum().item())
+        r0scales = pb[0, 512:528].tolist()
+        parts.append(
+            f" p0_zero_rows={p0_zero}/64"
+            f" row0_scales={r0scales[:8]}.."
+        )
+        if pt1 is not None:
+            pages = pt1.reshape(-1, pt1.shape[-1]).to(torch.int64)
+            uniq = torch.unique(pages[pages >= 0])
+            grows = pb[uniq]
+            gnan = int(((grows & 0x7F) == 0x7F).sum().item())
+            parts.append(
+                f" uniq_idx={int(uniq.numel())}"
+                f" min={int(uniq.min().item())}"
+                f" max={int(uniq.max().item())}"
+                f" gathered_nan_bytes={gnan}/{grows.numel()}"
+            )
+        if fb is not None:
+            loc = fb.out_cache_loc
+            parts.append(
+                f" loc_n={int(loc.numel())}"
+                f" loc_min={int(loc.min().item())}"
+                f" loc_max={int(loc.max().item())}"
+                f" loc_head={loc[:6].tolist()}"
+            )
+            try:
+                parts.append(f" prefix={fb.extend_prefix_lens_cpu}")
+            except Exception:
+                pass
+        print(" ".join(parts), flush=True)
+        os.makedirs("/tmp/u2probe", exist_ok=True)
+        torch.save(
+            {
+                "pool_rows_0_64": pb[:65].cpu(),
+                "out_nan_rows": row_nan.cpu(),
+                "loc": (fb.out_cache_loc.cpu() if fb is not None else None),
+                "pt1": (pt1.cpu() if pt1 is not None else None),
+            },
+            f"/tmp/u2probe/p0_L{layer_id}_{n}.pt",
+        )
+    except Exception as e:  # probe only
+        import traceback
+
+        print(
+            f"[dsa-prefill-probe] err {e!r} {traceback.format_exc(limit=3)}",
+            flush=True,
+        )
 
 
 def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
@@ -2024,13 +2165,43 @@ class DeepseekSparseAttnBackend(
                 # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
                 if q_all is None or not _is_hip:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            out = self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+            # [sparse-probe] prefill: convict the page indices vs the kernel.
+            if (
+                os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") == "1"
+                and not torch.cuda.is_current_stream_capturing()
+                and forward_batch.forward_mode.is_extend()
+                and layer.layer_id in (3, 7)
+            ):
+                _dsa_prefill_sparse_probe(
+                    out, page_table_1, kv_cache, q_all, layer.layer_id, forward_batch
+                )
+            # [sparse-probe] verify graphs route through forward_extend, not
+            # forward_decode; stash the same graph-owned buffers here so the
+            # replay-glue dump sees the sparse kernel's real inputs/outputs.
+            if (
+                os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") == "1"
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+                    _SPARSE_PROBE_STATE,
+                )
+
+                _SPARSE_PROBE_STATE[(id(metadata), layer.layer_id)] = {
+                    "out": out,
+                    "q": q_all,
+                    "pt1": page_table_1,
+                    "pool": kv_cache,
+                    "scale": layer.scaling,
+                    "d_v": layer.v_head_dim,
+                }
+            return out
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -2333,13 +2504,34 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            out = self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+            # [sparse-probe] capture-only stash of the graph-owned sparse
+            # attention output plus its gather inputs; the replay-glue probe
+            # reads them one step delayed to bisect indexer-side vs pool-side
+            # non-finite attention.
+            if (
+                os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") == "1"
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+                    _SPARSE_PROBE_STATE,
+                )
+
+                _SPARSE_PROBE_STATE[(id(metadata), layer.layer_id)] = {
+                    "out": out,
+                    "q": q_all,
+                    "pt1": page_table_1,
+                    "pool": kv_cache,
+                    "scale": layer.scaling,
+                    "d_v": layer.v_head_dim,
+                }
+            return out
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
                 q_nope=q_nope,

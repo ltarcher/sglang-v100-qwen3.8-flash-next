@@ -125,6 +125,67 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 
+# [blk-nan-probe] Capture-only stash of graph-owned block-boundary tensors.
+# The replay-glue probe (dsa_backend_kpool) reads these after a verify replay
+# -- one step delayed, the graph rewrites them in place -- to census which
+# block first produces non-finite hidden states. Host refs only: reading
+# tensor values inside the capturing region would invalidate the graph.
+_BLK_NAN_PROBE: dict = {}
+
+
+def _blk_nan_probe_stash(tag: str, t: torch.Tensor) -> None:
+    if (
+        os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") != "1"
+        or not torch.is_tensor(t)
+        or t.dim() != 2
+        or not t.is_floating_point()
+        or not torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _BLK_NAN_PROBE[(tuple(t.shape), tag)] = t
+
+
+# PROBE(strip): eager-side tail census. The first output token of a request
+# comes from the PREFILL's last-position logits, and prefill runs eager (the
+# capture-gated stash above never sees it). Print nan/magnitude of the final
+# norm output per extend chunk; the request's token 0 comes from the chunk
+# with the smallest row count (the last one).
+def _extend_tail_probe(t: torch.Tensor) -> None:
+    if (
+        os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") != "1"
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    last = t[-1]
+    print(
+        f"[extend-tail-probe] rows={t.shape[0]} nan={torch.isnan(t).sum().item()}"
+        f" abs={t.abs().max().item():.3e}"
+        f" last_nan={torch.isnan(last).sum().item()}"
+        f" last_abs={last.abs().max().item():.3e}",
+        flush=True,
+    )
+
+
+# PROBE(strip): per-block eager census; prints ONLY poisoned tensors, so the
+# first printed tag after a clean prefix names the layer where NaN enters the
+# eager (prefill) forward.
+def _blk_eager_census(tag: str, t: torch.Tensor) -> None:
+    if (
+        os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") != "1"
+        or torch.cuda.is_current_stream_capturing()
+        or not torch.is_tensor(t)
+        or t.dim() != 2
+        or not t.is_floating_point()
+    ):
+        return
+    n = torch.isnan(t).sum().item()
+    if n == 0:
+        return
+    print(
+        f"[blk-eager-probe] {tag} rows={t.shape[0]} nan={n}/{t.numel()}",
+        flush=True,
+    )
+
 
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
@@ -883,6 +944,8 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
+        _blk_nan_probe_stash(f"{self.layer_id}.attn", hidden_states)
+        _blk_eager_census(f"{self.layer_id}.attn", hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
@@ -1135,6 +1198,8 @@ class Glm5NextModel(nn.Module):
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
                 )
+                _blk_nan_probe_stash(f"{i}.blk", hidden_states)
+                _blk_eager_census(f"{i}.blk", hidden_states)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -1165,6 +1230,8 @@ class Glm5NextModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                _blk_nan_probe_stash("tail.norm", hidden_states)
+                _extend_tail_probe(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1453,6 +1520,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         else:
             return hidden_states
+
+    def checkpoint_tensor_reader(self):
+        """Skip expert bytes this boot rebinds from the persistent u2 cache."""
+        from sglang.srt.layers.quantization.sm70_u2_pool import u2_checkpoint_reader
+
+        return u2_checkpoint_reader(self)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:

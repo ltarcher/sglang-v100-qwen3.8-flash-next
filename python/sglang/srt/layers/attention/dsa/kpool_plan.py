@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
 _RAGGED_SCRATCH_K_U8: Optional[torch.Tensor] = None
 _RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
+_plan_probe_fired = False
 
 
 def _get_ragged_scratch(
@@ -747,6 +749,23 @@ def update_kpool_write_plan(
 
     plan = metadata.kpool_write_plan
     assert plan is not None, "kpool_write_plan must be allocated before update"
+    global _plan_probe_fired
+    if (
+        os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") == "1"
+        and is_verify
+        and not _plan_probe_fired
+        and not torch.cuda.is_current_stream_capturing()
+        and int(write_start.max().item()) > 64
+    ):
+        _plan_probe_fired = True
+        print(
+            f"[plan-writer] verify ws={write_start.tolist()} "
+            f"req={req_pool_indices.tolist()} pool_size={pool_size} "
+            f"nd={num_draft_tokens} plan_id={id(plan)} "
+            f"slots_per_page={slots_per_page} "
+            f"n_rows_alloc={None if plan.pool_seqlens_per_q is None else plan.pool_seqlens_per_q.shape[0]}",
+            flush=True,
+        )
     update_kpool_write_plan_cuda_graph(
         write_start=write_start,
         req_pool_indices=req_pool_indices,
@@ -778,6 +797,18 @@ def update_kpool_write_plan(
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
+
+    if _plan_probe_fired and not getattr(update_kpool_write_plan, "_probed", False):
+        update_kpool_write_plan._probed = True
+        torch.cuda.synchronize()
+        print(
+            f"[plan-writer] after kernel pool_seqlens_per_q[:16]="
+            f"{plan.pool_seqlens_per_q[:16].tolist()} "
+            f"seqlens_per_q[:16]={plan.seqlens_per_q[:16].tolist()} "
+            f"write_start_out={plan.write_start.tolist()} "
+            f"write_loc[0]={plan.write_loc[0].tolist()}",
+            flush=True,
+        )
 
 
 def init_kpool_write_plan(

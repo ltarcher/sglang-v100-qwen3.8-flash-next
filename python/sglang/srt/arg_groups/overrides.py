@@ -634,6 +634,7 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    cuda_major: Optional[int] = None,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -646,8 +647,17 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    # Upstream's CUDA tilelang kernels only read a bf16 KV cache; the SM70
+    # fork kernels decode fp8_e4m3 + block-128 scales directly, so the fp8
+    # ban below does not apply on Volta.
     cuda_fp8_unsupported = {"tilelang"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+    sm70_fp8_ok = cuda_major is not None and cuda_major < 8
+    if (
+        not hip
+        and not sm70_fp8_ok
+        and kv_cache_dtype == "fp8_e4m3"
+        and cuda_fp8_unsupported
+    ):
         raise ValueError(
             f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
             "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
@@ -765,7 +775,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         # dtype-aware, so an explicitly requested backend still has to clear the
         # shared backend/kv-cache-dtype rules before this arm returns early.
         _check_dsa_backend_constraints(
-            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+            kv_cache_dtype,
+            prefill,
+            decode,
+            hip=get_platform().is_hip,
+            cuda_major=major,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -795,7 +809,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        cuda_major=major,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

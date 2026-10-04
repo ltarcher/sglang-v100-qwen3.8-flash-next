@@ -1421,6 +1421,27 @@ class Envs:
     # disk with ~45 GB free per rank, never tmpfs -- tmpfs pages are anon
     # RAM and defeat the whole point).
     SGLANG_SM70_U2_STAGE_DIR = EnvStr("")
+    # Persist the converted u2b2 expert pools under SGLANG_SM70_U2_STAGE_DIR
+    # so later boots of the same model skip the ~30 s/layer GPU requant
+    # (~76 GB on disk for GLM-5.3 TP4). A cache hit stores and reuses the
+    # exact converted bytes, so numerics are identical to a fresh requant.
+    # Model or TP change auto-misses: the fingerprint covers config.json,
+    # every weight file's size+mtime, the requant algorithm version and TP.
+    SGLANG_SM70_U2_CACHE = EnvBool(False)
+
+    # Release stranded allocator blocks after every eager extend chunk. The
+    # per-chunk indexer logits workspace grows with the prefix length, so
+    # every chunk allocates a new distinct size; even with
+    # expandable_segments the caching allocator strands ~2 GB of
+    # reserved-but-unallocated pages by ~100k tokens. Measured on the
+    # GLM-5.3 262k ladder this only delays the wall (chunk 512: ~100k ->
+    # ~183k); the structural fix is preallocating the indexer logits
+    # workspace, so this stays default-off.
+    SGLANG_SM70_EXTEND_EMPTY_CACHE = EnvBool(False)
+
+    # Per-chunk extend memory census (CUDA free vs torch allocated/reserved
+    # vs holes-in-live-segments) for long-context OOM forensics. Logging only.
+    SGLANG_DEBUG_EXTEND_MEM = EnvBool(False)
 
     # ===================================================================
     # RoPE cache

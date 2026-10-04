@@ -81,6 +81,44 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _log_extend_memory(forward_batch) -> None:
+    """Per-chunk memory census for long-context OOM forensics: CUDA-level
+    free vs the torch allocator's view, plus how much reserved-but-unallocated
+    sits in segments that still hold live blocks (unreleaseable by
+    empty_cache) vs fully-free segments. This is what separates real
+    fragmentation from mere VA accounting.
+    """
+    try:
+        max_extend_len = int(max(forward_batch.extend_seq_lens_cpu))
+        free_b, total_b = torch.cuda.mem_get_info()
+        stats = torch.cuda.memory_stats()
+        alloc = stats["allocated_bytes.all.current"] / 2**30
+        resvd = stats["reserved_bytes.all.current"] / 2**30
+        holes = free = 0.0
+        for seg in torch.cuda.memory_snapshot():
+            seg_free = sum(
+                b["size"] for b in seg["blocks"] if b["state"] != "active_allocated"
+            )
+            seg_live = seg["total_size"] - seg_free
+            if seg_live > 0:
+                holes += seg_free
+            else:
+                free += seg_free
+        logger.info(
+            "[extend-mem] ctx>=%dk chunk=%d cuda_free=%.2fG torch_alloc=%.2fG "
+            "torch_resvd=%.2fG holes_in_live_segs=%.2fG free_segs=%.2fG",
+            max_extend_len // 1000,
+            len(forward_batch.input_ids),
+            free_b / 2**30,
+            alloc,
+            resvd,
+            holes / 2**30,
+            free / 2**30,
+        )
+    except Exception as e:  # logging must never break serving
+        logger.info("[extend-mem] census failed: %s", e)
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
@@ -375,6 +413,14 @@ class EagerRunner(BaseRunner):
                     forward_batch,
                     **kwargs,
                 )
+        if envs.SGLANG_SM70_EXTEND_EMPTY_CACHE.get() and not (
+            forward_batch.forward_mode.is_target_verify()
+        ):
+            torch.cuda.empty_cache()
+        if envs.SGLANG_DEBUG_EXTEND_MEM.get() and not (
+            forward_batch.forward_mode.is_target_verify()
+        ):
+            _log_extend_memory(forward_batch)
         return ret
 
     def _execute_extend_cp(

@@ -36,6 +36,57 @@ import triton
 import triton.language as tl
 
 
+# PROBE(strip): fire-limited census of the KDA verify-commit inputs. Entry
+# census shows h0 as the NEXT verify will read it, i.e. after the previous
+# round's fold (or after prefill for the first commit); ring census shows the
+# raw verify-window inputs about to be folded. Answers "did the fold write the
+# NaN, or was h0 already poisoned before this commit".
+_KDA_COMMIT_PROBE_FIRED = {"n": 0}
+
+
+def _kda_commit_probe(
+    spec_state, state_batch_indices, accept_lens, last_correct_step_indices
+):
+    import os
+
+    if os.environ.get("SGLANG_SM70_SPARSE_PROBE") != "1":
+        return
+    if _KDA_COMMIT_PROBE_FIRED["n"] >= 6:
+        return
+    _KDA_COMMIT_PROBE_FIRED["n"] += 1
+    n = _KDA_COMMIT_PROBE_FIRED["n"]
+    try:
+        slots = sorted({int(x) for x in state_batch_indices.tolist()})
+        parts = [
+            f"commit#{n} al={accept_lens.tolist()} lcs={last_correct_step_indices.tolist()} slots={slots}"
+        ]
+        temporal = spec_state.temporal  # [num_layers, num_slots, HV, V, K] fp32
+        for li in (0, 8, 16, 33):
+            for si in slots:
+                s = temporal[li, si]
+                parts.append(
+                    f"h0[{li}.{si}:nan={torch.isnan(s).sum().item()}"
+                    f" inf={torch.isinf(s).sum().item()}"
+                    f" abs={s.abs().max().item():.3e}]"
+                )
+        for name, t in (
+            ("rawv", spec_state.replayssm_rawv),
+            ("rawk", spec_state.replayssm_rawk),
+            ("gk", spec_state.replayssm_g),
+            ("beta", spec_state.replayssm_beta),
+        ):
+            for li in (8, 33):
+                for si in slots:
+                    x = t[li, si, :, :4]
+                    parts.append(
+                        f"{name}[{li}.{si}:nan={torch.isnan(x).sum().item()}"
+                        f" abs={x.abs().max().item():.3e}]"
+                    )
+        print("[kda-commit-probe] " + " ".join(parts), flush=True)
+    except Exception as e:  # probe must never break the commit path
+        print(f"[kda-commit-probe] ERR {e!r}", flush=True)
+
+
 @triton.jit
 def kda_replayssm_exact_fold_kernel(
     h0,  # [num_slots, HV, V, K] fp32 checkpoint (folded in place)
@@ -353,6 +404,10 @@ def commit_kda_replayssm_after_verify(
     """
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_conv_window_scatter_with_mask,
+    )
+
+    _kda_commit_probe(
+        spec_state, state_batch_indices, accept_lens, last_correct_step_indices
     )
 
     L = spec_state.replayssm_rawv.shape[-2]

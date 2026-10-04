@@ -31,6 +31,80 @@ import triton
 import triton.language as tl
 
 
+def grow_2d_workspace(
+    cache: dict,
+    device,
+    rows: int,
+    cols: int,
+    dtype,
+    reserve: Optional[tuple] = None,
+) -> torch.Tensor:
+    """Return a persistent [>=rows, >=cols] buffer from ``cache`` (per device),
+    reallocated only when a dim falls short of its need.
+
+    Extend-path intermediates sized to the current prefix grow every chunked
+    prefill, and each growth strands the previous block inside a live
+    segment; on the 262k ladder this accumulates to ~2.1 GiB
+    reserved-but-unallocated and OOMs the 190k rung (5 boots, identical
+    signature, surviving ``empty_cache``). Serving all such intermediates
+    from constant-size workspaces is the structural fix; layers run
+    sequentially on one stream, so one buffer per device serves all of them.
+
+    ``reserve`` is a (rows, cols) ceiling applied at allocation time so the
+    buffer reaches full height in one allocation instead of re-fragmenting
+    the free-segment space through the ladder (callers pass the context
+    ceiling when the schedule bag is published). Only a dim that is actually
+    short doubles; an unrelated height growth must not widen the buffer.
+    Callers must slice to exactly [rows, cols] -- the returned buffer can be
+    wider/taller than requested.
+    """
+    buf = cache.get(device)
+    need_rows, need_cols = rows, cols
+    if reserve is not None:
+        need_rows = max(need_rows, reserve[0])
+        need_cols = max(need_cols, reserve[1])
+    if buf is not None and buf.shape[0] >= need_rows and buf.shape[1] >= need_cols:
+        return buf
+    prev = buf.shape if buf is not None else (0, 0)
+    buf = torch.empty(
+        (
+            need_rows if need_rows <= prev[0] else max(need_rows, 2 * prev[0]),
+            need_cols if need_cols <= prev[1] else max(need_cols, 2 * prev[1]),
+        ),
+        dtype=dtype,
+        device=device,
+    )
+    cache[device] = buf
+    return buf
+
+
+# Per-device output workspace for :func:`fp16_ragged_mqa_logits`; keyed by
+# torch.device, one entry per process.
+_ragged_logits_ws: dict = {}
+
+_arange_ws: dict = {}
+
+
+def _arange_i32(n: int, device) -> torch.Tensor:
+    """Persistent [0..n) int32 ramp, grown geometrically. Column values are
+    static, so a reused buffer is indistinguishable from a fresh arange."""
+    buf = _arange_ws.get(device)
+    if buf is None or buf.numel() < n:
+        buf = torch.arange(
+            max(n, 2 * (buf.numel() if buf is not None else 0)),
+            device=device,
+            dtype=torch.int32,
+        )
+        _arange_ws[device] = buf
+    return buf[:n]
+
+
+# Columns per GEMM/mask tile in :func:`fp16_ragged_mqa_logits`. Bounds the
+# fresh fp32 [n, tile] + bool [n, tile] footprint independently of context
+# length; total FLOPs and the per-column dot products are unchanged.
+_LOGITS_TILE_COLS = 8192
+
+
 def gate_fold(q: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Collapse heads with the per-(row, head) gate.
 
@@ -48,6 +122,7 @@ def fp16_ragged_mqa_logits(
     ks: torch.Tensor,
     ke: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    ceiling: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Ragged logits for the extend path, mirroring deep_gemm.fp8_mqa_logits.
 
@@ -58,16 +133,30 @@ def fp16_ragged_mqa_logits(
     to the top-k transform, which restores absolute positions).
 
     Rows are grouped by their range start (one group per sequence in a
-    chunked-prefill batch); each group runs one dense cuBLAS FP16 GEMM
-    with FP32 output over its own k slice, then masks the causal tail.
-    The hot single-sequence case is exactly one GEMM with no copies.
-    The grouping reads ks/ke on host (.tolist()); callers on the
-    per-layer hot path should hoist that sync to once per forward batch.
+    chunked-prefill batch); each group runs dense cuBLAS FP16 GEMMs with
+    FP32 output over its own k slice in fixed-width column tiles, masking
+    the causal tail per tile. The hot single-sequence case is one GEMM per
+    tile with no copies. The grouping reads ks/ke on host (.tolist());
+    callers on the per-layer hot path should hoist that sync to once per
+    forward batch.
+
+    Without ``out``, the result is a view of a shared per-device workspace
+    sized for the largest span seen so far (see :func:`grow_2d_workspace`)
+    -- valid only until the next call on the same device. The per-tile
+    fp32/bool intermediates are constant-size; nothing here scales with
+    the prefix length any more.
     """
     n, _ = q_eff.shape
     span = int((ke - ks).max().item()) if n else 0
     if out is None:
-        out = torch.zeros((n, span), dtype=torch.float32, device=q_eff.device)
+        out = grow_2d_workspace(
+            _ragged_logits_ws,
+            q_eff.device,
+            n,
+            max(span, 1),
+            torch.float32,
+            reserve=ceiling,
+        )[:n, :span]
     else:
         assert out.dtype == torch.float32 and out.shape[1] >= span
     if n == 0 or span == 0:
@@ -79,7 +168,7 @@ def fp16_ragged_mqa_logits(
     for i in range(n):
         groups.setdefault(ks_l[i], []).append(i)
 
-    cols_buf = None
+    cols_buf = _arange_i32(span, q_eff.device)
     zero = torch.zeros((), device=q_eff.device)
     for ks_v, rows in groups.items():
         ke_max = max(ke_l[i] for i in rows)
@@ -91,20 +180,21 @@ def fp16_ragged_mqa_logits(
             rows_t = torch.tensor(rows, dtype=torch.long, device=q_eff.device)
             q_g = q_eff.index_select(0, rows_t)
             ke_t = ke.index_select(0, rows_t)
-        logits = torch.mm(q_g, k[ks_v:ke_max].t(), out_dtype=torch.float32)
-        width = logits.shape[1]
-        if cols_buf is None or cols_buf.numel() < width:
-            cols_buf = torch.arange(width, device=q_eff.device, dtype=torch.int32)
-        valid = cols_buf[None, :width] < (ke_t - ks_v)[:, None]
-        logits = torch.where(valid, logits, zero)
-        if rows_t is None:
-            out[:, :width] = logits
-        else:
-            padded = torch.zeros(
-                (len(rows), span), dtype=torch.float32, device=q_eff.device
-            )
-            padded[:, :width] = logits
-            out.index_copy_(0, rows_t, padded)
+        k_group = k[ks_v:ke_max]
+        width = ke_max - ks_v
+        for t0 in range(0, width, _LOGITS_TILE_COLS):
+            t1 = min(t0 + _LOGITS_TILE_COLS, width)
+            logits = torch.mm(q_g, k_group[t0:t1].t(), out_dtype=torch.float32)
+            valid = cols_buf[None, t0:t1] < (ke_t - ks_v)[:, None]
+            if rows_t is None:
+                torch.where(valid, logits, zero, out=out[:, t0:t1])
+            else:
+                padded = torch.where(valid, logits, zero)
+                out[rows_t[:, None], cols_buf[None, t0:t1]] = padded
+        if rows_t is not None:
+            # Rows scattered per group must read as zero beyond the group's
+            # width (out is a reused workspace, not a fresh zeros()).
+            out[rows_t[:, None], cols_buf[None, width:]] = 0.0
     return out
 
 

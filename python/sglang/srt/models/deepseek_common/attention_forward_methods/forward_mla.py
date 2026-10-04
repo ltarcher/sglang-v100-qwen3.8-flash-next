@@ -127,6 +127,44 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
+# PROBE(strip): fire-limited census of the MLA absorb tail (sparse-kernel out
+# -> w_vc bmm -> o_proj). Brackets where NaN enters between a clean tilelang
+# output and the layer's poisoned `.attn` stash.
+_MLA_TAIL_PROBE_FIRED = {"n": 0}
+
+
+def _mla_tail_census(module, tag: str, t) -> None:
+    import os
+
+    if os.environ.get("SGLANG_SM70_SPARSE_PROBE", "0") != "1":
+        return
+    if (
+        torch.cuda.is_current_stream_capturing()
+        or not torch.is_tensor(t)
+        or _MLA_TAIL_PROBE_FIRED["n"] >= 40
+    ):
+        return
+    layer_id = getattr(module, "layer_id", None)
+    if layer_id not in (3, 7) or t.dim() < 2 or not 129 <= t.shape[0] <= 511:
+        return
+    _MLA_TAIL_PROBE_FIRED["n"] += 1
+    try:
+        rows = t.shape[0]
+        of = t.reshape(rows, -1).float()
+        lo = torch.arange(rows, device=t.device) < 128
+        print(
+            f"[mla-tail-probe] L{layer_id} {tag} rows={rows}"
+            f" nan={int(torch.isnan(of).any(-1).sum().item())}"
+            f" inf={int(torch.isinf(of).any(-1).sum().item())}"
+            f" abs={of.abs().max().item():.3e}"
+            f" abs_lo={of[lo].abs().max().item():.3e}"
+            f" abs_hi={of[~lo].abs().max().item():.3e}",
+            flush=True,
+        )
+    except Exception as e:  # probe only
+        print(f"[mla-tail-probe] err {e!r}", flush=True)
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -805,6 +843,8 @@ class DeepseekMLAForwardMixin:
                     attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+        _mla_tail_census(self, "attn_out", attn_output)
+
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
@@ -918,7 +958,9 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = _apply_attention_output_gate(
                 self, attn_bmm_output, attention_output_gate
             )
+        _mla_tail_census(self, "bmm_out", attn_bmm_output)
         output, _ = self.o_proj(attn_bmm_output)
+        _mla_tail_census(self, "o_proj_out", output)
 
         if self.next_skip_topk is None:
             return output

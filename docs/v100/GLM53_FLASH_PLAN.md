@@ -664,6 +664,13 @@ backend,target-only:
   路径替代 triton extend(仓库已有 `flash_attn_v100_backend.py` 骨架);
   (2) NCCL 13.4% 与 (1) 重叠后重估;之后 prefill @8k 有 ~3–5× 空间,≥800 门
   在注意力修完后才是合法门槛。
+- **(2026-10-03 补注)** 杠杆 #1 已由 P5-a dsa tilelang 稀疏核兑现(254 →
+  1,390–1,531 tok/s,49 TOPS 单核)。上表是 P4 triton 形态的构成,
+  **P5-a 后未复测**;34 层 KDA 的 TileLang/WMMA 化**不在计划内**(0.8%
+  份额,除非 post-P5-a profile 翻案)。要再抬 prefill,先按 G.5 同法跑
+  一次 post-P5-a 构成 profile(NCCL / Marlin / dense / KDA / 新稀疏核 +
+  indexer 各自份额),以数据重排杠杆——纸面推算无效:NCCL 4.32 s 等绝对
+  项无法与 5.9 s 的总窗共存,通信修复(unified 镜像)已改变各份额。
 
 ### G.6 MTP arm(u2 + NEXTN 3/1/4,生产 spec 配置)
 
@@ -775,6 +782,194 @@ unique suffix;decode 170 tok ×3(`ignore_eos`)。
   验证,非单 boot 参数问题。
 - **结论修正:262k 的前提 P5-a 已成立,性能不再是墙;墙只剩显存双条件。**
   现实阶梯 32k→64k 已实测可用(质量 5/5、吞吐持平),可直接进生产形态评估。
+
+**262k 双条件线设计(2026-10-03; recon 定案,待实施+质量门)**
+
+代码考古把双条件收敛成一个杠杆:**fp8 latent KV(`--kv-cache-dtype fp8_e4m3`)+ mem-fraction 0.94**,条件②被条件①的同一参数顺带关闭:
+
+- **GLM 无解耦 rope**(`qk_rope_head_dim = 0`,latent 行 = 512×2B = 1024 B,与
+  实测 cell 11.85 KB 互恰)。fp8 store 走树内现成链路:DSA 显式 `fp8_e4m3` 过
+  arg 校验(overrides.py `_dsa_kv_cache_dtype_default`)→ `calculate_mla_kv_cache_dim`
+  fp8 分支 → kv_cache_dim = 512 + 4×f32 scale(块 128)= **528 B/行** →
+  hybrid 池 `dsa_kv_cache_store_fp8=True` → 写路径 `quantize_k_cache_separate`
+  (Triton、fp16 输入可用、`dim_rope=0` 合法、`set_mla_kv_buffer_kernel_norope`
+  散写)。cell → **~6.5 KB/token**(latent 5.81 + indexer 0.7),262k ≈ 1.71 GiB,
+  **0.94 ≈ 300k tokens**(对照:fp16 262k 要 3.11 GiB → 0.977,余量 0.66 GiB < logits)。
+- **条件② = indexer fp32 logits workspace**:sm70 索引器 logits 形状
+  `[chunk 1024, kv_len] fp32`(`fp16_paged_mqa_logits_fp8kcache`,头折叠),
+  262k ≈ **1.08 GiB** 瞬态——190k OOM 的主导项(64k ≈ 250 MB,与 64k rung
+  无感一致)。0.94 余量 ~1.8 GiB > 1.08 GiB ✓;fp16 池方案的 0.977 余量
+  0.66 GiB < 1.08 GiB ✗。**fp16+高 mem-fraction 无论怎么调都过不了 262k。**
+- **唯一代码缺口**:sm70 tilelang sparse kernel(`tilelang_sparse_sm70.py`)
+  硬编码 fp16;prefill/decode/verify/NEXTN draft 四路全走它
+  (`_forward_tilelang` 直传 pool buffer,decode 分支 dsa_backend.py:2329 同),
+  模型层/kpool/MTP-precompute 不直接读 latent(已核)。upstream CUDA tilelang
+  也是 bf16,无 fp8 逻辑可借;读侧 dequant 必须进 kernel(整池或 gather-then-
+  dequant 的流量都不可接受:prefill 每 chunk 选中集 ≈ 全部 kv)。
+- **fp8 kernel 变体设计**(保留 fp16 版做 A/B):`KV` 平铺 uint8 `[N*528]` +
+  `S` 平铺 f32 `[N*132]`(同存储 view,`row*528+d` / `row*132+128+d//128`,
+  免 strided tensor);e4m3→fp16 精确译码用 256 项 fp16 smem LUT(512 B,
+  90→90.5 KB < 96 上限),每 program 填一次(LUT 填充用 exp2 的精确幂次,
+  denorm `m·2^-9`、`e==0&&m==0 → 恰 0`——保 padding 零行语义,masked 行读
+  row −1 全零 pad 与 fp16 版一致,不产生 NaN);gather 字节减半
+  (4×1024B→4×528B/行),译码 ALU 预计被带宽节省抵消,以实测为准。
+  已知偏差:0x7F/0xFF(±NaN)译码为 ±480,量化 clamp 不产生该字节,记录不处理。
+- **质量门**(G.9 纪律,逐项过):① fp8 latent 在 8k/64k 形态 vs fp16 基线:
+  top-1 24/24、needle 5/5、prefill/decode 速率、MTP accept;② 262k boot:
+  ~190k/262k rung needle + 速率;③ 前缀缓存:fp8 写→radix 复用读一致;
+  ④ 改动面 = tilelang_sparse_sm70(GLM 专用文件),Qwen 路径不触碰,
+  smoke 过即可;若实施中动到共享文件(如 `set_mla_kv_buffer` 路径)则补
+  完整 Qwen gate。已知上游边缘(记录不修):块内全零组 y_s=0 → y_q=NaN,
+  真实激活不触发。
+
+**fp8 262k 线实测回填(2026-10-03;Boot A–D)**
+
+条件①(池)已关;条件②(墙)改判为**分配器搁浅**,主导项不是纸面瞬态:
+
+- 条件①:fp8 池 262,144 tokens / 1.77 GB 三次 boot 全部分配成功;fp8 内核
+  verify-shape oracle 全过(M∈{1,4,12,16}、topk 2048/2112、−1 tail pad、
+  max|Δ|=3e-5),needle 每 rung 5/5、top-8 22/24——**fp8 内核无罪**,
+  MTP 若仍有错在 glue(draft KV dtype / indexer topk × MTP / accept)。
+- 条件②真身:per-chunk 增长型 logits 瞬态([chunk, prefix] fp32 ×2 + bool,
+  形状随前缀变)让 caching allocator 搁浅 ~2.1 GB reserved-but-unallocated,
+  `expandable_segments` 不救。OOM 签名跨 boot 一致:allocated ~26.3 GB、
+  stranded ~2.1 GB、free <50 MB、失败申请 80–90 MB 于
+  `fp16_ragged_mqa_logits`→`torch.where`。
+- 参数杠杆实测:强制 `--max-total-tokens` 后 mem-fraction 物理无效(0.92 与
+  0.94 布局全同);per-chunk `empty_cache`(`SGLANG_SM70_EXTEND_EMPTY_CACHE`)
+  只延墙不拆墙(hook 确认每 chunk 触发仍死);墙位:chunk 1024 → ~79k、
+  512 → ~100k、512+empty_cache → ~183k。**>183k 一律需要结构修复。**
+- fp8 代价(同脚本公平对比):prefill −53%(1413/1531 → 687–700 @chunk1024、
+  576–603 @chunk512、~504 @140–180k)、decode −39%(22.9 → ~14,平)。
+  fp8 prefill 1500 不可达:P5-b 内核调优(整数位运算译码替代 LUT、scale
+  折叠进 epilogue)后上限估计 ~1100–1300。
+- 结构修复定案(262k 线与降档线共享前置):`fp16_mqa_logits.py` 持久预分配
+  out + `torch.where(..., out=)` in-place;唯一调用方 `_get_topk_ragged_kpool_plan`
+  同调用即消费,持久缓冲返回安全。初版定案(整块 [chunk, 262144] out)被
+  Boot H 实测否决,终版为行切片方案,见下。
+
+**工作区墙:诊断与结构修复收口(2026-10-03;Boot E–H2,已验证)**
+
+诊断链(每步有证据,census = `SGLANG_DEBUG_EXTEND_MEM=1` 逐 chunk 打点
+`eager_runner._log_extend_memory`,基于 `torch.cuda.memory_snapshot()`):
+
+- `empty_cache` 证伪:每 chunk 触发后 2.10 GB reserved-but-unallocated 原样
+  存活——搁浅块活在仍有 active 块的 segment 里,物理不可释放。
+- Boot G census(ctx 0k warmup 即):`cuda_free=0.25G torch_alloc=26.02G
+  torch_resvd=28.21G holes_in_live_segs=2.00G free_segs=0.19G`——引擎在
+  boot 时就只剩 ~284 MB 真实余量;2.0 GB "洞"全部是 <512 MB 的碎片,
+  任何 ≥512 MB 连续申请都不可能(Boot H 实证)。
+- 主导项不是纸面瞬态:逐 chunk 变形的 [n, span] fp32 logits ×2 + bool
+  (span=当前前缀)每次增长都把旧块搁浅进 live segment;~2.1 GB 就是
+  这么累计的。拆墙只能靠**常量尺寸工作区**,不是调参。
+
+实现(`fp16_mqa_logits.py` + `dsa_indexer_kpool.py`;三次返工各有教训):
+
+- `grow_2d_workspace`:持久 per-device 2D 工作区,只在某维不足时重分配,
+  且**只增长不足的维度**(Boot G 崩溃根因:高度触发的重分配把 128 列
+  加倍成 256,copy_ 见 [t,256] vs [t,128]);`reserve=(rows, cols)` 天花板
+  一次到位,避免沿阶梯反复重分配碎片化;调用方必须自己切到精确形状。
+- 反量化 K 表(`_dequant_k_rows_tiled`):fp8→fp16 进 [262k,128] f16 持久
+  工作区(64 MB),8192 行分瓦片,fp32 数学与直接表达式逐位相等(oracle)。
+- logits+topk 行切片(`_fp16_ragged_topk_sliced`):Boot H 实测 512 MiB
+  整块 logits(=512 行 × 262k)永不可能装进 284 MB 余量,改为 **128 行/片**
+  ([128, 262144] fp32 = 128 MB),每片 logits→topk 闭环后 concat;top-k
+  逐行独立(§`topk_from_pooled_history_logits` 契约),切片组合与单调用
+  等价(oracle:max|d|=1.3e-5,top-32 index 集合逐一相等);−1 尾垫与
+  单调用 `out_rows` 语义一致。
+- GEMM 列瓦片(8192 列)+ 持久 arange + 组内因果尾零:瞬态 footprint
+  常量 16 MiB 级,与前缀长度无关。
+- 持久工作区总账:~193 MB(128 logits + 64 k_f16 + arange),对照
+  boot 时 284 MB 余量;`ceiling` 预放大小读 `get_schedule().max_total_tokens`。
+- 路径外成本:行切片把每层 `.tolist()` 同步从 1 次变 4 次(chunk 512),
+  实测 prefill 无可见回退(见下),将来可从 plan 的 host 侧副本提升。
+
+oracle(`/tmp/test_ragged_ws.py`,独立 GPU 验证,RESULT: ALL OK):单组/
+多组/宽 5 瓦片 vs 逐行参考 max|d|≤1e-6 且因果尾零;工作区复用无陈旧值
+(41k→9k);caller `out=`;反量化 1000→2000→20000 行增长序列逐位相等;
+ceiling 预放序列;行切片≡单调用。
+
+**Boot H2 验收(2026-10-03;fp8 262k 全配置,行切片修复后)——条件②关闭:**
+
+| rung | prefill | needle | decode |
+| --- | --- | --- | --- |
+| 32k | 567.5 tok/s | 5/5 | 14.2 tok/s |
+| 64k | 568.8 tok/s | 5/5 | 14.1 tok/s |
+| 190k(旧墙 183k 已越) | 555.9 tok/s | 5/5 | 13.7 tok/s |
+| **262k** | **550.5 tok/s** | **5/5** | 11.8 tok/s |
+| reuse 262k 前缀 | 1.4 s | — | — |
+
+- census 全程平:torch_alloc 26.02→26.21G 在 boot 一次到位(+190 MB 工作区),
+  之后 1090 个 prefill chunk **零漂移**(resvd 28.41G、free_segs 0.19–0.20G
+  恒定);对照修复前 reserved 沿阶梯爬升、79k/100k/183k 三档 OOM。
+- prefill 距 fp8 基线(576–603)−1~−5%,行切片无可见税;262k decode
+  11.8(32–190k 恒 ~14)是池满态尾段,非修复代价。
+- 262,147 tokens 实际 prefill 完成 = **262k 双条件(池 + 工作区)全部关闭**;
+  线上遗留只是性能项(P5-b fp8 内核调优,回到 ~1100–1300 上限)与
+  MTP×fp8 glue(下节)。
+- P5-a 后 profile(同 boot 顺手采,8k prefill 窗口):main_kernel 46.4%、
+  marlin_moe GEMM 23.0%、NCCL AR 9.9%、cutlass dense 7.8%——P5-a 把
+  DSA triton full-attention 从 75% 压到 46% 后,decode 第一杠杆已换成
+  MoE GEMM+AR 合计 ~33%。trace 存 `/tmp/p5prof`。
+
+**fp16 降档线:212k / 230k(2026-10-03 规划,待验证)**
+
+动机:fp16 无内核税(prefill 1,413–1,531、decode ~22.9,短上下文 MTP 43.9)。
+若 212k–230k 满足业务,fp16 降档是**性能最优档**;fp8 的价值收敛在 262k 档
+(其 212k/230k 无独立验证需求——262k 池已 boot,缩池只是改参数)。两线共享
+工作区预分配修复这一前置。
+
+- 池算术(cell 实测 11.85–12.4 KiB/tok):212k ≈ 2.4–2.5 GiB、230k ≈
+  2.6–2.7 GiB(对照 262k 3.11 GiB)。@0.92 + 强制 max-total-tokens + 显式
+  mamba 8,池后余 ~2.4 / ~2.2 GB;0.94(+0.64 GB)更稳。
+- 墙不跟降档走:墙跟前缀长度走,212k 前缀瞬态只比 262k 小 ~19%——无修复时
+  212k/230k 与 262k 同死于 79k–183k。
+- Boot 配方(fp16 线):默认 kv dtype(不加 `--kv-cache-dtype`)、
+  `--max-total-tokens 212992 / 230400`、`--chunked-prefill-size 512`、
+  `--mem-fraction-static 0.94`、`--max-mamba-cache-size 8`(max_running=1)、
+  `SGLANG_SM70_EXTEND_EMPTY_CACHE` 保持默认关(已证伪)。
+- 验证阶梯(`scripts/glm53_longctx_ladder.py`,确定性 prompt,同 boot 复跑
+  即前缀复用检查):212k 先行(余量最大):`--rungs 32000:32k 64500:64k
+  212000:212k --reuse`;过则 `--rungs 229500:230k --reuse`。
+- 判据:prefill ~1,400–1,530(无税)、needle 每 rung 5/5、`--reuse` 墙降到
+  秒级;任一 OOM → 记录墙位后收敛回 fp8 262k 线,不为 fp16 线新开参数杠杆。
+- 质量门:needle 5/5 每 rung;top-8 24/24(fp16 基线探针);MTP accept 单独
+  实测记录(212k decode × MTP 未测,不预设)。
+
+**fp16 降档线实测(2026-10-04,L34/L35;行切片修复树,探针关)**
+
+Boot 配方按上方逐项执行,两 rung 一次落位无 OOM。池实测:212,992 tok =
+2.52+0.23 GB/卡、230,400 tok = 2.73+0.25 GB/卡(预测 2.4–2.5 / 2.6–2.7 带内);
+池后 avail 3.55 / 3.03 GB,0.94 下余量充足。boot(u2 命中)274 s。
+
+| rung | boot | prefill tok/s | needle | decode tok/s(MTP) |
+| --- | --- | --- | --- | --- |
+| 8k | L35 | 697.1 | 5/5(flush 后全新 prefill) | 59.5 |
+| 12k | L35 | 698.1 | 4/5(近满池病灶,见下) | 50.6 |
+| 32k | L34 | 706.8 | 5/5 | 54.3 |
+| 64k | L34 | 711.3 | 5/5 | 50.9 |
+| 212k | L34 | 684.4 | 5/5 | 45.6 |
+| 229.5k | L35 | 671.1 | 5/5 | 46.9 |
+| reuse 212k / 230k | — | 1.3 s / 1.4 s | — | — |
+
+- MTP accept 2.95–3.92(212k/230k decode 窗口);decode 随 ctx 缓降
+  59.5→45.6。**"fp16 降档是性能最优档"成立**:对照 fp8 线(Boot H2 同树)
+  prefill +21–29%(684–711 vs 550–569)、decode +3.2–4.6×(45.6–59.5 vs
+  11.8–14.2)、accept 3.0–3.9。
+- **判据"prefill ~1,400–1,530 无税"未达**:实测 ≈ P5-a 数字(1390–1531)的
+  一半,且 8k 即 697 与 212k 同速率 → 固定每 chunk ~0.35–0.4 s 税,不随
+  kv 增长;fp8 线同一棵树只付 −1~−5% → 税不在两线共享的 Python/topk 侧,
+  在 fp16 KV prefill 独有路径。以 profile 定位,归入 P5-b 同类,不猜。
+- **新病灶(未修,独立立项):近满池驱逐下的小 prompt prefill 质量损坏**。
+  L35 上 229.5k prompt 占树(usage≈1.00)后,8k needle 末位翻字
+  (7391→7392),12k/13k/16k fact@15% 丢失或他位丢失;**decode 复现仍错且
+  翻成 7491 → 坏状态存于已写 KV/索引**;`/flush_cache` 后同 prompt 全新
+  prefill 5/5 恢复;空树同 boot 8k 亦 5/5 → 短 ctx 本身无罪,触发条件 =
+  池 ~99.5% 满 + 驱逐活动下的新 prefill。L34 的 212k shot 承受 ~94k 驱逐
+  仍 5/5,疑似需极端满池。与行切片病灶不同门(该修复在本树且长 rung 全过)。
+  生产 fp16 前缀复用长会话正是此形态,立项优先级高。
+- top-8 24/24 fp16 基线探针本轮未复跑(P5-a 已验;本轮以 per-rung needle
+  为门)。
 
 **DFlash(draft = `/data/models/GLM-5.3-Flash-DFlash`,2.6 GB)**
 
@@ -1191,3 +1386,85 @@ dsa-mtp 模式**:attention-backend 换 dsa 四旗标,新增
 `SGLANG_DSA_FUSE_TOPK=1`、`SGLANG_OPT_USE_TOPK_V2=0` 两个 env(镜像未烤,
 脚本 dsa 段导出);文件头注明回退方法(四旗标换回 triton + 删两 env)。
 decode 12.2 → 43.9 tok/s(+260%),8k prefill 254 → ~1390 tok/s。
+
+## 附录 I:262k 产线形态 MTP×fp8 NaN 根因收口(2026-10-04)
+
+262k 双条件关闭后,产线目标形态(262k sizing + fp8 latent KV + 图模式 +
+NEXTN MTP)短/长生成输出全 `!`(token 0);`--disable-cuda-graph` 输出真实
+文本。本附录记录 L9b→L14 的定位链与修复。
+
+### I.1 定位链(逐 boot 证据)
+
+| Boot | 实验 | 判决 |
+| --- | --- | --- |
+| L9b | blkcensus + idx census | `6.blk` 有限(含 0-6 层全部 MoE/u2 输出)→ `7.attn` 全 NaN;L7 indexer 链完全健康(q/logits/topk/kbuf 全净)→ NaN 诞生于 layer 7 attention 内部 |
+| L10 | 去 u2 直通二分 | **物理不可行**:NVFP4 直通 ~182G÷4 > 32G VRAM,装载期 OOM。u2 池对本模型强制 |
+| L11 | sp census(L3/L7/L11/L43 gather 前 2048 slot) | 全输入有限(q 有限、pt1 无 oor、pool e4m3/sc 无 NaN/inf)+ 内核输出仍 100% NaN;L11+ 全为继发感染。三输入侧假说全灭 |
+| L12 | u2 cache 冷启 + eager-repro 探针 | cache 冷存 168 文件/76G 正常;eager 探针因未镜像 %64 padding 失败(引擎死于已知 62k needle 图模式 OOM,非新病灶) |
+| L13 | u2 cache 热命中 + 修复探针 | **eager 图外重放真实捕获输入:L3 有限(abs 1.11)/L7 全 NaN → value-dependent,图状态排除** |
+
+### I.2 离线定罪与机制(/data/develop/u2probe/)
+
+张量 `docker cp` 出死容器后离线二分(probe_bisect.py),免 boot 迭代:
+
+- 交换实验:q_L7+pool_L3 → 有限;**q_L3+pool_L7 → 全 NaN → 池是罪魁**。
+- 全池扫描(262208 行/层):**仅 row 0 的 4 个 fp32 group scale 是 NaN**,
+  其余全净;L3 的 row 0 干净。NaN scale 不在合法读集内(pt1 无 slot 0)。
+- 机制:`free_slots = range(1, N)` → **slot 0 永不分配**,是索引 -1
+  padding 的钳制哨兵行。fp8 内核对 -1 lane 先置 `acc_s=-inf` 再做满块
+  QK gemm,`T.max(Indices,0)` 钳制读到的 row 0 携 NaN scale → 反量化 K 为
+  NaN → `-inf + NaN = NaN` → `reduce_max` 传播整行。L3 row 0 干净故幸免。
+  fp16 内核直读无 scale 乘法,天然免疫;仅 fp8 内核中招。
+
+### I.3 修复与验证(tilelang_sparse_sm70.py,fp8 内核)
+
+- QK 两次 gemm 后**重申掩码** `acc_s = where(mask, acc_s, -inf)`(NaN 被
+  -inf 覆盖,max 归约安全);
+- V gather 对掩码 lane **置零**:`S_shared` 在掩码 lane 恰为 0,但 V 为 NaN
+  时 `0×NaN=NaN` 会从 PV 路径再感染;
+- 验证三层:① 离线 boot 中毒张量 32768/32768 NaN → 0 NaN(abs 0.84,与
+  L3 量级同类);② 新内核回归测试
+  `test/registered/kernels/ops/attention/dsa/test_tilelang_sparse_sm70.py`
+  3/3 绿(中毒哨兵行/净池/全合法索引,对照 torch 参考 rtol=atol=2e-2),
+  修复前 3/3 红;③ **L14 产线形态 boot 端到端**(262k + fp8 KV + 图模式 +
+  NEXTN,即曾必现全 '!' 的形态):~200 token 请求真实文本,census L3/L7/
+  L11/L43 out_nan=0,sparse-eager 图外重放 L7 out_nan=0(abs 0.874,与图内
+  1.12 同为有限值,归约序差异)。
+- **开放问题(已无害化)**:谁在 boot 期把合理字节 + NaN scale 写进 row 0
+  (capture 期未初始化激活写哨兵行为最合假说)。slot 0 永不分配 → row 0
+  永远只经钳制路径被读,内核免疫后该写入无影响。
+
+### I.4 u2 stage 跨 boot 泄漏(任务 #30)
+
+引擎进程被杀时 `_free_u2_staging` 不可达,`sglang_u2_stage_<pid>_*.bin`
+跨 boot 累积(曾到 171 GB)。`alloc_u2_staging` 加 once-flag pid 存活扫描:
+每次分配前清理同目录内 pid 已死进程的残件。引擎存活期间不可删自身文件。
+
+### I.5 u2 池持久化缓存(任务 #31,SGLANG_SM70_U2_CACHE=1)
+
+boot 期 NVFP4→u2 requant ~22 min(31.3 s/层×42 层)是冷 boot 主导项。
+缓存设计:
+
+- **指纹**:sha256(`u2-cache-v{N}` + tp + 模型目录 `*.safetensors/*.json`
+  的 `name:size:mtime_ns` 清单)前 16 hex → 换模型/换 TP 自动 miss 重建;
+- **内容**:转换后四池张量(w13/w2 int32 + s13/s2 fp16,0.45 GiB/层/rank),
+  per-(rank,layer) 自描述 payload(torch.save,tmp+rename 原子发布),
+  meta(group_size/macro)不符按 miss 处理,shape/dtype 布局校验兜底;
+- **失效安全**:任何读写异常仅禁用本 boot 缓存,绝不阻断装载;崩溃产生的
+  半量缓存 = 半量命中,永不错字节;
+- **实测**:冷存 168 文件 76 GB(Load weight 1395→1662 s,+4.5 min);
+  热命中 requant 22 min → **37 s**(1.0 s/层/rank),boot 33 → 25.7 min。
+- **checkpoint 读跳过(任务 #32,u2_checkpoint_reader)**:热命中 boot 本无需
+  专家字节,却仍全量读 182G(Load 1137 s)并写 76G staging 后丢弃。接
+  `checkpoint_tensor_reader` 钩子(DSV4.1 同款):`SGLANG_SM70_U2_CACHE=1` 且
+  本 rank 的 per-layer payload 存在且不小于预期字节的层,其 checkpoint
+  `experts.*/shared_experts.*` 的 `weight/weight_scale` 直接不读(99% 字节);
+  `weight_scale_2/input_scale` 等小张量照读。承诺破裂(cache 在 process 期
+  miss/死句柄/布局漂移)时 `convert_moe_layer_to_u2` 硬失败整个装载,绝不
+  反量化空 staging 产出零专家(smoke_v100.sh 存在所防的那类静默故障)。
+  **L16 实测**:target Load 1137 → **70.8 s**,draft 55 → 34.7 s,总 boot
+  25.7 → **7.3 min**(< 10 min 目标);staging 命中路径零写入;~200 token
+  短输出质量门真实文本(spec accept 4.0)。已知残留:被杀 boot 的 stage 文件
+  若 pid 被新容器复用,存活扫描按设计跳过不误删(L15 残件 672 文件 ~28G 因
+  L16 pid 段重合未清;磁盘富余时可手动清)。
+- 层号无冲突:NEXTN draft `layer_id = num_hidden_layers`(45),目标 3-44。
