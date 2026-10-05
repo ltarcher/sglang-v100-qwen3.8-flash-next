@@ -813,29 +813,29 @@ def get_mhc_pre_token_count_representatives(
     return tuple(sorted(reps.values()))
 
 
-def _mhc_pre_gemm_sqrsum_torch_chunked(
+def _mhc_pre_gemm_sqrsum_torch(
     x_flat: torch.Tensor,
     fn: torch.Tensor,
-    num_tokens: int,
     hc_mult3: int,
-    hc_hidden_size: int,
-    chunk: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """SM70 stand-in for the TileLang gemm_sqrsum kernels: the sm70 TileLang
-    MMA emitter has no fp32-operand form, so the projection stays in cuBLAS
-    fp32. Chunked over tokens so the fp32 copy of the residual stays ~25MB --
-    the unchunked transient OOMs chunked-prefill >= 2048 on VRAM-tight ranks.
-    GEMM inputs are bit-identical to the kernel path (same half-precision
-    storage upcast); only the summation order differs.
+    MMA emitter has no fp32-operand form, so the projection runs as a cuBLAS
+    fp16 GEMM (tensor-core, fp32 accumulate) and the square-sum as an
+    fp32-accumulated vector_norm. Neither materializes an fp32 copy of the
+    residual, so the ~25MB transient that forced the old fp32 path to chunk
+    (and OOMed chunked-prefill >= 2048 on VRAM-tight ranks) does not exist
+    here. bf16 input arrives only from correctness tests (V100 production is
+    fp16-forced) and keeps the fp32 GEMM: cuBLAS cannot return fp32 from a
+    half-operand mm, and rounding gemm_out_mul to bf16 breaches the post/comb
+    oracle gates.
     """
-    gemm_out_mul = torch.empty(
-        num_tokens, hc_mult3, dtype=torch.float32, device=x_flat.device
-    )
-    gemm_out_sqrsum = torch.empty(num_tokens, dtype=torch.float32, device=x_flat.device)
-    for i in range(0, num_tokens, chunk):
-        xb = x_flat[i : i + chunk].float()
-        torch.mm(xb, fn.t(), out=gemm_out_mul[i : i + chunk])
-        torch.sum(xb.square(), dim=-1, out=gemm_out_sqrsum[i : i + chunk])
+    if x_flat.dtype == torch.float16:
+        gemm_out_mul = torch.mm(x_flat, fn.to(torch.float16).t()).float()
+    else:
+        gemm_out_mul = torch.mm(x_flat.float(), fn.t())
+    gemm_out_sqrsum = torch.linalg.vector_norm(
+        x_flat, dim=-1, dtype=torch.float32
+    ).square_()
     return gemm_out_mul, gemm_out_sqrsum
 
 
@@ -1166,12 +1166,10 @@ def mhc_pre(
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     elif is_sm70_supported():
-        gemm_out_mul, gemm_out_sqrsum = _mhc_pre_gemm_sqrsum_torch_chunked(
+        gemm_out_mul, gemm_out_sqrsum = _mhc_pre_gemm_sqrsum_torch(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
-            num_tokens,
             hc_mult3,
-            hc_hidden_size,
         )
         gemm_out_mul = gemm_out_mul.unsqueeze(0)
         gemm_out_sqrsum = gemm_out_sqrsum.unsqueeze(0)
