@@ -419,19 +419,21 @@ def handle_model_specific_adjustments(server_args: Any):
         if model_arch == "Glm5NextForConditionalGeneration" and (
             get_platform().is_sm70
         ):
-            # GLM-5.3 shares DeepSeek V4.1's mHC hyper-connections. The
-            # kernels are fp16-capable now, but the Volta numbers are
-            # unvalidated, so the torch implementation stays the default
-            # (same defaults the V4 arm sets below, which GLM used to miss).
-            # Its Sinkhorn section routes to the sm70 JIT kernel
-            # (SGLANG_SM70_MHC_SINKHORN_JIT, default on). The DeepGEMM hc
-            # prenorm has no Volta build, and a hand-set TILELANG_MHC_PRE=1
-            # would otherwise walk into that branch and NameError.
+            # GLM-5.3 shares DeepSeek V4.1's mHC hyper-connections, and the
+            # TileLang pre/post kernels are the measured default on Volta:
+            # mhc_post_tilelang runs 103us vs the torch chain's 1064us
+            # x90/forward, +17.3% prefill (1490 -> 1749 tok/s) with needle
+            # 5/5 and rel err 3.0e-04 vs the fp32 reference (the torch
+            # chain itself is 6.9e-04). The Sinkhorn section routes to the
+            # sm70 JIT kernel (SGLANG_SM70_MHC_SINKHORN_JIT, default on).
+            # The DeepGEMM hc prenorm has no Volta build, and a hand-set
+            # TILELANG_MHC_PRE=1 would otherwise walk into that branch and
+            # NameError.
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
-                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
                 logger.info(
                     "SM70 GLM: torch mHC fallback enabled "
