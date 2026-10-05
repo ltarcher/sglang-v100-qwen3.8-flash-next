@@ -1428,6 +1428,13 @@ class Envs:
     # Model or TP change auto-misses: the fingerprint covers config.json,
     # every weight file's size+mtime, the requant algorithm version and TP.
     SGLANG_SM70_U2_CACHE = EnvBool(False)
+    # Route the u2 expert-pool GEMMs through sm70_u2_gemm_v2 (transposed-word
+    # register-direct kernel, ~1.5x the CUTLASS-path u2 kernel on prefill
+    # shapes) instead of moe_wna16_marlin_gemm. Boot-time contract: when set,
+    # convert_moe_layer_to_u2 binds the pool weights in the v2 transposed
+    # layout, so flipping it after load would misread the bytes. Decode
+    # (moe_block_size != 32) and any unqualified shape fall back to marlin.
+    SGLANG_USE_SM70_U2_GEMM_V2 = EnvBool(False)
 
     # Release stranded allocator blocks after every eager extend chunk. The
     # per-chunk indexer logits workspace grows with the prefix length, so

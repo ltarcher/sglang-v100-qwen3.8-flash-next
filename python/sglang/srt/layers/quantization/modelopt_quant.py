@@ -3360,6 +3360,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     w2_g_idx_sort_indices=None,
                     weight_bits=2,
                     is_expert_parallel=False,
+                    u2_v2_words=layer._u2_v2_words,
                 )
                 return self.runner.run(dispatch_output, quant_info)
 

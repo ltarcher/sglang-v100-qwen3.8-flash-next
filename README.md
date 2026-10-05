@@ -361,6 +361,12 @@ Long context on the dsa mode (2026-10-03 ladder, same WIP-tree boots): sparse pr
 
 GLM's 34 KDA layers each run an mHC pre/post block around the MoE; in torch eager that block cost ~4.2 ms per layer per 1k-token chunk (~150 ms of every 8k prefill). The A step ports the elementwise kernels to fp16 TileLang (the projection GEMM stays chunked cuBLAS fp32 — the sm70 TileLang MMA emitter has no fp32 operand form), enabled by default in `serve_glm53_flash_v100.sh` via `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=1`: ~7.6k prefill 1275-1300 → **1436-1454 tok/s** (+12%) on the u2 dsa-mtp c1024 recipe. Gates: 16-case torch-oracle suite (fp16 layer diff ≤9.8e-4 ≈ 1 ulp; the `hc_mult=3` sinkhorn is rewritten onto shared memory + a serial thread because the fragment AllReduce lowering needs power-of-two extents), needle 5/5, near-full-pool eviction regression clean, decode/accept unchanged. `chunked-prefill-size 2048` OOMs at mem-fraction 0.94 (Marlin's 128 MB `intermediate_cache13` transient vs 86 MiB free) and would cap at ~1570 tok/s anyway. Full record: `docs/v100/GLM53_FLASH_PLAN.md` appendix J.
 
+### u2 transposed-word GEMM (P5-b B step, 2026-10-05)
+
+The Marlin u2 MoE GEMM (~218 ms per 1k-token chunk) is the last big prefill item, so the 2-bit words get their own sm70 kernel: `sm70_u2_gemm_v2`, added to the pinned Marlin build via `patches/marlin-v100-u2-gemm-v2.patch` (`bash scripts/setup_v100_marlin.sh` rebuilds the `.so`). At boot the u2 pool can re-bind its words into a layout where each 32-bit word IS an HMMA B-operand tile (`u2_packed_to_T`, one-time repack); the kernel dequantizes fp16 in-register through the same WMMA fragment path as the other sm70 TileLang work. Prefill GEMM w13 1.51× / w2 1.61× vs Marlin u2 at the production shapes, bit-exact on both stages against the production Marlin output.
+
+Same boot, only `SGLANG_USE_SM70_U2_GEMM_V2` flipped (7936-token prefill ×9, flushed radix): 1343 → **1490 tok/s (+10.9%)**, spec-decode 68.2 → 74.7 tok/s (+9.5%; the M=4 verify step takes the v2 path too, M=1 decode stays Marlin), accept 3.39 unchanged, needle 5/5. Because a lost flag here means Marlin silently reads the wrong bytes, the flag is plumbed through `fused_marlin_moe` and guarded by a boot-time binding self-test that requires bit equality between the two word layouts through the full fused entry point — a stale `.so` or a broken kwarg chain fails the boot instead of serving garbage. Qwen3.8 NVFP4 regression on the shared `.so`: clean (8k protocol prefill 3031 tok/s, decode 165 tok/s, smoke exit 0). Default off in the serve script pending the production-compose re-validation; full record: `docs/v100/GLM53_FLASH_PLAN.md` appendix K.
+
 ### Reference recipe
 
 The wrapper is the supported entry. `target` (u2 pool, no speculation) is what the numbers above were measured on; `mtp` adds the NEXTN draft; `spill`/`spill-mtp` reproduce the pre-P4 shape for A/B.
@@ -380,6 +386,7 @@ Key knobs (the script header carries the full list):
 | `--context-length` | 8192 | The validated ceiling. Raising it re-opens the KV/activation trade on the pool path; do not bump it and the mem fraction together on faith |
 | `--chunked-prefill-size` | 1024 | The benched configuration; larger chunks are untested on the pool path. 2048 OOMs at mem-fraction 0.94 (Marlin 128 MB transient) and would cap at ~1570 tok/s |
 | `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST` | 1 (set by the script) | fp16 TileLang mHC pre/post, +12% 8k prefill; unset falls back to torch |
+| `SGLANG_USE_SM70_U2_GEMM_V2` | 0 (default pending compose re-validation) | Bind the u2 pool to the transposed-word GEMM: +10.9% 8k prefill, +9.5% spec decode. Needs the rebuilt Marlin `.so` (boot fails hard without the op) and a restart when flipped |
 | `GLM53_U2_GROUP` | 128 | The tuned grid's group; 64/32 are kernel fallbacks and were measured worse per byte |
 
 ## What the port adds

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -19,6 +20,7 @@ if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import moe_sum_reduce_triton
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.moe.sm70_u2_gemm_v2 import sm70_u2_gemm_v2
 
     try:
         _cuda_major, _ = torch.cuda.get_device_capability()
@@ -195,6 +197,7 @@ def fused_marlin_moe(
     is_gated: bool = True,
     gate_up_input_scale: float = 1.0,
     wide_output_scale: float = 1.0,
+    u2_v2_words: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -279,11 +282,25 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    # u2b2 v2 kernel dispatch: opt-in via SGLANG_USE_SM70_U2_GEMM_V2, weights
+    # must have been bound in the transposed layout by convert_moe_layer_to_u2
+    # (u2_v2_words). Prefill only -- the M==1 single-token align path stays on
+    # marlin (decode coverage is a separate task); its tile is moe_block_size
+    # 32, which is why the marlin heuristic below is skipped.
+    use_u2_v2 = (
+        num_bits == 2
+        and u2_v2_words
+        and envs.SGLANG_USE_SM70_U2_GEMM_V2.get()
+        and M > 1
+    )
+    if use_u2_v2:
+        block_size_m = 32
+    else:
+        # M block size selection logic
+        # TODO: tune this further for specific models
+        for block_size_m in [8, 16, 32, 48, 64]:
+            if M * topk / E / block_size_m < 0.9:
+                break
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -359,34 +376,55 @@ def fused_marlin_moe(
     else:
         marlin_hidden_states = hidden_states
 
-    intermediate_cache1 = moe_wna16_marlin_gemm(
-        marlin_hidden_states,
-        intermediate_cache1,
-        w1,
-        w1_bias,
-        w1_scale,
-        w1_global_scale,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=topk,
-        mul_topk_weights=False,
-        is_ep=is_ep,
-        b_q_type=scalar_type1,
-        size_m=M,
-        size_n=gemm1_n,
-        size_k=K,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=w1_zeros is not None and w1_zeros.dtype != torch.int32,
-    )
+    if use_u2_v2:
+        # Group size from the scales' group-major dim, mirroring the marlin
+        # op's own derivation.
+        sm70_u2_gemm_v2(
+            marlin_hidden_states,
+            intermediate_cache1,
+            w1,
+            w1_scale,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=topk,
+            mul_topk_weights=False,
+            size_m=M,
+            size_n=gemm1_n,
+            size_k=K,
+            group_size=K // w1_scale.shape[-2],
+        )
+    else:
+        intermediate_cache1 = moe_wna16_marlin_gemm(
+            marlin_hidden_states,
+            intermediate_cache1,
+            w1,
+            w1_bias,
+            w1_scale,
+            w1_global_scale,
+            w1_zeros,
+            g_idx1,
+            sort_indices1,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=topk,
+            mul_topk_weights=False,
+            is_ep=is_ep,
+            b_q_type=scalar_type1,
+            size_m=M,
+            size_n=gemm1_n,
+            size_k=K,
+            is_k_full=is_k_full,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=True,
+            is_zp_float=w1_zeros is not None and w1_zeros.dtype != torch.int32,
+        )
 
     activation_scales = None
     if wide_output_scale != 1.0:
@@ -441,34 +479,55 @@ def fused_marlin_moe(
     if is_ep:
         intermediate_cache3.zero_()
 
-    intermediate_cache3 = moe_wna16_marlin_gemm(
-        intermediate_cache2,
-        intermediate_cache3,
-        w2,
-        w2_bias,
-        w2_scale,
-        w2_global_scale,
-        w2_zeros,
-        g_idx2,
-        sort_indices2,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=1,
-        mul_topk_weights=True,
-        is_ep=is_ep,
-        b_q_type=scalar_type2,
-        size_m=M * topk,
-        size_n=K,
-        size_k=N,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=w2_zeros is not None and w2_zeros.dtype != torch.int32,
-    ).view(-1, topk, K)
+    if use_u2_v2:
+        c3 = intermediate_cache3
+        sm70_u2_gemm_v2(
+            intermediate_cache2,
+            c3,
+            w2,
+            w2_scale,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=1,
+            mul_topk_weights=True,
+            size_m=M * topk,
+            size_n=K,
+            size_k=N,
+            group_size=N // w2_scale.shape[-2],
+        )
+    else:
+        c3 = moe_wna16_marlin_gemm(
+            intermediate_cache2,
+            intermediate_cache3,
+            w2,
+            w2_bias,
+            w2_scale,
+            w2_global_scale,
+            w2_zeros,
+            g_idx2,
+            sort_indices2,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=1,
+            mul_topk_weights=True,
+            is_ep=is_ep,
+            b_q_type=scalar_type2,
+            size_m=M * topk,
+            size_n=K,
+            size_k=N,
+            is_k_full=is_k_full,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=True,
+            is_zp_float=w2_zeros is not None and w2_zeros.dtype != torch.int32,
+        )
+    intermediate_cache3 = c3.view(-1, topk, K)
 
     if wide_output_scale != 1.0:
         from sglang.srt.layers.laguna_rmsnorm import laguna_scale_output_sm70

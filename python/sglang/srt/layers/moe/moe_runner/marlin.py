@@ -116,6 +116,9 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_global_scale: Optional[torch.Tensor] = None
     w13_bias: Optional[torch.Tensor] = None
     w2_bias: Optional[torch.Tensor] = None
+    # u2b2 pool weights bound in the sm70_u2_gemm_v2 transposed layout
+    # (SGLANG_USE_SM70_U2_GEMM_V2; set by convert_moe_layer_to_u2).
+    u2_v2_words: bool = False
 
 
 @register_fused_func("none", "marlin")
@@ -296,6 +299,7 @@ def fused_experts_none_to_marlin(
         w2_bias=quant_info.w2_bias,
         workspace=workspace,
         num_bits=quant_info.weight_bits,
+        u2_v2_words=quant_info.u2_v2_words,
         is_k_full=quant_info.is_k_full,
         inplace=marlin_inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,

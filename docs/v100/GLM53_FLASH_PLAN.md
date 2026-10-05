@@ -1528,3 +1528,90 @@ c2048 boot 后首个请求 OOM:Marlin `intermediate_cache13` 申 128MB,mem-fract
 tok/s,仍 < 1800。A 步后缺口 ~350 tok/s ≈ 130 ms/chunk > 100 ms 立项线,
 剩余最大单项 = Marlin MoE GEMM ~218 ms/chunk → B 步(TileLang u2 MoE GEMM)
 立项。
+
+## 附录 K:P5-b B 步——sm70 手写 u2 GEMM v2(U2B2,2026-10-05 收口)
+
+J.5 立项的 Marlin MoE GEMM ~218 ms/chunk:不重写 Marlin,给 2-bit 词单独写一个
+以 HMMA B 操作数为目标布局的 GEMM。产出:生产 marlin .so 新增
+`sm70_u2_gemm_v2`(纯新增 dispatch,u4b8/NVFP4 路径零接触),prefill +10.9%、
+spec-decode +9.5%,位级 oracle 全等。
+
+### K.1 内核形态:转置词布局 + w2 mul 合同
+
+marlin 的 u2 词按其 B-load 路径打包;v2 把词重排成"每个 32-bit 词直接是一块
+HMMA B 操作数"的布局(`u2_packed_to_T`,boot 期一次性重排),内核逐宏片从
+smem 直读、寄存器内反量化 fp16、4-warp 16×16 WMMA 碎片累积(sm70 约束见
+[[sm70-triton-fma-tilelang-wmma]]:必须 WMMA,不能 FMA)。两段合同:
+
+- w13:`size_m=M`(chunk tokens),`top_k=8`,`mul_topk_weights=False`(与
+  marlin 同:权重在最终 combine 乘)。
+- w2:`size_m=M*topk`,`top_k=1`,**`mul_topk_weights=True`**——w2 输出按行
+  乘 topk 权重的合同由 v2 内核承担(marlin 在同形状下不乘)。两臂输出在
+  combine 前位级全等以此成立。
+
+生产 .so oracle(`verify_v2prod_so.py`,完整生产链 repack→u2_packed_to_T→
+v2 op vs 生产 marlin op):w13 exact maxdiff=0(3112.9→2066.9 μs,1.51×);
+w2 mul 合同 exact maxdiff=0(2175.9→1347.9 μs,1.61×)。
+
+### K.2 部署链:patches/ + setup 脚本(生产集成形态)
+
+- `patches/marlin-v100-u2-gemm-v2.patch`(349 行,恰 3 文件:CMakeLists +
+  `sm70_u2_gemm_v2.cu` + torch_bindings)追加进
+  `scripts/setup_v100_marlin.sh` 的 SM70_PATCHES(pinned marlin 6d72a49);
+  回放验证:裸树 + 4 补丁 = 本地构建树逐字节 IDENTICAL。
+- 生产 .so 是容器(u2b2 镜像,CUDA 12.9)SKIP_BF16_COMPAT=1 构建:容器的
+  `cuda_bf16.hpp` 已定义 bf16 向量 intrinsics,`sm70_bf16_compat.h`(为宿主
+  12.4 写)重定义冲突;宿主无 python env 不可构建。setup 脚本 stamp 不匹配
+  自动 reset+reapply,产物装入 prebuilt 目录(bind mount 同文件),内置
+  load+注册 smoke。
+- python 侧触发点:`SGLANG_USE_SM70_U2_GEMM_V2`(environ.py)→ boot
+  `convert_moe_layer_to_u2` 决定绑定 marlin 词或 T 词(`layer._u2_v2_words`,
+  **重启契约**:换绑定即换字节,必须重启);forward 期
+  `fused_marlin_moe(..., u2_v2_words=...)` 门控 `num_bits==2 and words and
+  env and M>1`(decode M=1 对齐路径留 marlin;spec verify M=4 走 v2)。
+
+### K.3 kwarg 断管教训(A/B 第一轮零提升的根因)
+
+首轮 A/B 两臂统计相同(needle 都没测就停下排查):runner 调
+`fused_marlin_moe` 时漏传 `u2_v2_words` → 恒 False → v2 从未派发 → arm B
+实为 marlin 直接读 T 布局字节(静默垃圾)。三重防线全部被绕过——boot 硬失败
+检查的是"op 存在",forward 门控依赖的恰是断掉的 flag,位级 oracle 直调 op
+不穿 `fused_marlin_moe` 入口。修复:补 kwarg(全树仅 2 个调用点,逐一核对)+
+新增第四道、穿全入口的防线——**boot 一次性绑定自检**
+(`_u2_v2_binding_selftest`):同组微型输入经 `fused_marlin_moe` 两臂
+(marlin 词 + False vs T 词 + True)必须位级相等;flag 半路丢失则第一臂读
+垃圾 → NaN 发散 → boot raise。自检用层的真实权重/形状/激活配置
+(`moe_runner_config`),M=1024(生产元数据;tiny-M 的 fused 路径有未初始化
+中间行 NaN 伪影,NaN≠NaN 会让相等断言误报)。
+
+### K.4 A/B 实测(4×V100-32GB,u2 dsa-mtp c1024+es 配方 212k 池,launch_u2v2_on.sh)
+
+同 .so 同 boot,仅 `SGLANG_USE_SM70_U2_GEMM_V2` 翻转;prefill =
+7936-token ×9(clean bench,flush 起测):
+
+| 项 | arm A(v2 off) | arm B(v2 on) |
+| --- | --- | --- |
+| prefill ×9 | 1305-1345(median 1343) | **1489-1501(median 1490,+10.9%)** |
+| needle 5 深度(1300..25700) | 5/5 | 5/5 |
+| decode e2e(128+512,单流 MTP) | 68.2 tok/s | **74.7 tok/s(+9.5%)** |
+| accept_len | 3.39 | 3.39 |
+
+每 chunk 省 ~73 ms(5.91→5.33 s / 8 chunks),与探针 ~79 ms 预估吻合;
+boot 自检四 rank 全过,池命中日志 `words=v2-transposed`。decode 提升 = spec
+verify 步(M=4>1)切 v2 所致,accept 持平证明 M=4 输出无退化。P5-b 累计:
+fp16 线 684-711 → **1490**(×2.1),距 1800 目标差 ~300。
+
+### K.5 Qwen 回归(共享 .so 硬约束)
+
+qwen38-reg(活树 bind-mount,冻结回归配置)8k 档同协议(input 7936 /
+output 256 / 3 prompts / seed 42):prefill **3031 tok/s**(基线带
+2930-3055 内,09-28 同协议 3007)、TPOT 6.05 ms = 165 tok/s(优于 09-28
+基线 9.01 ms,树内 decode 改进)、accept 3.67;容器内 smoke exit 0(marlin
+注册 + 零输出检测)。u4b8/NVFP4 路径无回归。
+
+### K.6 缺口与下一步
+
+P5-b 总账还剩:DSA round-2(~0.25 s/chunk)、MoE epilogue 融合(~0.15 s)。
+decode 杠杆:#37 spec-step 残余解剖、#38 DSA/KDA decode 份额、#39 v2
+small-M(M=1/2/4;现门控 M>1,decode M=1 留 marlin,内核已具备扩展面)。
+serve 脚本默认仍 0,A/B 与质量门已全过,翻默认待生产 compose 复测定案。

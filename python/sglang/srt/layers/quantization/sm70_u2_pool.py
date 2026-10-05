@@ -21,6 +21,13 @@ The u2b2 contract consumed by ``fused_marlin_moe(num_bits=2)``:
     w13_weight_scale  [E, H/g, 2I]  fp16   (k-group major, transposed vs w13)
     w2_weight_scale   [E, I/g, H]   fp16
 
+With SGLANG_USE_SM70_U2_GEMM_V2 set (and the shape gate met), the two
+weight pools are instead bound in the sm70_u2_gemm_v2 transposed layout
+(same shapes, permuted words -- see u2_packed_to_T) and
+``layer._u2_v2_words`` marks the mode for the apply path. The persistent
+cache always stores the marlin format, so the env only decides the final
+GPU binding and flipping it just re-derives on the next boot.
+
 The requantization folds each expert's NVFP4 ``weight_scale_2`` into the
 dequantized fp32 weights, so the u2 group scales are the only scale at
 apply time (no per-expert global scale, unlike the u4 Marlin path).
@@ -253,6 +260,190 @@ def _macro_for_n(n: int) -> int:
     if n % 128 == 0:
         return 128
     return 64
+
+
+def repack_u2_sm70T(codes_u8: torch.Tensor) -> torch.Tensor:
+    """codes_u8 [E, R(n), C(k)] values 0..3 -> words [E, C/16, R] int32.
+
+    Direct builder for the sm70_u2_gemm_v2 transposed layout: one uint32
+    holds 16 consecutive-k codes of ONE column; code j = k %% 16 sits at BIT
+    position (j even ? j : j + 15) -- even-j codes in the low halfword at
+    nibble positions, odd-j codes in the high halfword (sm70_u2_gemm_v2.cu
+    u2_deq). Production never calls this (weights are derived from the cached
+    marlin words via u2_packed_to_T); it is the independent reference the
+    layout unit test cross-checks that inverse against.
+    """
+    e, r, c = codes_u8.shape
+    assert c % 16 == 0
+    dev = codes_u8.device
+    codes = codes_u8.view(e, r, c // 16, 16).to(torch.int32)
+    j = torch.arange(16, device=dev)
+    pos = torch.where(j % 2 == 0, j, j + 15)
+    words = (codes << pos.view(1, 1, 1, 16)).sum(-1, dtype=torch.int32)
+    return words.permute(0, 2, 1).contiguous()
+
+
+def u2_packed_to_T(
+    packed: torch.Tensor, r: int, c: int, packed_macro_n: int
+) -> torch.Tensor:
+    """marlin packed u2 words [E, C/16, R] -> sm70_u2_gemm_v2 words [E, C/16, R].
+
+    Exact inverse chain of repack_u2_sm70: undo the macro-N scatter (gather
+    with the same address matrix), unpack the 16 run-column codes of each
+    (k, 16-column) word (code of run-column q lives at bit-pair pos[q]), and
+    repack k-major -- one uint32 = 16 consecutive-k codes of ONE column, code
+    j = k %% 16 at BIT position (j even ? j : j + 15), matching the T layout
+    the v2 kernel documents. Same shape as the input; verified bit-exact
+    against repack_u2_sm70T(requant codes) in test_sm70_u2_gemm_v2_layout.py.
+    """
+    e = packed.shape[0]
+    assert c % 16 == 0 and r % 64 == 0 and 64 <= packed_macro_n <= 256
+    k_group_tiles = packed_macro_n // 64
+    dev = packed.device
+
+    kk = torch.arange(c, device=dev)
+    m = torch.arange(r // 16, device=dev)
+    n_tile = m // 4
+    addr = (
+        (kk // 16).view(-1, 1) * r
+        + ((kk % 16).view(-1, 1) * 4 + (m % 4).view(1, -1)) * k_group_tiles
+        + (n_tile // k_group_tiles).view(1, -1) * k_group_tiles * 64
+        + (n_tile % k_group_tiles).view(1, -1)
+    )  # [C, R/16]
+    words = (packed.reshape(e, -1).gather(1, addr.reshape(1, -1).expand(e, -1))).view(
+        e, c, r // 16
+    )  # logical [k, n16] word grid
+
+    # codes[e, k, n16, q] = run-column q of the (k, n16) word.
+    j = torch.arange(16, device=dev)
+    pos = (j % 8 >> 1) + ((j & 1) << 2) + (j // 8) * 8
+    codes = (words.unsqueeze(-1) >> (2 * pos).view(1, 1, 1, 16)) & 3
+
+    # T word (kw, n): code j = k % 16 at BIT position pos_T[j] (even j in the
+    # low halfword at nibble positions, odd j in the high halfword).
+    codes = codes.view(e, c // 16, 16, r // 16, 16)  # [e, kw, j, n16, q]
+    codes = codes.permute(0, 1, 3, 4, 2).reshape(e, c // 16, r, 16)
+    pos_t = torch.where(j % 2 == 0, j, j + 15)
+    return (codes.int() << pos_t.view(1, 1, 1, 16)).sum(-1, dtype=torch.int32)
+
+
+def _u2_v2_layout_ok(layout: dict) -> bool:
+    """Shape gate for sm70_u2_gemm_v2 (kernel TORCH_CHECKs mirrored)."""
+    hidden = layout["hidden"]
+    inter = layout["inter"]
+    n13 = layout["n13"]
+    return (
+        hidden % 64 == 0
+        and inter % 64 == 0
+        and n13 % 128 == 0
+        and hidden % 128 == 0
+        and layout["group_size"] in (32, 64, 128)
+    )
+
+
+def _repack_pools_to_v2(
+    layout: dict, w13_words: torch.Tensor, w2_words: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked marlin -> v2 transposed repack of both weight pools."""
+    w13_t = torch.empty_like(w13_words)
+    w2_t = torch.empty_like(w2_words)
+    for lo in range(0, layout["num_experts"], _U2_CHUNK_EXPERTS):
+        hi = min(lo + _U2_CHUNK_EXPERTS, layout["num_experts"])
+        w13_t[lo:hi] = u2_packed_to_T(
+            w13_words[lo:hi], layout["n13"], layout["hidden"], layout["macro13"]
+        )
+        w2_t[lo:hi] = u2_packed_to_T(
+            w2_words[lo:hi], layout["hidden"], layout["inter"], layout["macro2"]
+        )
+    return w13_t, w2_t
+
+
+_V2_SELFTEST_DONE = False
+
+
+def _u2_v2_binding_selftest(
+    layer: torch.nn.Module,
+    w13_m: torch.Tensor,
+    w2_m: torch.Tensor,
+    w13_t: torch.Tensor,
+    w2_t: torch.Tensor,
+    s13: torch.Tensor,
+    s2: torch.Tensor,
+    layout: dict,
+) -> None:
+    """One-shot plumbing guard for the v2 word binding (U2B2).
+
+    Runs fused_marlin_moe twice on identical tiny inputs -- once on the
+    marlin-format words with u2_v2_words=False, once on the v2 words with
+    True -- and requires bit equality. If the flag fails to reach the GEMM
+    dispatch (a dropped kwarg on some call path, a new call site, ...), the
+    first call's marlin kernel reads the v2 words as marlin bytes and the
+    outputs diverge. That failure mode is silent garbage in serve, so it
+    must fail the boot instead.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        fused_marlin_moe,
+    )
+
+    device = w13_t.device
+    # M=1024 reproduces the production prefill metadata (both arms pick
+    # moe_block_size 32); tiny M sends the fused path through metadata whose
+    # uninitialized intermediates leak NaN into BOTH arms and would make the
+    # guard flaky.
+    m, top_k = 1024, layer.moe_runner_config.top_k
+    gen = torch.Generator(device="cpu").manual_seed(20261005)
+    h = (
+        torch.randn(m, layout["hidden"], generator=gen).to(
+            device=device, dtype=torch.float16
+        )
+        * 0.1
+    )
+    g = torch.randn(m, layout["num_experts"], generator=gen).to(
+        device=device, dtype=torch.float16
+    )
+    ti = torch.randint(
+        0, layout["num_experts"], (m, top_k), generator=gen, dtype=torch.int32
+    ).to(device)
+    tw = torch.rand(m, top_k, generator=gen).to(device=device, dtype=torch.float32)
+
+    def run(w1, w2, v2: bool):
+        return fused_marlin_moe(
+            hidden_states=h,
+            w1=w1,
+            w2=w2,
+            w1_scale=s13,
+            w2_scale=s2,
+            gating_output=g,
+            topk_weights=tw,
+            topk_ids=ti,
+            workspace=torch.zeros(4096, dtype=torch.int32, device=device),
+            num_bits=2,
+            activation=layer.moe_runner_config.activation,
+            is_gated=layout["is_gated"],
+            clamp_limit=(
+                layer.moe_runner_config.gemm1_clamp_limit
+                if layer.moe_runner_config.gemm1_alpha is not None
+                else layer.moe_runner_config.swiglu_limit
+            ),
+            gemm1_alpha=layer.moe_runner_config.gemm1_alpha,
+            u2_v2_words=v2,
+        )
+
+    y_ref = run(w13_m, w2_m, v2=False)
+    y_v2 = run(w13_t, w2_t, v2=True)
+    if not torch.isclose(
+        y_ref.float(), y_v2.float(), rtol=0, atol=0, equal_nan=True
+    ).all():
+        raise RuntimeError(
+            "SM70 u2 v2 binding self-test failed: fused_marlin_moe output "
+            "differs between the marlin-format and v2-transposed words; the "
+            "u2_v2_words flag is not reaching the GEMM dispatch, so the "
+            "marlin kernel would read the v2 bytes as silent garbage"
+        )
+    logger.info(
+        "SM70 u2 v2 binding self-test passed (layer %s, words=v2-transposed)",
+        layer.layer_id,
+    )
 
 
 _U2_CHUNK_EXPERTS = 16
@@ -499,7 +690,7 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
     Runs inside process_weights_after_loading, before any CUDA graph
     capture. Frees the host staging by rebinding the layer parameters.
     """
-    global _ANNOUNCED
+    global _ANNOUNCED, _V2_SELFTEST_DONE
 
     from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
 
@@ -507,6 +698,22 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
     layout = _layer_pool_layout(layer)
     pool_shapes = layout["pool_shapes"]
     device = layer.w13_weight_scale_2.device
+    # Boot-time contract: the env decides the on-GPU word layout (marlin vs
+    # v2 transposed); fused_marlin_moe reads the same env plus layer._u2_v2_words.
+    use_v2 = _u2_v2_layout_ok(layout) and envs.SGLANG_USE_SM70_U2_GEMM_V2.get()
+    if use_v2:
+        from sglang.kernels.ops.moe.sm70_u2_gemm_v2 import (
+            sm70_u2_gemm_v2_available,
+        )
+
+        # No fallback: marlin reading T-layout bytes is silent garbage, so a
+        # stale .so must fail the load instead of serving.
+        if not sm70_u2_gemm_v2_available():
+            raise RuntimeError(
+                "SGLANG_USE_SM70_U2_GEMM_V2 is set but the loaded "
+                "marlin_v100 .so does not register sm70_u2_gemm_v2; rebuild "
+                "it (scripts/setup_v100_marlin.sh) or unset the env"
+            )
 
     cache = _u2_cache_open()
     if cache is not None:
@@ -518,8 +725,27 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
             device=device,
         )
         if pools is not None and _u2_pool_layout_ok(pools, pool_shapes):
-            copy_or_rebind_param(layer, "w13_weight", pools["w13"])
-            copy_or_rebind_param(layer, "w2_weight", pools["w2"])
+            if use_v2:
+                w13_t, w2_t = _repack_pools_to_v2(layout, pools["w13"], pools["w2"])
+                if not _V2_SELFTEST_DONE:
+                    _u2_v2_binding_selftest(
+                        layer,
+                        pools["w13"],
+                        pools["w2"],
+                        w13_t,
+                        w2_t,
+                        pools["s13"],
+                        pools["s2"],
+                        layout,
+                    )
+                    _V2_SELFTEST_DONE = True
+                copy_or_rebind_param(layer, "w13_weight", w13_t)
+                copy_or_rebind_param(layer, "w2_weight", w2_t)
+                layer._u2_v2_words = True
+            else:
+                copy_or_rebind_param(layer, "w13_weight", pools["w13"])
+                copy_or_rebind_param(layer, "w2_weight", pools["w2"])
+                layer._u2_v2_words = False
             copy_or_rebind_param(layer, "w13_weight_scale", pools["s13"])
             copy_or_rebind_param(layer, "w2_weight_scale", pools["s2"])
             # The staged NVFP4 bytes are pure garbage on a hit; reclaim the
@@ -530,9 +756,10 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
                 _ANNOUNCED = True
                 logger.info(
                     "SM70 u2 expert pool: layer %s restored from persistent "
-                    "cache in %.2fs (hit)",
+                    "cache in %.2fs (hit, words=%s)",
                     layer.layer_id,
                     elapsed,
+                    "v2-transposed" if use_v2 else "marlin",
                 )
             else:
                 logger.debug(
@@ -613,8 +840,27 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
             pools={"w13": pool_w13, "w2": pool_w2, "s13": pool_s13, "s2": pool_s2},
         )
 
-    copy_or_rebind_param(layer, "w13_weight", pool_w13)
-    copy_or_rebind_param(layer, "w2_weight", pool_w2)
+    if use_v2:
+        w13_t, w2_t = _repack_pools_to_v2(layout, pool_w13, pool_w2)
+        if not _V2_SELFTEST_DONE:
+            _u2_v2_binding_selftest(
+                layer,
+                pool_w13,
+                pool_w2,
+                w13_t,
+                w2_t,
+                pool_s13,
+                pool_s2,
+                layout,
+            )
+            _V2_SELFTEST_DONE = True
+        copy_or_rebind_param(layer, "w13_weight", w13_t)
+        copy_or_rebind_param(layer, "w2_weight", w2_t)
+        layer._u2_v2_words = True
+    else:
+        copy_or_rebind_param(layer, "w13_weight", pool_w13)
+        copy_or_rebind_param(layer, "w2_weight", pool_w2)
+        layer._u2_v2_words = False
     copy_or_rebind_param(layer, "w13_weight_scale", pool_s13)
     copy_or_rebind_param(layer, "w2_weight_scale", pool_s2)
     # Last tensor references died with the rebinds; release the page cache
@@ -631,7 +877,7 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
         ) / 2**30
         logger.info(
             "SM70 u2 expert pool: requantized first layer (E=%d H=%d I=%d "
-            "g=%d macro=%d/%d, %.2f GiB/rank per layer) in %.2fs",
+            "g=%d macro=%d/%d, %.2f GiB/rank per layer, words=%s) in %.2fs",
             layout["num_experts"],
             layout["hidden"],
             layout["inter"],
@@ -639,6 +885,7 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
             layout["macro13"],
             layout["macro2"],
             pool_gib,
+            "v2-transposed" if use_v2 else "marlin",
             elapsed,
         )
     else:

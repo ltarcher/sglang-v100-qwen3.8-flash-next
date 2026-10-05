@@ -131,6 +131,17 @@ else
   export SGLANG_DSV41_SPILL_LANDING=0
   export SGLANG_SM70_U2_STAGE_DIR="${GLM53_U2_STAGE_DIR:-$HOME/.cache/sglang-glm53-u2-stage}"
   export SGLANG_SM70_U2_CACHE="${GLM53_U2_CACHE:-0}"
+  # U2B2 P5-b: bind the u2 pool to the v2 transposed-word GEMM (M>1: prefill
+  # chunks and the M=4 spec verify step; M=1 decode stays on marlin u2).
+  # Boot-time contract: flipping it changes which bytes the pool binds, so it
+  # needs a restart; boot fails hard if the installed marlin .so lacks the op
+  # (binding T bytes with the marlin kernel would read them as garbage).
+  # Measured A/B on the u2 dsa-mtp c1024 recipe, same boot, only this env
+  # flipped: 7936-token prefill x9 1343 -> 1490 tok/s (+10.9%), spec decode
+  # 68.2 -> 74.7 tok/s (+9.5%), accept 3.39 and needle 5/5 unchanged; the
+  # boot binding self-test (bit equality through fused_marlin_moe) gates all
+  # four ranks. Default 0 pending the production-compose re-validation.
+  export SGLANG_USE_SM70_U2_GEMM_V2="${SGLANG_USE_SM70_U2_GEMM_V2:-0}"
   mkdir -p "$SGLANG_SM70_U2_STAGE_DIR"
   SPEC=()
 fi

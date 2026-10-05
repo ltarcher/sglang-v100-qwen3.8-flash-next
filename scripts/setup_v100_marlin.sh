@@ -49,6 +49,11 @@ SM70_PATCHES=(
   # GLM-5.3 P4: uint2b2 resident-expert GEMM (pure addition; the dispatch
   # hook in ops.cu is inert until a caller passes ScalarType.uint(2, 2)).
   "$PATCH_DIR/marlin-v100-u2-experts.patch"
+  # GLM-5.3 P5-b U2B2: transposed-word u2 GEMM v2 (pure addition; registers
+  # op sm70_u2_gemm_v2, dispatched by fused_marlin_moe only under
+  # SGLANG_USE_SM70_U2_GEMM_V2 with u2_v2_words=True; marlin u2/u4b8/NVFP4
+  # paths untouched).
+  "$PATCH_DIR/marlin-v100-u2-gemm-v2.patch"
 )
 if [[ "${MARLIN_V100_SKIP_BF16_COMPAT:-0}" != 1 ]]; then
   SM70_PATCHES+=("$PATCH_DIR/marlin-v100-sm70.patch")
