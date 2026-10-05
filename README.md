@@ -357,6 +357,10 @@ Correctness gates, all passed: 24-prompt greedy top-1 identical to the triton ar
 
 Long context on the dsa mode (2026-10-03 ladder, same WIP-tree boots): sparse prefill stays flat with context — 32k 1,414 tok/s and 64k 1,531 tok/s (needle 5/5 both, decode flat ~23 tok/s), so the old full-attention "262k prefill = hours" extrapolation does not apply (linear extrapolation ≈ 3 min). The 262k rung is memory-bound, not perf-bound: the KV cell is 11.85 KB/token/rank (DSA latent + fp8 indexer keys), the 0.92 boot pools 112k tokens, mem-fraction 0.98 pools 195k with 0.57 GiB to spare and OOMs in the ~190k eager prefill attention workspace — 262k needs both a smaller KV cell (fp8 latent, quality-gated) or ~5% u2-pool trim, AND prefill-workspace headroom. Full record: `docs/v100/GLM53_FLASH_PLAN.md` G.9.
 
+### mHC fp16 TileLang prefill kernels (P5-b A step, 2026-10-05)
+
+GLM's 34 KDA layers each run an mHC pre/post block around the MoE; in torch eager that block cost ~4.2 ms per layer per 1k-token chunk (~150 ms of every 8k prefill). The A step ports the elementwise kernels to fp16 TileLang (the projection GEMM stays chunked cuBLAS fp32 — the sm70 TileLang MMA emitter has no fp32 operand form), enabled by default in `serve_glm53_flash_v100.sh` via `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=1`: ~7.6k prefill 1275-1300 → **1436-1454 tok/s** (+12%) on the u2 dsa-mtp c1024 recipe. Gates: 16-case torch-oracle suite (fp16 layer diff ≤9.8e-4 ≈ 1 ulp; the `hc_mult=3` sinkhorn is rewritten onto shared memory + a serial thread because the fragment AllReduce lowering needs power-of-two extents), needle 5/5, near-full-pool eviction regression clean, decode/accept unchanged. `chunked-prefill-size 2048` OOMs at mem-fraction 0.94 (Marlin's 128 MB `intermediate_cache13` transient vs 86 MiB free) and would cap at ~1570 tok/s anyway. Full record: `docs/v100/GLM53_FLASH_PLAN.md` appendix J.
+
 ### Reference recipe
 
 The wrapper is the supported entry. `target` (u2 pool, no speculation) is what the numbers above were measured on; `mtp` adds the NEXTN draft; `spill`/`spill-mtp` reproduce the pre-P4 shape for A/B.
@@ -374,7 +378,8 @@ Key knobs (the script header carries the full list):
 | `SGLANG_SM70_U2_STAGE_DIR` | `~/.cache/sglang-glm53-u2-stage` | Boot-time requant staging memmaps. MUST be real disk; tmpfs is host RAM |
 | `--mem-fraction-static` | 0.92 | 18.9 GiB expert pool + ~8 GiB dense/attention on a 32 GB card. The measured OOM chain on this engine is at boot/capture, not under load |
 | `--context-length` | 8192 | The validated ceiling. Raising it re-opens the KV/activation trade on the pool path; do not bump it and the mem fraction together on faith |
-| `--chunked-prefill-size` | 1024 | The benched configuration; larger chunks are untested on the pool path |
+| `--chunked-prefill-size` | 1024 | The benched configuration; larger chunks are untested on the pool path. 2048 OOMs at mem-fraction 0.94 (Marlin 128 MB transient) and would cap at ~1570 tok/s |
+| `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST` | 1 (set by the script) | fp16 TileLang mHC pre/post, +12% 8k prefill; unset falls back to torch |
 | `GLM53_U2_GROUP` | 128 | The tuned grid's group; 64/32 are kernel fallbacks and were measured worse per byte |
 
 ## What the port adds

@@ -1468,3 +1468,63 @@ boot 期 NVFP4→u2 requant ~22 min(31.3 s/层×42 层)是冷 boot 主导项。
   若 pid 被新容器复用,存活扫描按设计跳过不误删(L15 残件 672 文件 ~28G 因
   L16 pid 段重合未清;磁盘富余时可手动清)。
 - 层号无冲突:NEXTN draft `layer_id = num_hidden_layers`(45),目标 3-44。
+
+## 附录 J:P5-b A 步——mHC fp16 TileLang 移植(2026-10-05)
+
+目标:dsa-mtp c1024+expandable_segments 配方的 ~7.6k prefill 1275-1300 tok/s
+→ 1800-2000。A 步先攻 mHC(G.5 构成中仅次于 Marlin MoE 的确定性项)。
+
+### J.1 重定界:TileLang 只吃 elementwise,GEMM 留 cuBLAS
+
+sm70 TileLang MMA emitter(`gemm_mma_sm70.py`)不支持 fp32 操作数
+(`make_mma_load_layout` 抛 `Unsupported dtype float32`),故上游 splitk/simple
+两个 TileLang GEMM 内核在 V100 不可编译(DSV4.1-sm70 被钩子强制走 torch,从未
+暴露)。A 步实际形态:
+
+- **GEMM 段**(hc_mult3×hc_hidden 投影 + sqrsum):留 cuBLAS fp32,按 token
+  分 chunk(512)使 fp32 residual 拷贝保持 ~25MB,消掉整块 128MB 瞬态
+  (`_mhc_pre_gemm_sqrsum_torch_chunked`)。输入值与内核路径位级一致
+  (同一 fp16 存储 upcast),只差求和顺序。
+- **elementwise 段**(big_fuse / big_fuse_with_norm / mhc_post):fp16
+  TileLang。5 个内核加 `is_fp16: bool = False` 参数(io_t 参数化,bf16 产物不变)。
+
+### J.2 hc_mult=3 非 2 幂:sinkhorn 重写
+
+`T.reduce_max/reduce_sum` 的 fragment AllReduce butterfly lowering 要求 2 幂
+extent;GLM hc_mult=3(DSV4.1 是 4)编译即崩。修复:sinkhorn 分支改 shared
+memory + `get_thread_binding()==0` 单线程串行,数值上更贴 torch 顺序,对任意
+hc_mult 通用。`TileSync` 的 hoist 警告良性。TileLang python 局部变量 SSA 不可
+变,跨迭代累积必须写 buffer cell。
+
+### J.3 门与修复面
+
+- hook(`model_hook.py`)GLM-sm70 臂补 `SGLANG_OPT_DEEPGEMM_HC_PRENORM=False`
+  (V100 无 deep_gemm wheel;手设 TILELANG=1 原本会走进该分支 NameError);
+  日志条件化。DSV4.1-sm70 臂不动(仍 torch)。
+- oracle:`test_mhc_kernels.py` 新增 16 用例(bf16/fp16 × norm ×
+  {1,17,1024,4096},GLM 形状 hc_mult=3/hidden=4096),torch 直调
+  `_mhc_pre_torch/_mhc_post_torch`。fp16 layer 差 ≤9.8e-4(1 ulp 量级),
+  post/comb ≤3.6e-7;bf16 按 dtype 放宽到 6e-3(8 位尾数不同求和顺序的物理下限)。
+  既有 `test_mhc_fused_post_pre_matches_unfused` 的 20 failed 是 V100 存量红
+  (deep_gemm 缺失;git stash 对照证明与本次改动无关,H100 CI 才绿)。
+
+### J.4 实测(4×V100-32GB,u2 dsa-mtp c1024+es 配方,launch_p5b_mhc.sh)
+
+| 项 | torch mHC | fp16 TileLang |
+| --- | --- | --- |
+| 微基准/层 @n=1024(pre+post) | 4218 μs | 879 μs(−3339,×45 ≈ 150 ms/chunk 预期) |
+| ~7.6k prefill(clean bench ×3) | 1275-1300 tok/s | **1418/1444/1446 tok/s(+12%)** |
+| needle 5 深度(1300..25700) | — | 5/5 |
+| #34 形态回归(198k fill→5×20k 强制驱逐) | — | PASS(5/5 正确+needle 命中) |
+| decode / accept | — | 54.7 tok/s;accept 1.62-3.77(文本驱动,历史带内) |
+
+生产落地:serve 脚本默认 export `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=1`
+(可覆盖回 torch);hook 默认仍 torch,待镜像形态复测后再翻。
+
+### J.5 chunk 2048 判死与缺口
+
+c2048 boot 后首个请求 OOM:Marlin `intermediate_cache13` 申 128MB,mem-fraction
+0.94 下三卡 free 仅 86 MiB。且 c2048 即使能跑,chunk 税摊薄收益上限 ~1570
+tok/s,仍 < 1800。A 步后缺口 ~350 tok/s ≈ 130 ms/chunk > 100 ms 立项线,
+剩余最大单项 = Marlin MoE GEMM ~218 ms/chunk → B 步(TileLang u2 MoE GEMM)
+立项。

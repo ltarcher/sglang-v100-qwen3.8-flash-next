@@ -420,20 +420,23 @@ def handle_model_specific_adjustments(server_args: Any):
             get_platform().is_sm70
         ):
             # GLM-5.3 shares DeepSeek V4.1's mHC hyper-connections. The
-            # TileLang mhc_pre/mhc_post kernels are bf16-only (asserted), so
-            # Volta's fp16 path must use the torch implementation -- same
-            # defaults the V4 arm sets below, which GLM used to miss (it only
-            # worked when the env was hand-set at launch). The torch
-            # fallback's Sinkhorn section routes to the sm70 JIT kernel
-            # (SGLANG_SM70_MHC_SINKHORN_JIT, default on).
+            # kernels are fp16-capable now, but the Volta numbers are
+            # unvalidated, so the torch implementation stays the default
+            # (same defaults the V4 arm sets below, which GLM used to miss).
+            # Its Sinkhorn section routes to the sm70 JIT kernel
+            # (SGLANG_SM70_MHC_SINKHORN_JIT, default on). The DeepGEMM hc
+            # prenorm has no Volta build, and a hand-set TILELANG_MHC_PRE=1
+            # would otherwise walk into that branch and NameError.
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
-            logger.info(
-                "SM70 GLM: torch mHC fallback enabled "
-                "(SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=0)"
-            )
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+                logger.info(
+                    "SM70 GLM: torch mHC fallback enabled "
+                    "(SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=0)"
+                )
 
     elif model_arch in [
         "DeepseekV4ForCausalLM",

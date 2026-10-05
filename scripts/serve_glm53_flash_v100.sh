@@ -94,6 +94,14 @@ export SGLANG_MAMBA_CONV_DTYPE=float16
 export SGLANG_MAMBA_SSM_DTYPE=float16
 export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_SM70_QWEN_FUSIONS=1
+# P5-b A step: the mHC pre/post elementwise kernels run the fp16 TileLang
+# port. Measured on the u2 dsa-mtp c1024 recipe: ~7.6k prefill 1275-1300 ->
+# 1436-1454 tok/s (+12%), needle 5/5, near-full-pool eviction regression
+# clean, decode/accept unchanged. The projection GEMM stays chunked cuBLAS
+# fp32 -- the sm70 TileLang MMA emitter has no fp32 operand form. Unset
+# either var to fall back to the torch elementwise path.
+export SGLANG_OPT_USE_TILELANG_MHC_PRE="${SGLANG_OPT_USE_TILELANG_MHC_PRE:-1}"
+export SGLANG_OPT_USE_TILELANG_MHC_POST="${SGLANG_OPT_USE_TILELANG_MHC_POST:-1}"
 # Measured win: the allocator grows in place instead of defragmenting, which
 # the u2 boot needs (a ~19 GiB pool is carved out while capture tries to
 # reserve its workspace).
