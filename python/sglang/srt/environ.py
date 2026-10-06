@@ -619,6 +619,11 @@ class Envs:
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
+    # Finish a request whose generated tail is a periodic token loop (runaway
+    # repetition attractor) instead of letting it burn the context window; see
+    # managers/output_loop_detector.py. SGLANG_MAX_NEW_TOKENS_LIMIT only caps
+    # the blast radius — this is what actually stops the loop mid-flight.
+    SGLANG_ENABLE_OUTPUT_LOOP_BREAK = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.

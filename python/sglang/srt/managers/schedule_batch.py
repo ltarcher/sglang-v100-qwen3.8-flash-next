@@ -97,6 +97,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.output_loop_detector import detect_periodic_loop
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -323,6 +324,24 @@ class FINISH_ABORT(BaseFinishReason):
             "message": self.message,
             "status_code": self.status_code,
             "err_type": self.err_type,
+        }
+
+
+class FINISH_LOOP_DETECTED(BaseFinishReason):
+    def __init__(self, period: int, repeats: int, length: int):
+        super().__init__()
+        self.period = period
+        self.repeats = repeats
+        self.length = length
+
+    def to_json(self):
+        # "length" is the closest OpenAI concept (truncated output); the OpenAI
+        # finish_reason Literal has no loop notion, so the loop details only
+        # surface in native meta_info.
+        return {
+            "type": "length",
+            "length": self.length,
+            "loop_detected": {"period": self.period, "repeats": self.repeats},
         }
 
 
@@ -1922,6 +1941,24 @@ class Req(ReqDllmMixin):
         if self._check_token_based_finish(new_accepted_tokens):
             self._cap_finished_len_at_max_new_tokens()
             return
+
+        # ignore_eos requests (bench, raw-generation tooling) contractually want
+        # untrimmed output; a loop there is the caller's requested behavior.
+        if envs.SGLANG_ENABLE_OUTPUT_LOOP_BREAK.get() and not (
+            self.sampling_params.ignore_eos
+        ):
+            loop = detect_periodic_loop(self.output_ids)
+            if loop is not None:
+                period, repeats = loop
+                logger.warning(
+                    f"Periodic output loop (rid={self.rid}, period={period}, "
+                    f"repeats={repeats}, output_len={len(self.output_ids)}); "
+                    f"finishing the request."
+                )
+                self.finished_reason = FINISH_LOOP_DETECTED(
+                    period=period, repeats=repeats, length=len(self.output_ids)
+                )
+                return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
