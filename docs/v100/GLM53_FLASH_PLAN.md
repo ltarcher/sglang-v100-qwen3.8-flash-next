@@ -1966,3 +1966,30 @@ LIMIT**;needle 三深度(1300/13000/25700,~36k token 填充)3/3 HIT(~25s/趟,
 prefill ~1.4k tok/s 带内),真实长文零误杀。离线真实数据矩阵(本日逃逸 dump
 还原 token 喂检测器):逃逸 runaway (253, 24) 命中、旧窗口 None;已覆盖
 (29, 3) 新旧一致;干净输出两份 None。
+
+### K.15 工具调用泄漏修复:tool-call-parser 必须用 glm47(2026-10-06 晚七)
+
+**现象。** zcode 发"今天美股行情如何",回复只有一行原始
+`<tool_call>Skill<arg_key>...</arg_value></tool_call>` 文本然后结束:模型正常
+生成原生 tool-call 块并吐 EOS(finish=stop,引擎无异常),但服务端没配
+`--tool-call-parser`,整块漏进 content、`tool_calls=null`,agent 客户端无工具
+可执行直接终止。
+
+**根因是两层,第二层更隐蔽。** ①缺 flag;②GLM-5.3-Flash 的 chat template
+教的是【无换行】新格式(`<tool_call>name<arg_key>k</arg_key>...`,模板 50 行),
+而上游 `glm45` 注册名指向 GLM-4.5 时代 `Glm4MoeDetector`,正则
+`<tool_call>(.*?)(?:\\n|\n)(.*?)` 要求函数名后必须换行——与本模板【不】匹配,
+配了也解析不出。`glm47`(Glm47MoeDetector)的格式与本模板逐字一致,必须用它。
+
+**落位。** serve 脚本 + compose 加 `--tool-call-parser glm47`(运行期 flag,
+无需重建镜像,当前镜像已含该 detector)。**验证(4×V100 生产)**:reproduce
+先复现泄漏(tool_calls=null + content 原始块);修复后非流式
+`finish=tool_calls`、id/name/arguments 完整 JSON、content 干净;glm47 流式
+状态机对真实泄漏串离线解析正确;修复后全部请求 content 零泄漏。boot 干净
+(KV 230400、ERROR=0、WARNING 仅上游 DSV3.2 的 dsa/kv-dtype 提示——本引擎
+kv_cache_dtype=float16 正是 fork 验证配方,无需动作)。期间打断器又擒两例
+(period=4 cut@915、period=11 cut@10097)。
+
+**已知边界。** NVFP4 checkpoint 在该题上采样方差大:同题多轮出现 正常调用
+工具 / 幻觉一堆长工具名(runaway,已被打断器切)/ 直接拒答称无实时行情工具
+三种形态;后者是 checkpoint 行为,非引擎问题。

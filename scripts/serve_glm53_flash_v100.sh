@@ -201,6 +201,13 @@ args=(
   --trust-remote-code
   --model-path "$MODEL"
   --served-model-name glm53-flash-nvfp4
+  # GLM-5.3-Flash's chat template teaches the NEW no-newline tool-call format
+  # (<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>).
+  # Without this flag the raw block leaks into content and agent clients get
+  # no tool_calls field (2026-10-06 zcode incident); the glm45 key is the
+  # GLM-4.5-era detector whose regex requires a newline after the name and
+  # does NOT match this template -- glm47 is the exact-format detector.
+  --tool-call-parser glm47
   --dtype float16
   --quantization modelopt_fp4
   "${ATTN_ARGS[@]}"
