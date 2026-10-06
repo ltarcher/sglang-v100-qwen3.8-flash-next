@@ -1846,6 +1846,11 @@ class ColumnParallelBatchedLinear(nn.Module):
         setattr(self.weight, "weight_loader", self.weight_loader)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # The KDA fg_b pair is latency-sized but cuBLAS's strided-batched
+        # gemmSN already runs it in ~8us/layer on sm70; an offline bench on
+        # contiguous inputs measures a 5x slower kernel choice and a
+        # small_gemm rewrite netted +0.2ms/verify-window in production
+        # traces. Stay on torch.bmm.
         return torch.bmm(input, self.weight.transpose(-1, -2))
 
     def weight_loader(

@@ -1850,3 +1850,82 @@ sampling 判死不变(承诺分布论证与精度无关)。
 在被清零的支撑上重归一),非词汤病灶;未来做非 spec/rejection 部署时再议 fp32
 加固。**采样保真 oracle 入册**:/generate + return_logprob 的采样-token logprob
 分布相关性,一次请求即可证伪/证实"采样器坏了"类指控。
+
+### K.12 decode 杠杆4:skinny dense GEMM 收口(2026-10-06 深夜二;立项假设大半被生产证伪)
+
+**立项与修正。** #42 立项于 #37 解剖的 wmma 签名表:verify 窗 M≤8 GEMM 组
+(8,32,1)×112、(8,51,2)×34、(8,4,4)×42 疑似 WMMA tile 延迟税。离线 bench
+(scratch_r2/bench42_skinnny_dense.py,idle 4×V100,200 iter)两轮修正:①
+(8,32,1) 组(qkvbfg/o_proj 等)带宽饱和 ~814GB/s≈HBM2 地板,qkvbfg 1.11×、
+lm_head 1.16×,判死不接线;② 延迟主导小形状(sh gate_up 46→16.9us、shared_down
+57.7→7.6、dsa_kv_a 50.7→9.7、fg_b pair bmm 42.3→11.9)值得切 `sm70_small_gemm`
+(纯 FMA 行复用,权重单次读取)。
+
+**round1(已留):UnquantizedLinearMethod dispatch。** `_CONFIGS` 增 10 条 GLM
+M=4 形状;unquant.py/logits_processor 的既有 dispatch 拓扑自然承接。9 形状数值
+验证 rel err ≤4.5e-4,compose overlay 上生产。生产 trace 判决:o_proj 组
+`<4,128,32>` 59/窗×28.2us、shared gate_up `<4,512,32>` 42×23.9、shared_down
+`<4,128,16>` 42×13.9 全部生效;但 decode 门 75.9/78.0/77.8 vs 更早基线
+76.9-77.3 —— **带内,不可见**。
+
+**round2(一留一判死):trace 全量 diff 定案。** 生产两份 60 步 trace
+(1791266153 → 1791267441)按 kernel+grid 全量 diff:
+
+| 项 | 修前 ms/win | 修后 | 判决 |
+| --- | --- | --- | --- |
+| dense gate_up 形状修正 | 0.279 | 0.210 | **留**。`_CONFIGS` 死条目 (4,3072,4096) → 真实 (4,6144,4096)(checkpoint 全局 (12288,4096) TP4 合并),bench 68.4 vs 98.4us=1.44×,生产 3/窗×70us 生效 |
+| fg_b bmm dispatch | 0.271 | 0.471 | **判死回退**。生产净亏 +0.2ms/win |
+
+fg_b 判死机制(防重蹈,注释已固化进 linear.py):立项把 verify 窗签名
+`(8,51,2)`×34×74.9us 当成 fg_b bmm 的 WMMA 延迟税,**身份改判——它是
+`fused_qkvbfg_a_proj`(N=6416→51 tiles,z=2 splitK,52.6MB/75us≈700GB/s 带宽
+饱和,bench 判死正确的那一个)**。真 fg_b 的 cuBLAS 走 `gemmSN_TN` strided
+batched 仅 8us/层(0.271ms/win);离线 bench 的 42.3us 是 **contiguous 输入让
+cuBLAS heuristic 选了 5× 慢的 kernel**——生产调用点传 `transpose(0,1)` 非连续
+视图反而更快。small_gemm 2×(4.3 GEMM+2.6 contiguous 拷贝)=11.2us/层,净亏。
+离线 bench 的 cuBLAS 对照必须在**生产同布局**(含非连续)下测,否则 heuristic
+选型不可比。
+
+**总账与门。** #42 全部保留改动在生产 verify 窗净省 ~0.5-0.6ms(≈52ms 步长的
+1%),decode 门 76.9/78.0/78.0(带内持平),needle 5 深度×2 case 10/10,ruff
+过。trace 间 all_reduce 单项波动 ±1.8ms > 全部 #42 收益——**这一量级的 GPU 侧
+优化在 decode 门上原理性不可见**;decode 杠杆要 ≥2ms/win 起步才值得立项。
+compose overlay 仅剩 sm70_small_gemm.py(linear.py 与镜像仅差判死注释,已撤)。
+
+**遗留。** decode 杠杆只剩 #38(DSA/KDA decode 后端份额,锚点 DSA 8.6% +
+fp32 indexer sgemm 组 ~1.49ms/win);(8,8,4)×11×36.6us 与 (4,1,10)×22×16.8us
+两小簇未归因,量级 ~0.8ms/win,并入 #38 解剖一并看。
+
+### K.13 decode 杠杆2:DSA/KDA decode 份额核实与定点判死(2026-10-06 深夜三;decode kernel 收敛证明闭合)
+
+**方法。** 不新开引擎窗口:复用 #42 的两份 60 步 GPU trace + 一份新抓 CPU+GPU
+trace(/data/prof_38,engine 在跑时抓,非侵入),逐 kernel×grid 聚合,未归因簇
+用"候选 GEMM 单测对 grid 签名"(scratch_r2/bench38_dsa.py)钉族。
+
+**verify 窗 DSA+KDA 全家族账(12/窗 = 11 DSA 层 + 1 NEXTN;GPU busy ~52ms/win):**
+
+| ms/win | 份额 | kernel | 判决 |
+| --- | --- | --- | --- |
+| 4.103 | 63% | `main_kernel`(dsa tilelang verify 主核)342us×12 | **#40 判死维持**(流水线无效+内存无罪+17T 发射器地板,手写 CUDA 唯一路径) |
+| ~1.5 | 23% | indexer 链:mqa_logits 31.4us + wq_b 19.5us + wk_weights_proj 16.3us + weights_proj fp32 16us + topk/kpool 杂项 | 逐项判死,见下 |
+| 0.870 | 13% | `fused_sigmoid_gating_delta_rule_update`(KDA decode 主核)25.6us×34 | 判死:triton fused 已成型,25.6us/层无单点杠杆;#36/#39 相邻领域已判死 |
+| 0.838 | — | wmma align8 两簇 [8,8,4]×12、[4,1,10]×24 | 候选 = mhc_pre torch.mm / indexer wk 类;签名同族但归属未钉死,**逐项可收割 ≤0.2ms** |
+
+**indexer 链逐项判死依据(bench 生产同布局,200 iter):** wq_b (4,4096,1536)
+19.5us = 12.6MB/646GB/s 带宽地板;mqa_logits (fp16q×fp8k paged) 31.4us 是主算子
+本体;kda 侧 (4,160,4096) wk 7-10us(bench)vs 17us(生产 graph)差全在固定开销,
+省上限 0.13ms/win;weights_proj (4,32,128) fp32 16us 是 32KB 数据的纯延迟税,
+生产签名 volta_sgemm fp32(输入即 fp32,与 out_dtype fp16→fp32 版不同族),换小
+核上限 0.13ms/win 且动 fp32 语义。
+
+**判决。** 全部定点候选合计可收割 **<1ms/win(<2% 步长)**,低于 K.12 立项的
+2ms 门槛,单项无一 ≥0.5ms;唯一大项 main_kernel 已在 #40 判死。**#38 以"核实+
+判死"收口,不做定点改造。** 至此 decode kernel 杠杆线闭合:#37 解剖 → #39 不接
+线 → #40 判死 → #42 收益不可见 → #38 定点全判死。**本引擎形态(V100 SM70、
+dsa-mtp、M=4 verify)的 decode GPU 侧已无 ≥2ms/win 的 kernel 杠杆;下一级杠杆在
+算法侧(MTP accept 长度)或 prefill(命中 H2D 导入墙,K.6),不在 kernel。**
+
+**方法备注(复用 K.12 教训)。** CPU+GPU 混合 trace 的 cpu_op 父链对 CUDA graph
+内的 kernel 归因无效(async launch 错位,"no enclosing cpu_op" 是常态);graph
+内归因靠"kernel 序列相邻性 + 候选单测对 grid/签名族"两条腿,后者必须用生产同
+布局输入(K.12:contiguous 与否改变 cuBLAS heuristic 选型)。

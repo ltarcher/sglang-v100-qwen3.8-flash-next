@@ -29,6 +29,20 @@ _CONFIGS = {
     (4, 512, 2560): (256, 32),
     (2, 62080, 2560): (128, 32),
     (4, 62080, 2560): (128, 32),
+    # GLM-5.3-Flash TP4 verify (M=4) projections, best of 5 configs each on
+    # an idle 4x V100 bench (scratch_r2/bench42_skinnny_dense.py); rel err
+    # <= 4.5e-4 vs fp32 throughout. The KDA fused_qkvbfg (4, 6416, 4096)
+    # (1.11x) and lm_head (1.16x) shapes measured at the bandwidth floor on
+    # cuBLAS and deliberately stay there.
+    (4, 1024, 4096): (512, 32),  # shared experts gate_up
+    (4, 4096, 512): (128, 16),  # shared experts down
+    (4, 6144, 4096): (128, 32),  # first-3 dense MLP gate_up, 68.4 vs 98.4us cuBLAS
+    (4, 4096, 3072): (128, 32),  # first-3 dense MLP down
+    (4, 1536, 4096): (128, 32),  # DSA q_a
+    (4, 4096, 1536): (128, 32),  # DSA q_b
+    (4, 512, 4096): (256, 32),  # DSA kv_a
+    (4, 8192, 512): (128, 16),  # DSA kv_b
+    (4, 4096, 2048): (128, 32),  # KDA/DSA o_proj
 }
 
 
