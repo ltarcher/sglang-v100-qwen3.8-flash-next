@@ -1,0 +1,200 @@
+# GLM-5.3-Flash NVFP4 on 4x V100-32GB: u2 resident expert pool + NEXTN MTP
+# + DSA sparse attention, served from the unified image.
+#
+# Prerequisites:
+#   1. Build the image (docker/v100.Dockerfile via docker/v100-compose.yaml),
+#      or use the published sglang-v100-unified tag.
+#   2. `bash scripts/smoke_v100.sh` must pass BEFORE any serve: an image
+#      missing the sm70 Marlin kernels starts and answers normally with
+#      all-zero expert outputs. "It booted" is not evidence of correctness.
+#   3. Model checkout: modelopt NVFP4 safetensors (~182 GB), mounted ro.
+#   4. Stage dir on REAL disk (not tmpfs -- tmpfs is host RAM and defeats
+#      the point): boot-time u2 requant writes ~43 GB through it, and with
+#      SGLANG_SM70_U2_CACHE=1 the converted pools (~76 GB) persist there.
+#      It is exclusive with diagnostic containers that share it: a shared
+#      stage dir can evict the production cache key.
+#
+# Launch / verify:
+#   docker compose -f docker/v100-compose-glm53.yaml up -d
+#   docker compose -f docker/v100-compose-glm53.yaml logs -f        # boot ~6 min (u2 cache hit)
+#   curl -s http://127.0.0.1:8110/v1/models
+#   curl -s http://127.0.0.1:8110/health
+#
+# Parameter source of truth: scripts/serve_glm53_flash_v100.sh (mode
+# `dsa-mtp`). If a flag or env changes there, change it here too.
+# Single-stream is a recipe requirement, not a bug: at the 230k pool the
+# 8 mamba state slots (5 slots/request) hard-clamp concurrency to 1, and
+# the ~3 GB/rank boot headroom leaves no room to raise it.
+#
+# Non-DSA fallback: swap the four --dsa-* / --attention-backend flags back
+# to `--attention-backend triton` and drop SGLANG_DSA_FUSE_TOPK /
+# SGLANG_OPT_USE_TOPK_V2 (the pre-P5-a `mtp` mode).
+services:
+  sglang-v100:
+    image: sglang-v100-unified:latest
+    container_name: sglang-v100-glm53
+    restart: "no"
+    network_mode: bridge
+    ipc: host
+    environment:
+      # Comm: this box is PCIe-only 4x V100; without ALLOW_PCIE the custom
+      # all-reduce refuses to start and every small AR falls back to NCCL.
+      NCCL_P2P_LEVEL: PXB
+      SGLANG_CUSTOM_AR_ALLOW_PCIE: "1"
+      SGLANG_CUSTOM_ALLREDUCE_ALGO: 1stage
+      # Volta has no bf16: the mamba/linear-attention path runs fp16.
+      SGLANG_MAMBA_CONV_DTYPE: float16
+      SGLANG_MAMBA_SSM_DTYPE: float16
+      SGLANG_SM70_DENSE_GEMV: "1"
+      SGLANG_SM70_QWEN_FUSIONS: "1"
+      # u2 resident expert pool (~19 GiB/rank, requantized once at boot);
+      # SGLANG_DSV41_SPILL_LANDING=0 disables the spill-era landing path.
+      SGLANG_SM70_U2_EXPERT_POOL: "1"
+      SGLANG_DSV41_SPILL_LANDING: "0"
+      SGLANG_SM70_U2_STAGE_DIR: /data/glm53-u2-stage
+      SGLANG_SM70_U2_CACHE: "1"
+      # u2 pool binds the v2 transposed-word GEMM (prefill +10.9%, spec
+      # decode +9.5%). Flipping it changes which bytes the pool binds:
+      # restart required; boot fails hard if the marlin .so lacks the op.
+      SGLANG_USE_SM70_U2_GEMM_V2: "1"
+      # torch 2.9.1 only honors PYTORCH_CUDA_ALLOC_CONF (the
+      # PYTORCH_ALLOC_CONF spelling is silently ignored). Without
+      # expandable_segments the 42-layer u2 pool restore fragments
+      # +2.15 GB/rank and the KV pool is clamped 230400 -> 146176.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      TORCH_CUDA_ARCH_LIST: "7.0"
+      CUDAHOSTCXX: /usr/bin/g++-12
+      NVCC_PREPEND_FLAGS: -ccbin /usr/bin/g++-12
+      TRITON_CACHE_DIR: /data/glm53-u2-stage/triton
+      FLASHINFER_WORKSPACE_BASE: /data/glm53-u2-stage
+      SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: "0"
+      PYTHONFAULTHANDLER: "1"
+      HF_HUB_OFFLINE: "1"
+      # DSA sparse attention (P5-a): kpool decode must run the fused JIT
+      # topk; the folded topk-v2 plan has zero sm70 coverage -- keep it off
+      # to shrink the capture surface.
+      SGLANG_DSA_FUSE_TOPK: "1"
+      SGLANG_OPT_USE_TOPK_V2: "0"
+      # mHC pre/post elementwise kernels on the fp16 TileLang port (POST
+      # missing leaves prefill stuck on an 82 ms/step torch chain).
+      SGLANG_OPT_USE_TILELANG_MHC_PRE: "1"
+      SGLANG_OPT_USE_TILELANG_MHC_POST: "1"
+      # Runaway guards. LIMIT clamps max_new_tokens for ALL requests
+      # (client-passed values included); the loop breaker terminates a
+      # formed cycle: periodic token runs (period 4..2048, >=3 identical
+      # rounds) finish the request with type=length +
+      # loop_detected{period,repeats}. ignore_eos=True requests (bench
+      # contract) are exempt, so gates are unaffected.
+      SGLANG_MAX_NEW_TOKENS_LIMIT: "32768"
+      SGLANG_ENABLE_OUTPUT_LOOP_BREAK: "1"
+      SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD: "2048"
+    volumes:
+      # Adjust both host paths to this machine's layout.
+      - /data/models/GLM-5.3-Flash-NVFP4:/data/models/GLM-5.3-Flash-NVFP4:ro
+      - /data/glm53-u2-stage:/data/glm53-u2-stage
+      - sglang-v100-jit:/root/sglang-v100-jit
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ports:
+      - "8110:8100"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8100/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First boot (cold JIT + u2 requant) takes ~25-45 min; cache-hit boots
+      # take ~6 min.
+      start_period: 45m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["/opt/venv/bin/python", "-m", "sglang.launch_server"]
+    command:
+      # Thinking model (the template auto-prepends <|assistant|><think>):
+      # without the parser thinking text leaks into content.
+      - --reasoning-parser
+      - glm45
+      # GLM-5.3-Flash's chat template teaches the NEW no-newline tool-call
+      # format (<tool_call>name<arg_key>k</arg_key>...</tool_call>). Without
+      # this flag the raw block leaks into content and agent clients get no
+      # tool_calls field. glm45 is the GLM-4.5-era detector whose regex
+      # requires a newline after the name -- glm47 is the exact-format one.
+      - --tool-call-parser
+      - glm47
+      # Server-side sampling defaults, /generate (native) path ONLY.
+      # /v1/chat/completions ignores them; its defaults come from the
+      # model's generation_config.json (temperature 0.6 / top_p 0.95 /
+      # top_k 20 / repetition_penalty 1.05 -- fp16 Volta degrades at
+      # temperature 1.0 on real high-entropy content). Client-passed
+      # sampling params always win on both paths.
+      - --preferred-sampling-params
+      - '{"temperature": 0.6, "top_p": 0.95, "top_k": 20, "repetition_penalty": 1.05}'
+      - --log-requests
+      - --log-requests-level
+      - "1"
+      - --trust-remote-code
+      - --model-path
+      - /data/models/GLM-5.3-Flash-NVFP4
+      - --served-model-name
+      - glm53-flash-nvfp4
+      - --dtype
+      - float16
+      - --quantization
+      - modelopt_fp4
+      - --attention-backend
+      - dsa
+      - --dsa-prefill-backend
+      - tilelang
+      - --dsa-decode-backend
+      - tilelang
+      - --dsa-topk-backend
+      - sgl-kernel
+      - --tensor-parallel-size
+      - "4"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8100"
+      - --mem-fraction-static
+      - "0.94"
+      - --context-length
+      - "230400"
+      - --max-total-tokens
+      - "230400"
+      - --max-mamba-cache-size
+      - "8"
+      - --chunked-prefill-size
+      - "1024"
+      - --cuda-graph-max-bs-decode
+      - "4"
+      # u2 requant + capture can exceed the default watchdog on a cold boot.
+      - --watchdog-timeout
+      - "900"
+      # The 182 GB checkpoint streams through the page cache once; drop it
+      # after load to keep ~100+ GB of host RAM from staying dirty-resident.
+      - --weight-loader-drop-cache-after-load
+      - --speculative-algorithm
+      - NEXTN
+      - --speculative-num-steps
+      - "3"
+      - --speculative-eagle-topk
+      - "1"
+      - --speculative-num-draft-tokens
+      - "4"
+      - --enable-linear-replayssm-spec
+      # Single stream: the mamba slot budget (8 slots, 5/request) clamps
+      # concurrency to 1 at the 230k pool; raising this just logs a cap
+      # warning. See the header note for the concurrency trade.
+      - --max-running-requests
+      - "1"
+
+volumes:
+  sglang-v100-jit:
+    name: sglang-v100-jit
