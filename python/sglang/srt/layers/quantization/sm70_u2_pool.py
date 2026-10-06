@@ -469,6 +469,11 @@ def _u2_cache_fingerprint(model_path: str, tp_size: int) -> str:
     for name in sorted(os.listdir(model_path)):
         if not name.endswith((".safetensors", ".json")):
             continue
+        # Sampling-only configs cannot change the converted u2 bytes; hashing
+        # their mtime colds the cache on any generation_config.json edit, and a
+        # cold requant OOMs at 230k (fixed ~31.1GB staging footprint).
+        if name == "generation_config.json":
+            continue
         st = os.stat(os.path.join(model_path, name))
         h.update(f"{name}:{st.st_size}:{st.st_mtime_ns}\0".encode())
     return h.hexdigest()[:16]
