@@ -23,6 +23,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LOOP_DETECTED,
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
@@ -1348,6 +1349,16 @@ class SchedulerBatchResultProcessor:
                     rid=req.rid,
                     natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
                 )
+
+            # One count per request: the loop check runs on every TP rank, so
+            # without the stats-logging-rank gate sum() across ranks would
+            # multiply the true loop count by tp_size.
+            if (
+                isinstance(req.finished_reason, FINISH_LOOP_DETECTED)
+                and get_observability().enable_metrics
+                and self.metrics_reporter.is_stats_logging_rank
+            ):
+                self.metrics_collector.increment_output_loop_breaks()
 
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:

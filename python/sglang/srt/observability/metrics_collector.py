@@ -462,6 +462,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Output loop breaker
+        # =================================================================
+        self.num_output_loop_breaks_total = Counter(
+            name="sglang:num_output_loop_breaks_total",
+            documentation=(
+                "Requests finished by the periodic output-loop breaker "
+                "(SGLANG_ENABLE_OUTPUT_LOOP_BREAK)."
+            ),
+            labelnames=labels.keys(),
+        )
+
+        # =================================================================
         # Retract
         # =================================================================
         # TODO maybe remove this old gauge in favor of the new counter
@@ -1262,6 +1274,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_retracted_output_tokens_total.labels(**self.labels).inc(
             num_retracted_output_tokens
         )
+
+    def increment_output_loop_breaks(self) -> None:
+        self.num_output_loop_breaks_total.labels(**self.labels).inc(1)
 
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
