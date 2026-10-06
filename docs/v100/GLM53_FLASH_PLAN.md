@@ -971,6 +971,34 @@ Boot 配方按上方逐项执行,两 rung 一次落位无 OOM。池实测:212,99
 - top-8 24/24 fp16 基线探针本轮未复跑(P5-a 已验;本轮以 per-rung needle
   为门)。
 
+**fp16 230k 生产落位(2026-10-06,生产 compose,镜像 sglang-v100-unified)**
+
+P5-b 全部 prefill 杠杆(mhc TileLang pre/post + u2 gemm v2 + MHC GEMM fp16)
+加上表 L34/L35 落位配方后的生产复测;容器统一镜像,无活树挂载。
+
+- 落位:`--context-length 230400 --max-total-tokens 230400`、
+  `--chunked-prefill-size 1024`、`--mem-fraction-static 0.94`、
+  `--max-mamba-cache-size 8`、`--max-running-requests 1`(mamba 8 槽
+  ×5 槽/请求本就硬钳并发 1,显式写 1 只是消 cap 告警);boot(u2 缓存命中)
+  约 6 min,load 23.87 GB、池 2.86+0.25 GB、池后 avail 3.07 GB、收尾
+  available_gpu_mem 3.00 GB,230400 满额无钳制、无 OOM(212992 备档未用)。
+- 三门(prefill clean bench 7936×9;decode e2e 128+512 单流;needle 5 深度
+  1300..25700):prefill 稳态 **1740–1746**(中位 1745,首跑 1686 为 JIT
+  暖机;带内含 mhc A/B 的 1747–1749,门 1750 在 ±0.3% 噪声内)、
+  decode **76.9 / 77.2 / 77.3 tok/s**(accept 3.13–3.50;高于 u2v2b 参照
+  74.7)、needle **5/5** 魔数逐案命中。
+- 排障记录(1.5 h):首两次 boot 池被 profile 钳到 146176(load 26.02 GB
+  vs 正常 23.87)。逐层排除:context 230400 无罪(旧镜像+同代码 boot 满
+  额)、代码提交无罪(u2v2b 二次 boot 已含全部提交仍 23.87)、镜像构件无罪
+  (两镜像 CUDA base/pip/sgl-kernel md5/turbomind md5/marlin cuobjdump
+  内核清单全部等价)。终因 = compose 写了 `PYTORCH_ALLOC_CONF`,torch
+  2.9.1 实测不认该名字(c10 AllocatorConfig.h 注释声称它是主变量,与实现
+  不符;`memory_snapshot` is_expandable 实证 False/True)→
+  expandable_segments 静默关闭 → 42 层 u2 池恢复逐层暂存碎片化
+  +2.15 GB/rank → 池被钳。改名 `PYTORCH_CUDA_ALLOC_CONF` 后一次落位;
+  serve_glm53_flash_v100.sh 同步修正(该脚本同 trap,注释一直声称的
+  "u2 boot 需要"此前实际未生效,靠各 launch 脚本手传正确名兜底)。
+
 **DFlash(draft = `/data/models/GLM-5.3-Flash-DFlash`,2.6 GB)**
 
 6 层 qwen3 型 sliding-window(4096)小模型,block-8 块扩散并行提案,EAGLE 式读
@@ -1615,3 +1643,210 @@ P5-b 总账还剩:DSA round-2(~0.25 s/chunk)、MoE epilogue 融合(~0.15 s)。
 decode 杠杆:#37 spec-step 残余解剖、#38 DSA/KDA decode 份额、#39 v2
 small-M(M=1/2/4;现门控 M>1,decode M=1 留 marlin,内核已具备扩展面)。
 serve 脚本默认仍 0,A/B 与质量门已全过,翻默认待生产 compose 复测定案。
+
+### K.7 生产采样参数通路修复 + u2 缓存指纹事故(2026-10-06 晚)
+
+**重复输出第四次复发与真正根因。** 第三次 runaway 现场实锤:6.4k prompt 的 chat
+请求在生成 ~2k token 后 accept len 恒 4.00、accept rate 恒 1.00(80-82 tok/s)锁死
+5 分钟以上——temp 1.0/top_p 0.95 采样下不可能,除非 logits 进入 one-hot 不动点且
+**惩罚根本没在作用**。代码定案:`ChatCompletionRequest.to_sampling_params` 的
+`get_param()` 在 tokenizer_manager 的 `{**preferred, **client}` 合并**之前**就把
+client 未传字段填上默认值(repetition_penalty 回退 `_DEFAULT_SAMPLING_PARAMS`
+= 1.0),所以 `--preferred-sampling-params` 对 `/v1/chat/completions` 是死代码;
+昨晚"注入后 needle 5/5"验证的是 preferred 只在 native /generate 生效的那半边,
+chat 通路从未被验证(server_info 回读只证明"存了"不证明"应用了")。
+
+**修复(生产已落位)。** `sampling_defaults=model`(默认开)下,chat 路径默认采样
+由模型工件 `generation_config.json` 承载:`get_param()` 的回退层正是取它。工件加
+`"repetition_penalty": 1.05`(temperature 1.0/top_p 0.95 本已在)。验证用
+`--log-requests --log-requests-level 1`(记 sampling_params、不记文本):chat 无参
+请求 rep=1.05、chat 显式 1.0 → rep=1.0(client 最优先)、native 无参 → rep=1.05,
+三通路逐行实证。惩罚语义:只罚已生成 token、每 token 恒定 /1.05(非累乘)——
+是"扰动成环早期"的预防档,对已锁死不动点打不破;真兜底仍是客户端 max_tokens。
+
+**u2 缓存指纹事故(改工件引发,已闭合)。** 改 generation_config.json 触发
+`_u2_cache_fingerprint`(全目录 .json 的 name:size:mtime_ns)变化 → cache cold,
+而**本镜像冷 requant 在 230k 下必 OOM**:`convert_moe_layer_to_u2` 固定足迹
+~31.12GB,0.94 与 0.88 mem-fraction 两轮实证同值同 128MiB 缺口(KV 池 profile
+在 requant 之后,降档无用);历史 230k boot 全是缓存命中,10-04 的冷 boot 是旧版
+镜像(已被覆盖)在 8k 上下文下完成的。当前镜像**无法在位重建缓存**。解法:指纹
+函数跳过 generation_config.json(采样配置不影响 u2 字节),本地逐字节复算新指纹
+679d4588ac1e008b(先以现状指纹 0ad72eca 与 boot 日志比对验证复算函数一致),缓存
+目录 `mv` 改名到新指纹 → 缓存命中恢复。生产 compose 以单文件 bind-mount 挂补丁
+副本(`sglang-glm53-cache/u2_fp_fix/sm70_u2_pool.py`),同补丁进 fork 源码,下次
+镜像重建后 mount 可撤。boot 285s、池 230400 满额。教训:普通 `cp` 备份不保 mtime;
+缓存/staging 文件是容器 root 属主,清理需一次性容器。
+
+**质量门。** needle 5 深度:native 贪心 5/5(与 10-06 早一致);chat 形态(生产默认
+temp 1.0/0.95/1.05)深度 1300-19500 全 HIT、25700 单次 MISS 复测 3/3 命中 = temp
+1.0 采样噪声而非惩罚伤害。chat 探针注意:思考段吃 max_tokens 预算(实测 ~500
+token/短问),64 预算下 content 恒空,不是回归。
+
+### K.8 "输出全是英文乱码"定案:fp16 尾部采样退化(2026-10-06 晚二;根因已被 K.11 改判)
+
+**现象与定性。** 用户长文档(22.7k token)chat 请求输出多语言 BPE 词汤,思考段
+从第一 token 就乱(19391 token 全在 think 内,从未出 `</think>`);draft accept 锁
+~1.05、直方图 95% 验证步 0 命中 = token 近随机。客户端把乱码收进历史重试
+(prompt 22752→42418 ≈ 上轮 + 上轮输出),故"每轮都乱"。**引擎前向完全健康**:
+native `/generate` greedy @65k 真实内容完全连贯(KV/注意力/MoE/logits 全对)。
+
+**定位过程(对照矩阵)。** K.7 的 needle 全 HIT 但那是低多样性填充——本故障与
+长度无关(20k 就乱 vs 填充 202k 连贯)、与 rep 1.05 无关(显式 rep=1.0 照乱)、
+与特殊 token 注入无关(P5 prompt 里 0 个标记串)。决定性梯度来自温度/尾部扫描:
+**temp 0.6/top_p 0.95 完全连贯 → 0.7 幻觉漂移 → 1.0/top_p 0.5 尚可 → 1.0/0.95
+(默认)乱码 → 1.0/1.0 纯词汤**;低多样性内容(needle 填充/base64 57k/模板日志
+202k)在任意配置下都不受伤 = 尖峰分布尾部无质量,采样不受伤。
+
+**根因。** `sampler.py` 的 `logits[:] = torch.softmax(logits, dim=-1)` 在 fp16 上
+直接做(V100 机器强制 fp16),flashinfer `top_k_top_p_sampling_from_probs` 吃 fp16
+probs:151k 词表上平坦分布的尾部概率 ~1e-5 落进 fp16 次正常区(最小正常数
+6.1e-5)/深度量化,top_p 从被量化的尾部抽 token → 词汤。上游 bf16 尾数位同样
+8 位但下溢界限 1e-38,无此问题——**V100 专属退化**。chat greedy @65k 退化成
+结构化循环(思考段 greedy 吸引子)是另一张脸:同一采样动力学在尖峰分布下表现为
+K.7 的 one-hot 重复、在平坦分布下表现为词汤。spec verify 路径(fp16 probs + temp>0)
+的同类风险未查。
+
+**修法(生产已落位)。** generation_config.json temperature 1.0 → **0.6**
+(Zhipu GLM 官方 chat 推荐配方 0.6/0.95;实测 20k/43k/65k 真实内容全连贯、accept
+回 1.8-2.5);native 侧 `--preferred-sampling-params` 同步 0.6 对齐——所有
+bench/门脚本均显式传参(decode 门 greedy、needle 门 temp 0),不受影响。改
+generation_config 零成本(K.7 指纹修复已排除该文件),重启一次生效。客户端显式
+传参永远最优先。排查口诀:accept 指纹三态——~4.0 锁死 = one-hot 重复(K.7)、
+~1.05 = 随机词汤(本节)、2-3.9 = 正常文本;先 native greedy 定前向,再温度扫描
+定采样,再长度/多样性阶梯定触发域。
+
+**修后门(boot ~348s、池 230400 满额)。** ① 日志实证 chat 无参 sampling_params =
+temperature 0.6 / top_p 0.95 / repetition_penalty 1.05;② needle 5 深度 native
+贪心有效 5/5——25.7k 档单次 MISS 复测 3/3,该档存在 ~1/3 内核近平局抖动(temp 0
+下同请求输出措辞也会漂),与 rep 无关(显式 rep=1.0 同样 3/3)、与重启无关,
+与 K.7 chat 形态 25.7k 的单次 MISS 同性质;③ 65k 真实内容 chat 纯默认通路连贯且
+总结准确。boot 期 transformers warning "generation flags not valid: ['temperature',
+'top_p']" 已核实为虚惊:`GenerationConfig.from_pretrained` 后字段全在
+(0.6/0.95/1.05),警告来自 `_from_model_config` 校验提示语,不丢字段;旁证是故障日
+Receive 行 top_p 0.95 本就来自该文件(protocol 裸默认是 1.0)。native `/generate`
+裸短 prompt 续写(无 chat 模板)在低温度下复读吸引子属 raw 路径固有行为,与 chat
+无关。根因侧修复原立项 #48,后经 K.11 采样链路审计**改判结案**(fp16 叙事被证伪,
+零代码改动),本节保留对照矩阵与修法作为工作记录。
+
+### K.9 第四次 runaway 收口:fp16 饱和锁死定案 + 硬护栏 + rejection sampling 判死(2026-10-06 晚三)
+
+**现象。** temp 0.6 修法落位后数小时,用户再报"重复输出"。取证(`--log-requests
+level 1` 首次实战):runaway 请求 Receive 行 `temperature 0.6 / top_p 0.95 /
+repetition_penalty 1.05` 三值全对——词汤修法在按设计工作;accept 分布锁
+3.83-3.85、早期 15 窗口精确 4.00/1.00,42k+ token 零逃逸,烧 7 分钟只能 abort。
+定性:老 runaway(one-hot attractor),非词汤复发(词汤指纹是 ~1.05/95% 零命中)。
+
+**锁死真机制(代码级定案;浮点归因经 K.11 修正)。** verify 路径(temp 0.6 非贪心)
+= JIT `tree_speculative_sampling_target_only`(speculative/sampling.cuh)逐位从带
+惩罚的目标分布采样、draft 匹配则接受,即精确链采样;threshold_single/acc 默认
+1.0/1.0 = no-op。one-hot attractor 深处,gap/T 上 softmax 输出的次要概率质量
+1-p 跌破浮点分辨率 → p(重复 token) **舍入为恰好 1.0** → 链采样与拒绝采样的逃逸
+概率双双精确归零 → 永久锁死(指纹 = 精确 4.00/1.00 多窗口零逃逸)。门槛由输出
+精度决定:fp16 需 gap/T>7.6、fp32 需 gap/T>16.6——attractor 深处 gap 数十 nats,
+**两者都精确锁死,fp32 化救不了逃逸**(原"#48 恢复 ~1e-5/位逃逸"的说法不成立,
+见 K.11);温度 0.6 把 gap 放大 1.67×,只改锁死门槛不改锁死本身。
+
+**rejection sampling 两理由分账(用户批准跳过 A/B,记档结案)。** ① runaway
+理由判死:当前 verify 已是目标分布精确链采样,拒绝采样(Leviathan)承诺分布与之
+相同,锁死动力学分毫不差,预期只有 accept 损失(draft 从 q=softmax(logits/T)
+随机提案 vs 现在 argmax 链)。② 真实内容吞吐理由仍悬置且机制成立:draft 贪心
+argmax 提案 vs 按温采样 verify 失配是高熵内容 accept 1.0-2.4 的直接原因,q≈p 时
+提案-验证匹配率应升;代价预测 = 低熵/bench 内容 accept 从 3.8 回落。topk=1 已
+满足,单 flag 单趟 boot 可测,留作独立立项。
+
+**硬护栏(生产已落位)。** compose `SGLANG_MAX_NEW_TOKENS_LIMIT: "32768"`
+(fork 现成机制:environ.py `EnvInt(None)`,scheduler `init_req_max_new_tokens`
+钳**所有**请求含客户端显式传参,触发打 warning 留痕)。起因是第四次 runaway 的
+客户端 `max_new_tokens: None`(引擎内按 1<<30 无限)。客户端 <32768 不受影响;
+bench/门脚本全显式传参不受影响;262k 全文续写线(#29)做 >32k 长输出时需临时调高。
+重启后需验证:超限请求日志出现 capping warning + 正常请求与 accept 不受影响。
+
+**runaway 处置总账(四次)。** 引擎侧:repetition_penalty 1.05 是预防档非解药
+(恒定 /1.05 打不破深 attractor)、rejection sampling 判死、锁死不受浮点精度影响
+(K.11:fp16/fp32 在深 attractor 下都精确锁死);真正的护栏 = 引擎侧循环打断器
+(K.10,真解)+ 客户端 max_tokens + 服务端 SGLANG_MAX_NEW_TOKENS_LIMIT + abort。
+模型侧:思考模板自动 `<think>` 生成从思考段内部开始,长生成不吐 EOS 是吸引子
+行为,`--reasoning-parser glm45` 只是显示隔离。
+
+### K.10 输出循环打断器(2026-10-06 晚四):runaway 真解落位,上线首日即擒两例
+
+**动机。** K.9 收口时确认 LIMIT 只是止损上限,唯一能打断已形成循环的是引擎侧
+检测器;用户批准立项。
+
+**实现(fork 树,env 默认关)。** `managers/output_loop_detector.py`
+`detect_periodic_loop`:输出尾部滑窗,周期 ∈[4,32]、连续 ≥3 轮全同 → 返回
+(period, repeats);短周期有意排除(标点串是合法输出)。`Req.update_finish_state`
+集成(env `SGLANG_ENABLE_OUTPUT_LOOP_BREAK`,默认 False;**ignore_eos=True 豁免**
+——bench/原始生成工具的契约就是不裁剪),置于 token finish 之后、length cap 之前
+(loop 比 length 更具体)。新 `FINISH_LOOP_DETECTED`:to_json = `type=length` +
+`loop_detected{period,repeats}`(OpenAI finish_reason Literal 无 loop 概念,native
+meta_info 可见细节)。每步成本 O(Σp)≈1.5k 次整数比较,单流可忽略。单测 9 例
+(`test/registered/unit/managers/test_output_loop_detector.py`)全绿,含 env 关/
+ignore_eos 豁免/长度帽次序。
+
+**生产落位。** 镜像早于该功能,走 u2_fp_fix 同款单文件 overlay:environ.py /
+schedule_batch.py / output_loop_detector.py 三文件 bind-mount(diff 核对 = 镜像版
++ 功能改动、零其他漂移),下次镜像重建吸收。compose env 开 + 注释。
+
+**验证(4×V100,dsa-mtp 230k)。** ① 合成触发:greedy 重复短语,period 9、
+cut@29 token,四 TP warning,meta 契约正确;② **上线 3 分钟内真实请求两连擒**:
+innocuous 短问题在思考段 runaway,检测器 17s 即打断(period 15、repeats 3、
+cut@636;旧行为烧 32768/~7 分钟);另一例短周期锁死(accept 4.00)被客户端超时
+abort,未触发 warning——**周期 <4 的锁死检测器有意不覆盖**,由 LIMIT 兜底,若
+频率高再议 p∈{2,3} + min_repeats 6 档;③ needle 5 深度 5/5(真实内容零误杀);
+④ decode 门 128+512:512 满额、75.4 tok/s(门 74)、accept 3.13 带内、零误截断。
+boot 两次 ~350-660s,池满额路径不变。
+
+**已知边界。** ① 打断发生在思考段时,reasoning parser 看不到 `</think>`,客户端
+看到 content 空 + reasoning 截断 + finish_reason=length(诚实行为,客户端可感知
+被截);② p=1..3 循环不覆盖(LIMIT 兜底);③ 误杀面 = 合法文本中 ≥3 轮全同的
+4-32 token 块(歌词/列表可能),参数在 detect_periodic_loop 默认值处可调。
+
+### K.11 词汤根因改判:temp 1.0 是真实宽分布,采样链路 fp32 干净(2026-10-06 深夜)
+
+**审计起因。** #48(采样路径 fp32 化)落地前代码勘察推翻了 K.8 的根因叙事,三路
+证据(代码级/定量级/实证级)一致,用户批准改判结案、零代码改动,生产维持 0.6。
+
+**证据一:生产 token 路径根本没有 fp16 softmax。** 生产 dsa-mtp 的可见 token 全部
+出自 `eagle_sample`(eagle_worker_common.py),不走 `sampler.py`;其
+`next_token_logits / expanded_temperature` 中 temperatures 在
+`SamplingBatchInfo.from_schedule_batch` 固定 `dtype=torch.float`(fp32)→ fp16
+logits 除 fp32 温度**类型提升为 fp32** → softmax 出 fp32 target_probs。铁证 =
+JIT kernel `kernels/jit/csrc/speculative/sampling.cuh` 的 TensorMatcher 强制
+`target_probs/draft_probs` 为 float32(不匹配直接抛错),生产百万 token 正常运行
+即 fp32 提升确实发生。`sampler.py` 的 fp16 softmax 只在 **spec 关闭**时承接
+token(两个生产引擎都开 spec);`spec_utils` 的 draft 侧 fp16 softmax
+(renorm_draft_probs/sample_draft_proposal)只在 rejection sampling 下用(生产
+关)。flashinfer sm70 patch 的 sampling hunk 只是 cub reduce 兼容 shim,dtype 无关。
+
+**证据二:定量上 fp16 softmax 即使在路径上也造不成词汤。** fp16 softmax 写出只会
+把 logit-gap >16.6 nats(p<6e-8)的极尾质量清零——这些 token 在任何温度下本来就
+几乎不会被抽到;它不能把概率质量搬给垃圾 token。词汤需要垃圾 token 有真实的中等
+概率,浮点量化给不了。
+
+**证据三:return_logprob 探针(采样保真 oracle)。** 方法:/generate 真实代码内容
+~45k token、temp 1.0、return_logprob+top_logprobs,统计**被采样 token 自身的
+logprob 分布**——若采样器越界抽尾/分布塌缩,会大量出现 ≈ log(1/151936)=-11.9 的
+token;若采样器忠实,分布应集中在中高概率区。三发结果:top_p 1.0 两发 =
+med -1.59/-2.19、82+/128 落 [-3,0)、仅 0-2/128 近 -11.9;top_p 0.95(事故同配置)
+= med -2.19、min -8.32、0 个 token 低于 -9,输出流畅但虚构(编造不存在的代码
+总结)。**采样器统计上忠实于模型报告的分布;垃圾 token 出现时携带真实概率 = 模型
+在 temp 1.0 下真给了它们质量。**
+
+**改判。** temp 1.0 词汤 = 思考模型在高熵真实内容上真实且平坦的多语言宽分布,
+不是采样退化。K.8 全部对照矩阵在"真实宽分布"解释下同样成立且更自洽:低多样性
+内容 = 尖峰分布无垃圾质量 = 任意温度不伤;top_p 0.5 裁尾所以尚可;0.6 收窄所以
+连贯(恰为 Zhipu 官方推荐配方)。生产默认 0.6 维持,无任何代码要改。accept 锁
+~1.05 的指纹也归位:greedy draft 提案 vs 宽目标分布失配(K.9 分账的吞吐理由),
+非采样器故障。
+
+**K.9 连带修正。** 锁死不需要 fp16:fp32 softmax 在 gap/T>16.6 时 1-p<6e-8 同样
+舍入为精确 1.0(fp16 门槛 gap/T>7.6),attractor 深处都锁死——"#48 fp32 化恢复
+逃逸"不成立,runaway 防线维持 K.10 循环打断器 + LIMIT + abort。rejection
+sampling 判死不变(承诺分布论证与精度无关)。
+
+**遗留档案(用户批准不做)。** sampler.py 标准 path 与 spec_utils rejection 路径
+的 fp16 softmax 位点 = 已知休眠,量化影响 = 低温档支撑集截断(top_k/top_p renorm
+在被清零的支撑上重归一),非词汤病灶;未来做非 spec/rejection 部署时再议 fp32
+加固。**采样保真 oracle 入册**:/generate + return_logprob 的采样-token logprob
+分布相关性,一次请求即可证伪/证实"采样器坏了"类指控。

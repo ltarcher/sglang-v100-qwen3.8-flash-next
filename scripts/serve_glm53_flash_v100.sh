@@ -94,6 +94,19 @@ export SGLANG_MAMBA_CONV_DTYPE=float16
 export SGLANG_MAMBA_SSM_DTYPE=float16
 export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_SM70_QWEN_FUSIONS=1
+# Runaway guards (2026-10-06, four runaway incidents that burned up to 42k+
+# tokens / 7 min each before abort). LIMIT clamps max_new_tokens for ALL
+# requests (client-passed values included, with a capping warning); the loop
+# breaker actually terminates a formed cycle: output-tail periodic runs
+# (period 4-32 tokens, >=3 identical rounds) finish the request with
+# type=length + loop_detected{period,repeats}. ignore_eos=True requests
+# (bench contract) are exempt, so gates are unaffected; needle/decode gates
+# re-verified clean after enabling (5/5; 75.4 tok/s vs gate 74). First day in
+# production it caught a real think-section runaway in 17 s (period 15,
+# cut@636). See docs/v100/GLM53_FLASH_PLAN.md K.9/K.10 and the unit test
+# test/registered/unit/managers/test_output_loop_detector.py.
+export SGLANG_MAX_NEW_TOKENS_LIMIT="${SGLANG_MAX_NEW_TOKENS_LIMIT:-32768}"
+export SGLANG_ENABLE_OUTPUT_LOOP_BREAK="${SGLANG_ENABLE_OUTPUT_LOOP_BREAK:-1}"
 # P5-b A step: the mHC pre/post elementwise kernels run the fp16 TileLang
 # port. Measured on the u2 dsa-mtp c1024 recipe: ~7.6k prefill 1275-1300 ->
 # 1436-1454 tok/s (+12%), needle 5/5, near-full-pool eviction regression
@@ -104,8 +117,12 @@ export SGLANG_OPT_USE_TILELANG_MHC_PRE="${SGLANG_OPT_USE_TILELANG_MHC_PRE:-1}"
 export SGLANG_OPT_USE_TILELANG_MHC_POST="${SGLANG_OPT_USE_TILELANG_MHC_POST:-1}"
 # Measured win: the allocator grows in place instead of defragmenting, which
 # the u2 boot needs (a ~19 GiB pool is carved out while capture tries to
-# reserve its workspace).
-export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+# reserve its workspace). torch 2.9.1 only honors PYTORCH_CUDA_ALLOC_CONF --
+# the PYTORCH_ALLOC_CONF name (which c10/core/AllocatorConfig.h documents as
+# the primary variable) is silently ignored in practice (memory_snapshot
+# reports is_expandable False), and without it the 42-layer u2 pool restore
+# fragments +2.15 GB/rank, clamping a 230400-token KV pool to 146176.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONFAULTHANDLER=1
 export FLASHINFER_WORKSPACE_BASE="${GLM53_U2_STAGE_DIR:-$HOME/.cache/sglang-glm53-jit}"
 export TRITON_CACHE_DIR="$FLASHINFER_WORKSPACE_BASE/triton"
@@ -188,9 +205,12 @@ args=(
   # this further starves capture, lowering it shrinks the KV pool for
   # nothing. Change together with GLM53_CONTEXT.
   --mem-fraction-static "${GLM53_MEM_FRACTION:-0.92}"
-  # 8192 is the largest context the P4 boots validated (probe boot matrix).
-  # Raising it needs the KV-pool/activation trade re-measured on the pool
-  # path; do not bump this and the mem fraction together on faith.
+  # 8192 is the P4-era default. The fp16-KV long-context recipe validated on
+  # the pool path (2026-10-05/06) is --context-length 230400 together with
+  # --max-total-tokens 230400, --max-mamba-cache-size 8 and
+  # --mem-fraction-static 0.94 (212992 if 230400 OOMs at boot/capture); the
+  # production compose pins that set. Do not bump context and mem fraction
+  # together on faith -- the OOM chain shows up at boot/capture, not load.
   --context-length "${GLM53_CONTEXT:-8192}"
   # P4 benches used 1024. GLM's routed-expert gather is per-chunk on the
   # spill path and the prefill wall grows with position either way; larger
