@@ -122,6 +122,22 @@ _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
 
+def append_chat_system_suffix(messages: list[dict[str, Any]], suffix: str) -> None:
+    """Fold SGLANG_CHAT_SYSTEM_SUFFIX into the messages in place: appended to
+    the first string-content system/developer message, or hosted by a new
+    system message when the request has none (or its content is a parts list).
+    """
+    for msg in messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = (
+                f"{msg['content']}\n\n{suffix}" if msg["content"] else suffix
+            )
+            return
+    messages.insert(0, {"role": "system", "content": suffix})
+
+
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
@@ -1462,6 +1478,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
+        system_suffix = envs.SGLANG_CHAT_SYSTEM_SUFFIX.get()
+        if system_suffix:
+            append_chat_system_suffix(messages, system_suffix)
         for message in messages:
             normalize_assistant_tool_call_arguments(
                 message, strict=self.chat_encoding_spec != "kimi_k3"

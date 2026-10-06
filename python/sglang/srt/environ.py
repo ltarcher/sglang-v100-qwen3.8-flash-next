@@ -1585,6 +1585,12 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Server-side discipline text appended to the chat system message (a
+    # system message is inserted when the request has none). Applies to the
+    # OpenAI jinja chat-template path only, not the builtin conversation
+    # templates. Unset keeps prompts untouched. Changing it shifts every
+    # request's prompt hash once, so the radix prefix cache rebuilds cold.
+    SGLANG_CHAT_SYSTEM_SUFFIX = EnvStr(None)
 
     # ===================================================================
     # Encoder pipeline and disaggregation

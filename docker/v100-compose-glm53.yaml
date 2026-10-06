@@ -90,6 +90,13 @@ services:
       SGLANG_MAX_NEW_TOKENS_LIMIT: "32768"
       SGLANG_ENABLE_OUTPUT_LOOP_BREAK: "1"
       SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD: "2048"
+      # Thinking-discipline suffix appended to every chat system message
+      # server-side (clients need no change). Same-quest A/B on this
+      # checkpoint: without it 14/16 agent-shape runs entered a repetition
+      # loop in the thinking segment; with it 0/5, all finishing as normal
+      # tool calls. Changing the text shifts every prompt hash once (cold
+      # radix cache rebuild).
+      SGLANG_CHAT_SYSTEM_SUFFIX: "Reasoning effort: low. Keep your thinking short: sketch the plan in a few dozen lines at most, then write the final answer. Do not enumerate alternatives exhaustively."
     volumes:
       # Adjust both host paths to this machine's layout.
       - /data/models/GLM-5.3-Flash-NVFP4:/data/models/GLM-5.3-Flash-NVFP4:ro
@@ -177,7 +184,11 @@ services:
       - --chunked-prefill-size
       - "1024"
       - --cuda-graph-max-bs-decode
-      - "4"
+      - "3"
+      - --cuda-graph-bs-decode
+      - "1"
+      - "2"
+      - "3"
       # u2 requant + capture can exceed the default watchdog on a cold boot.
       - --watchdog-timeout
       - "900"
