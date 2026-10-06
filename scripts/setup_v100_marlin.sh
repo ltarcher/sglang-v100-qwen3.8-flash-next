@@ -54,6 +54,16 @@ SM70_PATCHES=(
   # SGLANG_USE_SM70_U2_GEMM_V2 with u2_v2_words=True; marlin u2/u4b8/NVFP4
   # paths untouched).
   "$PATCH_DIR/marlin-v100-u2-gemm-v2.patch"
+  # GLM-5.3 decode small-M: 3-deep-pipeline variant of the v2 kernel (pure
+  # addition; registers op sm70_u2_gemm_v2sm). Must stay AFTER u2-gemm-v2 --
+  # it edits the file that patch creates.
+  "$PATCH_DIR/marlin-v100-u2-gemm-v2sm.patch"
+  # GLM-5.3 decode small-M: n-tile-64 variant of the v2 kernel (pure addition;
+  # registers op sm70_u2_gemm_v2n64). Both small-M variants A/B'd BEHIND v2 at
+  # the production verify shape (num_draft_tokens=4 -> M=4: n64 0.88x, v2sm
+  # ~1.0x) and are registered but not dispatched; the python wrappers exist
+  # only for offline A/B reruns. Must stay AFTER u2-gemm-v2sm.
+  "$PATCH_DIR/marlin-v100-u2-gemm-v2n64.patch"
 )
 if [[ "${MARLIN_V100_SKIP_BF16_COMPAT:-0}" != 1 ]]; then
   SM70_PATCHES+=("$PATCH_DIR/marlin-v100-sm70.patch")
@@ -194,7 +204,10 @@ fi
 mkdir -p "$PKG_DIR"
 
 DEST="$PKG_DIR/_sm70_marlin_v100_moe.abi3.so"
-cp -f "$SO_MOE" "$DEST"
+# Atomic install: a running engine mmaps this file, so never write it in
+# place -- cp -f O_TRUNCs the inode and leaves live mappings on a mix of old
+# and new pages (u2v2b health-checked fine but sat on mixed PLT offsets).
+cp -f "$SO_MOE" "$DEST.tmp" && mv -f "$DEST.tmp" "$DEST"
 log "installed -> $DEST"
 
 # also install the dense _C extension (used by future dense-linear paths; harmless if unused)

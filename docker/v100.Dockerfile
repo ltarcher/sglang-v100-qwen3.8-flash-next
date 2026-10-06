@@ -159,6 +159,14 @@ COPY patches/marlin-v100-qwen38-nvfp4-tuning.patch \
       /opt/sglang/patches/marlin-v100-qwen38-nvfp4-tuning.patch
 COPY patches/marlin-v100-u2-experts.patch \
       /opt/sglang/patches/marlin-v100-u2-experts.patch
+# Keep in sync with SM70_PATCHES in scripts/setup_v100_marlin.sh -- the
+# setup script hard-fails on the first patch this file forgets to COPY.
+COPY patches/marlin-v100-u2-gemm-v2.patch \
+      /opt/sglang/patches/marlin-v100-u2-gemm-v2.patch
+COPY patches/marlin-v100-u2-gemm-v2sm.patch \
+      /opt/sglang/patches/marlin-v100-u2-gemm-v2sm.patch
+COPY patches/marlin-v100-u2-gemm-v2n64.patch \
+      /opt/sglang/patches/marlin-v100-u2-gemm-v2n64.patch
 RUN --mount=type=cache,target=/opt/deps/marlin-v100,sharing=locked \
     export CUTLASS_DIR=/opt/cutlass \
     && export MARLIN_V100_REPO=/opt/deps/marlin-v100 \

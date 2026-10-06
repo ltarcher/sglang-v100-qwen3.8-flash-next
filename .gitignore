@@ -290,4 +290,7 @@ internal-docs/
 # results, planning notes. Not source -- the tools and tests this work produces
 # are committed on their own, under benchmark/ and test/.
 .workbench/
-kernels/prebuilt/
+# The ** form is load-bearing: the Marlin .so cache lives under
+# python/sglang/kernels/prebuilt/, and a slash-bearing pattern anchors to the
+# repo root, which has no kernels/ directory.
+**/kernels/prebuilt/

@@ -18,11 +18,37 @@ import torch
 logger = logging.getLogger(__name__)
 
 _op = False
+_op_sm = False
+_op_n64 = False
 
 
 def sm70_u2_gemm_v2_available() -> bool:
     """True iff the running marlin_v100 .so registers sm70_u2_gemm_v2."""
     return _resolve_op() is not None
+
+
+def sm70_u2_gemm_v2sm_available() -> bool:
+    """True iff the .so also registers the 3-deep-pipeline small-M variant.
+
+    A/B'd behind plain v2 at every decode M (0.97-1.01x, bit-identical):
+    deeper staging does not raise in-flight LDGs per thread, so it never
+    engages. Kept registered for offline A/B reruns only -- nothing
+    dispatches to it.
+    """
+    return _resolve_op_sm() is not None
+
+
+def sm70_u2_gemm_v2n64_available() -> bool:
+    """True iff the .so also registers the n-tile-64 decode-grid variant.
+
+    A/B vs v2 (bit-identical): wins only at M<=2 (w13 1.37x at M=1) where
+    per-expert blocks are few enough that doubling grid.y relieves CTA
+    starvation; loses at the production NEXTN verify shape
+    (num_draft_tokens=4 -> M=4: 0.88x) because halving the mma work per CTA
+    while keeping the K-loop depth just shortens the fixed-latency tail.
+    Not dispatched; the wrapper exists for offline A/B reruns.
+    """
+    return _resolve_op_n64() is not None
 
 
 def _resolve_op():
@@ -43,6 +69,28 @@ def _resolve_op():
                 ".so; marlin u2 stays the only u2 GEMM path"
             )
     return _op
+
+
+def _resolve_op_sm():
+    global _op_sm
+    if _op_sm is False:
+        _resolve_op()
+        try:
+            _op_sm = getattr(torch.ops._moe_C, "sm70_u2_gemm_v2sm", None)
+        except AttributeError:
+            _op_sm = None
+    return _op_sm
+
+
+def _resolve_op_n64():
+    global _op_n64
+    if _op_n64 is False:
+        _resolve_op()
+        try:
+            _op_n64 = getattr(torch.ops._moe_C, "sm70_u2_gemm_v2n64", None)
+        except AttributeError:
+            _op_n64 = None
+    return _op_n64
 
 
 def sm70_u2_gemm_v2(
@@ -66,6 +114,96 @@ def sm70_u2_gemm_v2(
     assert op is not None, (
         "sm70_u2_gemm_v2 unavailable: SGLANG_USE_SM70_U2_GEMM_V2 bound "
         "T-layout weights but the marlin_v100 .so lacks the op"
+    )
+    # The epilogue reads topk_weights as float32 (matches moe_wna16_marlin).
+    if topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
+    op(
+        a,
+        c,
+        b_qweight_t,
+        b_scales,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        size_m,
+        size_n,
+        size_k,
+        group_size,
+    )
+    return c
+
+
+def sm70_u2_gemm_v2n64(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_qweight_t: torch.Tensor,
+    b_scales: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_block_size: int,
+    top_k: int,
+    mul_topk_weights: bool,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    op = _resolve_op_n64()
+    assert op is not None, (
+        "sm70_u2_gemm_v2n64 unavailable: rebuild the marlin_v100 .so from a "
+        "tree carrying the n-tile-64 kernel"
+    )
+    # The epilogue reads topk_weights as float32 (matches moe_wna16_marlin).
+    if topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
+    op(
+        a,
+        c,
+        b_qweight_t,
+        b_scales,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        size_m,
+        size_n,
+        size_k,
+        group_size,
+    )
+    return c
+
+
+def sm70_u2_gemm_v2sm(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_qweight_t: torch.Tensor,
+    b_scales: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_block_size: int,
+    top_k: int,
+    mul_topk_weights: bool,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    op = _resolve_op_sm()
+    assert op is not None, (
+        "sm70_u2_gemm_v2sm unavailable: rebuild the marlin_v100 .so from a "
+        "tree carrying the small-M kernel"
     )
     # The epilogue reads topk_weights as float32 (matches moe_wna16_marlin).
     if topk_weights.dtype != torch.float32:
