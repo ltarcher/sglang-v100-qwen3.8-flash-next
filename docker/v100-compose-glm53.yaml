@@ -139,6 +139,10 @@ services:
       - --log-requests
       - --log-requests-level
       - "1"
+      # Prometheus /metrics endpoint, plus cached_tokens in the OpenAI
+      # usage block (verifies prefix-cache hits across agent turns).
+      - --enable-metrics
+      - --enable-cache-report
       - --trust-remote-code
       - --model-path
       - /data/models/GLM-5.3-Flash-NVFP4
