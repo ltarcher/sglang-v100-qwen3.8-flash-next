@@ -1929,3 +1929,40 @@ dsa-mtp、M=4 verify)的 decode GPU 侧已无 ≥2ms/win 的 kernel 杠杆;下�
 内的 kernel 归因无效(async launch 错位,"no enclosing cpu_op" 是常态);graph
 内归因靠"kernel 序列相邻性 + 候选单测对 grid/签名族"两条腿,后者必须用生产同
 布局输入(K.12:contiguous 与否改变 cuBLAS heuristic 选型)。
+
+### K.14 循环打断器扩周期(2026-10-06 晚六):大周期 runaway 变体闭合
+
+**动机。** K.10 上线当晚,zcode 思考段 runaway 出现**大周期变体**:重复块
+~600-1000+ token,远超 4-32 窗口,无 loop_detected,烧 ~4.9k token 后被客户端
+240s 超时杀(引擎无 Finish)。同题三连:1 次 period 29 被现有打断器 cut@1551、
+1 次大周期逃逸、1 次干净——top_k 20 只是降入环概率(K.10 后置防线缺口实锤),
+治本 = 打断器扩到大周期,用户批准立项。
+
+**实现(保持纯函数无状态)。** `detect_periodic_loop` 周期上限提为 env 可配:
+`SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD`(默认 32 = 旧行为,生产 2048,走
+environ.py 约定);检测语义不变:尾部 ≥3 轮全同精确重复 → FINISH_LOOP_DETECTED。
+大窗口下扫描成本靠**首元素预筛**压平:`tokens[n-1] != tokens[n-1-p]` 直接跳过
+该周期的整块切片比较(活环必过、干净尾部几乎必不过)。实测(容器、20k token
+尾部):干净尾部 @2048 = 0.242 ms/check(旧窗口 0.005),活环命中 0.076;spec
+单流 ~25 finish-check/s → ~6 ms/s,可忽略。此前担心的 2k+ 常量 run 病态不存在:
+常量 run 本身是 period-4 环,现有窗口即切断(实测 (4, 625) 两窗口一致)。
+**已知边界:只匹配精确重复**——逐周期漂移的环要等 one-hot 锁死后变精确才被切
+(锁死终态必精确,实测指纹 accept rate 1.00);锁死前漂移期 (~1-3k token) 不覆盖。
+
+**单测。** `test_output_loop_detector.py` 9 → 14 例:period-600 三轮触发(集成
+路径,含 env 双 override)、默认窗口 32 不扫 600(legacy 契约)、33 接缝边界、
+两轮不触发 + 末 token 相同的诱饵块不触发(预筛盲区)、漂移块不触发(钉死精确
+匹配契约)。容器内 14/14 全绿;ruff(F401/F821/UP037)+ ruff-format 过。
+
+**落位与上线实测(2026-10-06 晚,镜像 899a27f064cd)。** serve 脚本与 compose
+默认 2048 同步。重建注意:本次 `COPY scripts/setup_v100_marlin.sh` 内容与上一
+生产构建不一致 → Marlin 层缓存失效全量重编(~1h),torch 及上游层全缓存;此后
+纯 python 重建恢复轻层。boot:u2 持久缓存 42 层全命中(零 requant)、KV 230400
+满额、~5min 就绪;chat 采样三参(temp 0.6 / top_k 20 / rep 1.05)原样生效。
+**上线首跑三连即实战擒获**:同题三连 2 干净 stop + **1 次 runaway 形成
+period=118 环 → cut@3647**(四 rank warning 留痕,思考段打断,content 空 +
+finish=length 诚实行为)——**该周期旧窗口(≤32)不覆盖,旧行为会烧到 32768
+LIMIT**;needle 三深度(1300/13000/25700,~36k token 填充)3/3 HIT(~25s/趟,
+prefill ~1.4k tok/s 带内),真实长文零误杀。离线真实数据矩阵(本日逃逸 dump
+还原 token 喂检测器):逃逸 runaway (253, 24) 命中、旧窗口 None;已覆盖
+(29, 3) 新旧一致;干净输出两份 None。

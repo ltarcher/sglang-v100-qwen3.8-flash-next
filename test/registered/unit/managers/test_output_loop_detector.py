@@ -119,6 +119,59 @@ class TestOutputLoopDetector(CustomTestCase):
         # The window's upper edge, exactly three blocks, fires.
         self.assertEqual(detect_periodic_loop(list(range(32)) * 3), (32, 3))
 
+    def test_large_period_loop_breaks_request(self):
+        # Production escape (2026-10-06 zcode incident): a runaway whose
+        # repeated blocks are ~600 tokens, far beyond the phrase window, once
+        # burned ~5k tokens on a single turn. With the extended window the
+        # same tail must finish the request carrying the loop geometry; the
+        # loop starts mid-output, not at token 0.
+        tokens = [(i * 37 + 11) % 9973 for i in range(200)] + _loop_tokens(600, 3)
+        req = _make_req(tokens, max_new_tokens=100_000)
+        with (
+            envs.SGLANG_ENABLE_OUTPUT_LOOP_BREAK.override(True),
+            envs.SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD.override(2048),
+        ):
+            req.update_finish_state(new_accepted_len=1)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_LOOP_DETECTED)
+        self.assertEqual(req.finished_reason.period, 600)
+        self.assertEqual(req.finished_reason.repeats, 3)
+
+    def test_default_max_period_keeps_legacy_window(self):
+        # Unset env means the pre-extension behavior: a 600-token loop is not
+        # scanned at all, and the descriptor default is the phrase window.
+        self.assertEqual(envs.SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD.get(), 32)
+        self.assertIsNone(detect_periodic_loop(_loop_tokens(600, 3)))
+        self.assertIsNone(detect_periodic_loop(_loop_tokens(600, 4)))
+
+    def test_extended_window_seam_boundaries(self):
+        # The extended window starts right where the phrase window ends: 33
+        # must flip from legacy-miss to extended-hit with no gap at the seam.
+        tokens = _loop_tokens(33, 3)
+        self.assertIsNone(detect_periodic_loop(tokens))
+        self.assertEqual(detect_periodic_loop(tokens, max_period=2048), (33, 3))
+
+    def test_large_period_needs_three_identical_blocks(self):
+        # Two blocks stay coincidence at any period; the false-positive guard
+        # must hold when the would-be blocks merely share their last token
+        # (the prefilter's blind spot) but differ inside.
+        self.assertIsNone(detect_periodic_loop(_loop_tokens(600, 2), max_period=2048))
+        self.assertEqual(
+            detect_periodic_loop(_loop_tokens(600, 3), max_period=2048), (600, 3)
+        )
+        decoy = list(range(500, 1100)) + list(range(500, 1099)) + [777]
+        decoy += list(range(0, 599)) + [777]
+        self.assertIsNone(detect_periodic_loop(decoy, max_period=2048))
+
+    def test_drifted_large_block_does_not_fire(self):
+        # Only exact repetition matches: a cycle that mutates one token per
+        # round escapes the detector until it settles into an exact cycle
+        # (the one-hot attractor end state always does). Pins that contract
+        # against a fuzzy-matching rewrite.
+        block = list(range(600))
+        drifted = block[:-1] + [99_001] + block[:-1] + [99_002] + block[:-1] + [99_003]
+        self.assertIsNone(detect_periodic_loop(drifted, max_period=2048))
+
     def test_detector_needs_three_full_blocks(self):
         # Two identical blocks may still be coincidence; three is the trigger.
         self.assertIsNone(detect_periodic_loop(_loop_tokens(4, 2)))

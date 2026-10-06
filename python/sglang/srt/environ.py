@@ -624,6 +624,13 @@ class Envs:
     # managers/output_loop_detector.py. SGLANG_MAX_NEW_TOKENS_LIMIT only caps
     # the blast radius — this is what actually stops the loop mid-flight.
     SGLANG_ENABLE_OUTPUT_LOOP_BREAK = EnvBool(False)
+    # Upper bound of the loop breaker's period scan. The default keeps the
+    # phrase window (period 4-32); raise it to cover the observed runaway
+    # variant of ~600-1000-token repeated blocks. Firing needs >=3 identical
+    # blocks, so detection latency grows with the period (3x it); the
+    # per-step scan cost stays flat via a first-element prefilter (see
+    # managers/output_loop_detector.py).
+    SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD = EnvInt(32)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.

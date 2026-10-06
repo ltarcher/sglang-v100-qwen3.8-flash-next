@@ -107,6 +107,14 @@ export SGLANG_SM70_QWEN_FUSIONS=1
 # test/registered/unit/managers/test_output_loop_detector.py.
 export SGLANG_MAX_NEW_TOKENS_LIMIT="${SGLANG_MAX_NEW_TOKENS_LIMIT:-32768}"
 export SGLANG_ENABLE_OUTPUT_LOOP_BREAK="${SGLANG_ENABLE_OUTPUT_LOOP_BREAK:-1}"
+# Period-scan upper bound of the loop breaker. Default 32 keeps the phrase
+# window; 2048 covers the observed large-period runaway variant (~600-1000
+# token repeated blocks; one such loop escaped the breaker on day one and
+# burned ~5k tokens until the client timeout). A cut still needs >=3
+# identical blocks, so worst-case detection latency is 3x the period; the
+# per-step scan stays ~0.25 ms via a first-element prefilter (measured on a
+# clean 20k-token tail). See docs/v100/GLM53_FLASH_PLAN.md K.14.
+export SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD="${SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD:-2048}"
 # P5-b A step: the mHC pre/post elementwise kernels run the fp16 TileLang
 # port. Measured on the u2 dsa-mtp c1024 recipe: ~7.6k prefill 1275-1300 ->
 # 1436-1454 tok/s (+12%), needle 5/5, near-full-pool eviction regression

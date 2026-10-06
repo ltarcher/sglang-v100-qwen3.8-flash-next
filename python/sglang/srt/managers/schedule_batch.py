@@ -1947,7 +1947,10 @@ class Req(ReqDllmMixin):
         if envs.SGLANG_ENABLE_OUTPUT_LOOP_BREAK.get() and not (
             self.sampling_params.ignore_eos
         ):
-            loop = detect_periodic_loop(self.output_ids)
+            loop = detect_periodic_loop(
+                self.output_ids,
+                max_period=envs.SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD.get(),
+            )
             if loop is not None:
                 period, repeats = loop
                 logger.warning(
