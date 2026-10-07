@@ -2204,3 +2204,107 @@ tensor——wrapper 存在内层时优先走内层钩子)。constrained 全套 1
 `SGLANG_MAX_THINK_TOKENS: "4096"` + `--enable-strict-thinking` +
 reasoner_grammar_backend.py overlay mount(K.15 模式,commit 后镜像重建吸收);
 serve 脚本同步(参数 source of truth)。K.17 的复装前提已解除,回退注记改接线注记。
+
+## 附录 L:nvidia/ModelOpt checkpoint 上线(MTP 嫁接 + sm70 dense fallback)(2026-10-07—10-08)
+
+用户选定 nvidia/GLM-5.3-Flash-NVFP4 上线(推翻"维持本地 08-30 checkpoint"的
+溯源判决,checkpoint 溯源见 K.16/记忆)。nvidia 版量化拓扑与本地版不同:NextN
+draft 层全 BF16、layers 0-2 dense MLP 也被量化——两条本地 checkpoint 从未走过
+的路径,本附录记录嫁接、内核 fallback、缓存移植、部署与验收。
+
+### L.1 MTP 嫁接:draft 层量化专家移植(2026-10-07)
+
+**根因。** nvidia 的 NextN draft(模型 layer45)全 BF16 共 13.84GiB;fp16 引擎
+主权重 24.01GB/rank + draft 6.31GB + 加载期单笔 2.25GiB > 32GB/rank——载入相位
+结构性 OOM,任何 mem-fraction/context 旋钮都救不了。
+
+**嫁接 recipe**(模型目录内一次性改造,原文件备份 `*.bak-graft-20261007`):
+1. 本地 08-30 checkpoint 的 layer45 量化专家(288 专家 × 3 proj = 3456 张量
+   3.80GiB,**与 nvidia 专家字节逐位一致**)写入 `mtp_experts_nvfp4.safetensors`;
+2. `model.safetensors.index.json` 重映射 864 个 `.weight` 键 + **新增** 2592 个
+   scale 键(注意:scale 键 nvidia 原索引本就没有,断言别写成"必须已存在"),
+   总 150253 键;
+3. `config.json` quantization_config.ignore 补 8 条 layer45 dense 键
+   (`self_attn*`/`mlp.gate`/`shared_experts*`/`eh_proj`,`model.language_model.
+   layers.45.` 与 `model.layers.45.` 双前缀);
+4. 从 model-0000{1,2,3}-of-00033 **物理剔除** 864 个残留 BF16 专家权重。
+
+关键陷阱:safetensors 去重过滤(`filter_duplicate_safetensors_files`)按**文件
+级**判定——只丢"整个文件不含被引用键"的文件;文件内未被 index 引用的张量仍会
+喂给 loader,不物理删除必撞 fused_moe `_load_w2` 形状冲突(256 packed vs
+512 = BF16[4096,2048]÷TP4)。
+
+### L.2 sm70 dense NVFP4 fallback(modelopt_quant.py,3dd088bf65)
+
+nvidia checkpoint 把 layers 0-2 的 dense MLP(gate/up/down_proj)也量化成
+NVFP4 W4A4;本地生产 checkpoint 只量化 experts、dense 全 bf16,`ModelOptFp4
+LinearMethod` 的 dense 路径在 sm70 上从未执行过。sm70 无任何 dense NVFP4 内核:
+gptq_marlin JIT 在 `__CUDA_ARCH__ < 800` 是 stub、native 后端要求 SM100+;
+`--fp4-gemm-backend marlin` 试过,抓图阶段 JIT 编译失败。
+
+修复 = `ModelOptFp4LinearMethod.process_weights_after_loading` 载入期 sm70
+fallback(`__init__` 存 `is_sm70`):`weight_scale × weight_scale_2` 合并 →
+`dequantize_nvfp4` 反量化到 `params_dtype` → `copy_or_rebind_param` → 删三个
+scale 参数 → `layer.quant_method = UnquantizedLinearMethod`。效果正好复刻生产
+拓扑(experts NVFP4 Marlin + dense fp16 走 `SGLANG_SM70_DENSE_GEMV`)。Qwen
+checkpoint 无量化 dense,不进此路径,零回归面。已推 origin 并经镜像重建吸收
+(ff5b99c89f01,`md5sum` vs `git show HEAD` 逐文件核验)。
+
+### L.3 u2 缓存跨 checkpoint 移植与部署形态
+
+专家字节逐位一致 ⇒ 生产池缓存条目直接 `mv` 复用,零重拷;改 index/config/
+shard 都换 u2 指纹,池目录随改名(共 3 次改名),当前指纹
+`68d44d0ee9edfd4c`(42 层全 hit)。独立 stage 目录
+`/data/develop/sglang-glm53-cache-nvidia`,与生产 stage 绝不共用(triton 缓存
+与排障互相踩)。
+
+compose = `~/vllm-Qwen3.8/docker-compose-sglang-v100-glm53-nvidia.yaml`
+(宿主 8110→8100):生产逐项复制(230k 池 @0.94、dsa-mtp tilelang、NEXTN
+steps3/topk1/draft4、单流 mamba 8 槽、全部 runaway 护栏、preferred
+0.6/0.95/20/1.05)+ 头注释逐项差异 + 永久教训注释(L.5);served-model-name
+保持 `glm53-flash-nvfp4` 客户端无感;镜像形态零源码 mount(全部修复已进 HEAD)。
+
+### L.4 验收(2026-10-07,4×V100)
+
+boot ~285s、u2 缓存 42 层全 hit、池 230400 满额;needle **15/15**(1k/4k/16k
+各 5/5);EN native greedy 连贯;accept 1.98(EN)/3.35-3.60(needle 窗),
+needle 窗 decode 44.7 tok/s ≈ 生产稳态 43.9;真实内容 chat 31.6 tok/s @
+accept 1.64——全在生产真实内容带(accept 1.0-2.4 → 20-50 tok/s)。镜像重建
+吸收后形态复验:chat + needle 4096 5/5。
+
+### L.5 裸模型环倾向 A/B:护栏必要性定案(2026-10-08)
+
+**动机。** 五子棋规划独白事件(reasoning=1 跳思考 + 正文 period-144 环切,
+被 K.14 扩窗 2048 的循环打断器实战接住)后,回答"模型默认配置是否无环"。
+
+**A/B**(拆 MAX_NEW_TOKENS_LIMIT/LOOP_BREAK/MAX_THINK_TOKENS/
+CHAT_SYSTEM_SUFFIX 四护栏;chat 不传采样参数走 generation_config 默认
+0.6/0.95/20/1.05,Finish 日志验证生效):
+- greedy(`/generate` temp 0):**立即回声环**——题目原样重复,ZH period 11
+  字符、EN period 61 字符,全部跑满 512 上限;
+- chat 默认采样:**think 段无限自我验证环**——开头正常规划,随后反复重推同一
+  公式,period ~1586 字符 ≈500 token,永不出 `</think>`;5/5(3 CNN + 2 五子棋)
+  8192 全部跑满、**零可见输出**(content 全空,正文从未开始)。
+
+**结论。** 三护栏各司其职:suffix 把模型从 think 段推出来、思考预算强制收束
+(reasoning=4097 铁证)、循环打断器切成形周期。护栏是"零交付 → 有交付"的
+必要件,不可拆;compose 环境区已写永久教训注释。workbuddy 提问环另案定性:
+54 轮逐字节相同提问 = **跨请求**锁步环,单请求内无重复、引擎护栏够不着,解环
+在客户端(与 1Cat 调研结论一致)。
+
+### L.6 已知问题与遗留
+
+- **nvidia checkpoint 环倾向是 checkpoint 属性**:贪心/长文易入环,无
+  checkpoint 侧补丁(1Cat-vLLM 独立佐证),聊天体验由护栏兜底。
+- **target-only M=1 decode bug(未修)**:GLM 线从未验收 target-only——摘
+  spec 即词环、16 tok/s 下内核跑但算错;首 token 正确 = prefill 健康,spec
+  verify(M=4)绕开;`--dsa-decode-backend triton` 在 CUDA 硬门禁。排障
+  compose(targetonly.yaml)用完即删。
+- **u2 staging 僵尸泄漏**:boot 被杀(强制重建/OOM/容器 rm)漏 ~40-70G/次;
+  自愈清扫 `_sweep_stale_staging` 只在首次 staging 分配前跑,缓存命中 boot
+  零 staging 分配、清扫永不触发——只能手动
+  `find <stage_dir> -maxdepth 1 -name 'sglang_u2_stage_*.bin' ! -newermt <今天> -delete`
+  (日期 guard 保护在跑 boot;父目录 bso 属主,宿主直删即可)。2026-10-08
+  实清 69.3G ×272,`u2_cache/<活指纹>/` 绝不可删(缓存不可在位重建,L.3)。
+- boot 后 Triton 内核新鲜加载(assign_draft_cache_locs_contiguous 等
+  0.76GiB),生产形态可能预载,暂无碍。
