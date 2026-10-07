@@ -472,6 +472,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=labels.keys(),
         )
+        self.num_spec_accept_breaks_total = Counter(
+            name="sglang:num_spec_accept_breaks_total",
+            documentation=(
+                "Requests finished by the spec accept-rate lock breaker "
+                "(SGLANG_SPEC_ACCEPT_BREAK_THRESHOLD)."
+            ),
+            labelnames=labels.keys(),
+        )
 
         # =================================================================
         # Retract
@@ -1277,6 +1285,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_output_loop_breaks(self) -> None:
         self.num_output_loop_breaks_total.labels(**self.labels).inc(1)
+
+    def increment_spec_accept_breaks(self) -> None:
+        self.num_spec_accept_breaks_total.labels(**self.labels).inc(1)
 
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"

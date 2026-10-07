@@ -57,6 +57,7 @@ import logging
 import re
 import sys
 from array import array
+from collections import deque
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -328,20 +329,36 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 class FINISH_LOOP_DETECTED(BaseFinishReason):
-    def __init__(self, period: int, repeats: int, length: int):
+    def __init__(
+        self,
+        period: Optional[int],
+        repeats: Optional[int],
+        length: int,
+        source: str = "periodic_scan",
+        accept_rate: Optional[float] = None,
+    ):
         super().__init__()
         self.period = period
         self.repeats = repeats
         self.length = length
+        self.source = source
+        self.accept_rate = accept_rate
 
     def to_json(self):
         # "length" is the closest OpenAI concept (truncated output); the OpenAI
         # finish_reason Literal has no loop notion, so the loop details only
-        # surface in native meta_info.
+        # surface in native meta_info. The spec accept-rate source has no loop
+        # geometry, so period/repeats are omitted there.
+        loop_detected: Dict[str, object] = {"source": self.source}
+        if self.period is not None:
+            loop_detected["period"] = self.period
+            loop_detected["repeats"] = self.repeats
+        if self.accept_rate is not None:
+            loop_detected["accept_rate"] = self.accept_rate
         return {
             "type": "length",
             "length": self.length,
-            "loop_detected": {"period": self.period, "repeats": self.repeats},
+            "loop_detected": loop_detected,
         }
 
 
@@ -1322,6 +1339,14 @@ class Req(ReqDllmMixin):
 
         self.spec_num_block_accept_tokens = 0
 
+        # Rolling verify-round window for the accept-rate lock breaker:
+        # (correct, proposed) draft counts per round, with the window sums
+        # maintained alongside for O(1) rate reads.
+        self.spec_accept_rate_window: deque[tuple[int, int]] = deque()
+        self.spec_accept_rate_window_correct_sum = 0
+        self.spec_accept_rate_window_proposed_sum = 0
+        self.spec_accept_rate_near_miss_logged = False
+
         self.spec_num_cap_tokens = 0
 
         # Acceptance histogram for speculative decoding.
@@ -1479,6 +1504,37 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def push_spec_accept_rate_sample(
+        self, num_correct_drafts: int, num_proposed_drafts: int
+    ) -> None:
+        window = envs.SGLANG_SPEC_ACCEPT_BREAK_WINDOW.get()
+        if window <= 0:
+            return
+        self.spec_accept_rate_window.append((num_correct_drafts, num_proposed_drafts))
+        self.spec_accept_rate_window_correct_sum += num_correct_drafts
+        self.spec_accept_rate_window_proposed_sum += num_proposed_drafts
+        while len(self.spec_accept_rate_window) > window:
+            old_correct, old_proposed = self.spec_accept_rate_window.popleft()
+            self.spec_accept_rate_window_correct_sum -= old_correct
+            self.spec_accept_rate_window_proposed_sum -= old_proposed
+
+    def spec_accept_rate(self, min_output_tokens: int) -> Optional[float]:
+        """Paper accept_rate (correct / proposed drafts, no bonus) over the
+        trailing window, or None while not armed: output under
+        min_output_tokens or the window not yet full."""
+        if len(self.output_ids) < min_output_tokens:
+            return None
+        if len(self.spec_accept_rate_window) < (
+            envs.SGLANG_SPEC_ACCEPT_BREAK_WINDOW.get()
+        ):
+            return None
+        if self.spec_accept_rate_window_proposed_sum <= 0:
+            return None
+        return (
+            self.spec_accept_rate_window_correct_sum
+            / self.spec_accept_rate_window_proposed_sum
+        )
 
     def update_spec_cap_lens_histogram(self, cap_len: int):
         cap_len = int(cap_len)
@@ -1962,6 +2018,47 @@ class Req(ReqDllmMixin):
                     period=period, repeats=repeats, length=len(self.output_ids)
                 )
                 return
+
+        # Accept-rate lock breaker: a sustained ~1.0 accept_rate is the one-hot
+        # attractor end state. Fires before the period scan collects three
+        # exact repeats and covers loops beyond its period window. Same
+        # ignore_eos exemption: bench contractually wants untrimmed output.
+        accept_break_threshold = envs.SGLANG_SPEC_ACCEPT_BREAK_THRESHOLD.get()
+        if accept_break_threshold is not None and not (
+            self.sampling_params.ignore_eos
+        ):
+            accept_rate = self.spec_accept_rate(
+                min_output_tokens=envs.SGLANG_SPEC_ACCEPT_BREAK_MIN_TOKENS.get()
+            )
+            if accept_rate is not None:
+                if accept_rate >= accept_break_threshold:
+                    logger.warning(
+                        f"Spec accept-rate lock (rid={self.rid}, "
+                        f"accept_rate={accept_rate:.3f}, "
+                        f"output_len={len(self.output_ids)}); finishing the "
+                        f"request."
+                    )
+                    self.finished_reason = FINISH_LOOP_DETECTED(
+                        period=None,
+                        repeats=None,
+                        length=len(self.output_ids),
+                        source="spec_accept_rate",
+                        accept_rate=accept_rate,
+                    )
+                    return
+                # Near-miss evidence for threshold tuning: sustained but
+                # sub-threshold acceptance, logged once per request.
+                if (
+                    not self.spec_accept_rate_near_miss_logged
+                    and accept_rate >= accept_break_threshold - 0.06
+                ):
+                    self.spec_accept_rate_near_miss_logged = True
+                    logger.info(
+                        f"Spec accept-rate near miss (rid={self.rid}, "
+                        f"accept_rate={accept_rate:.3f}, "
+                        f"threshold={accept_break_threshold}, "
+                        f"output_len={len(self.output_ids)})."
+                    )
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(

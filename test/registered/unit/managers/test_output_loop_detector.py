@@ -105,12 +105,16 @@ class TestOutputLoopDetector(CustomTestCase):
 
     def test_finish_json_contract(self):
         # OpenAI's finish_reason Literal has no loop notion, so the wire type
-        # is "length"; native meta_info carries the loop details alongside.
+        # is "length"; native meta_info carries the loop details alongside,
+        # tagged with the detector source.
         reason = FINISH_LOOP_DETECTED(period=6, repeats=4, length=42)
         as_json = reason.to_json()
         self.assertEqual(as_json["type"], "length")
         self.assertEqual(as_json["length"], 42)
-        self.assertEqual(as_json["loop_detected"], {"period": 6, "repeats": 4})
+        self.assertEqual(
+            as_json["loop_detected"],
+            {"source": "periodic_scan", "period": 6, "repeats": 4},
+        )
 
     def test_detector_period_window(self):
         # Three-token and 33-token loops are outside the scan window: short

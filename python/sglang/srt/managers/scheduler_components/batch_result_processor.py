@@ -840,6 +840,12 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                # Proposed drafts per round = the per-req slot width minus the
+                # non-draft (bonus) tokens; same exclusion as num_correct_drafts.
+                req.push_spec_accept_rate_sample(
+                    num_correct_drafts=num_correct_drafts,
+                    num_proposed_drafts=stride - num_non_draft,
+                )
 
                 if block_accept_lens is not None:
                     req.spec_num_block_accept_tokens += block_accept_lens[i]
@@ -1358,7 +1364,10 @@ class SchedulerBatchResultProcessor:
                 and get_observability().enable_metrics
                 and self.metrics_reporter.is_stats_logging_rank
             ):
-                self.metrics_collector.increment_output_loop_breaks()
+                if req.finished_reason.source == "spec_accept_rate":
+                    self.metrics_collector.increment_spec_accept_breaks()
+                else:
+                    self.metrics_collector.increment_output_loop_breaks()
 
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:

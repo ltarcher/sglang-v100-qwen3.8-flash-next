@@ -119,6 +119,21 @@ export SGLANG_ENABLE_OUTPUT_LOOP_BREAK="${SGLANG_ENABLE_OUTPUT_LOOP_BREAK:-1}"
 # per-step scan stays ~0.25 ms via a first-element prefilter (measured on a
 # clean 20k-token tail). See docs/v100/GLM53_FLASH_PLAN.md K.14.
 export SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD="${SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD:-2048}"
+# Spec accept-rate lock breaker (2026-10-08): finishes a request whose
+# trailing verify rounds accept ~every draft (paper accept_rate = correct/
+# proposed drafts, no bonus) -- the one-hot attractor end state. Independent
+# of the period scanner above: fires before three exact repeats accumulate
+# and covers periods past its 2048 window. Threshold None disables; 0.96 is
+# zai's production guard, and on this engine the deep lock fingerprints at
+# 1.00 while healthy content stays <=0.47 -- the workbuddy block-repeat loop
+# form (~0.5) is the period scanner's job, not this one. WINDOW sets the
+# detection latency (a lock needs ~that many rounds to saturate the average);
+# MIN_TOKENS keeps short legitimate high-acceptance runs (tables, formulas)
+# from arming it. ignore_eos requests are exempt (bench contract). See
+# test/registered/unit/managers/test_spec_accept_break.py.
+export SGLANG_SPEC_ACCEPT_BREAK_THRESHOLD="${SGLANG_SPEC_ACCEPT_BREAK_THRESHOLD:-0.96}"
+export SGLANG_SPEC_ACCEPT_BREAK_MIN_TOKENS="${SGLANG_SPEC_ACCEPT_BREAK_MIN_TOKENS:-128}"
+export SGLANG_SPEC_ACCEPT_BREAK_WINDOW="${SGLANG_SPEC_ACCEPT_BREAK_WINDOW:-64}"
 # Thinking-discipline text appended server-side to every chat system message
 # (jinja chat-template path only; unset keeps prompts untouched). Same-quest
 # A/B on this checkpoint (agent shape, 5000-token budget): without it 14/16

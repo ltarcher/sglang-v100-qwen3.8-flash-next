@@ -90,6 +90,16 @@ services:
       SGLANG_MAX_NEW_TOKENS_LIMIT: "32768"
       SGLANG_ENABLE_OUTPUT_LOOP_BREAK: "1"
       SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD: "2048"
+      # Spec accept-rate lock breaker: the engine-dynamics complement to the
+      # period scanner -- a sustained ~1.0 paper accept_rate (correct/proposed
+      # drafts, no bonus) is the one-hot attractor end state and finishes the
+      # request before three exact repeats accumulate. Covers periods past the
+      # 2048 scan window; the workbuddy block-repeat loop form (~0.5) stays
+      # the scanner's job. ignore_eos (bench) exempt. See serve script for the
+      # measured fingerprints.
+      SGLANG_SPEC_ACCEPT_BREAK_THRESHOLD: "0.96"
+      SGLANG_SPEC_ACCEPT_BREAK_MIN_TOKENS: "128"
+      SGLANG_SPEC_ACCEPT_BREAK_WINDOW: "64"
       # Thinking-discipline suffix appended to every chat system message
       # server-side (clients need no change). Same-quest A/B on this
       # checkpoint: without it 14/16 agent-shape runs entered a repetition

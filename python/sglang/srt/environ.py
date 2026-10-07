@@ -631,6 +631,21 @@ class Envs:
     # per-step scan cost stays flat via a first-element prefilter (see
     # managers/output_loop_detector.py).
     SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD = EnvInt(32)
+    # Spec accept-rate lock breaker: finish a request whose trailing verify
+    # rounds accept nearly every draft (paper accept_rate = correct drafts /
+    # proposed drafts, no bonus token) -- the one-hot attractor end state.
+    # Independent of the period scan above: fires before three exact repeats
+    # accumulate and covers locks past MAX_PERIOD. None disables. 0.96 is zai's
+    # production guard; on this engine the deep lock sits at 1.00, healthy
+    # content <= 0.47, and the block-repeat loop form (the period scan's job)
+    # at ~0.5.
+    SGLANG_SPEC_ACCEPT_BREAK_THRESHOLD = EnvFloat(None)
+    # Generated-output tokens before the accept-rate check arms; short
+    # legitimate high-acceptance runs (formulas, tables) must not trip it.
+    SGLANG_SPEC_ACCEPT_BREAK_MIN_TOKENS = EnvInt(128)
+    # Trailing verify rounds averaged into the accept rate; a lock needs ~this
+    # many rounds to saturate the window, which is the detection latency.
+    SGLANG_SPEC_ACCEPT_BREAK_WINDOW = EnvInt(64)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
