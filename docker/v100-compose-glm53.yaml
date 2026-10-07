@@ -97,6 +97,13 @@ services:
       # tool calls. Changing the text shifts every prompt hash once (cold
       # radix cache rebuild).
       SGLANG_CHAT_SYSTEM_SUFFIX: "Reasoning effort: low. Keep your thinking short: sketch the plan in a few dozen lines at most, then write the final answer. Do not enumerate alternatives exhaustively."
+      # Thinking budget (2026-10-07): caps the thinking segment and forces
+      # the closing </think> when exhausted (verified live at
+      # reasoning_tokens=4097 = budget + forced close). Needs the
+      # --enable-strict-thinking flag below: the GLM tool constraint keys as
+      # full_assistant_ebnf, which ReasonerGrammarBackend otherwise returns
+      # unwrapped, leaving the budget no attach point (plan K.18).
+      SGLANG_MAX_THINK_TOKENS: "4096"
     volumes:
       # Adjust both host paths to this machine's layout.
       - /data/models/GLM-5.3-Flash-NVFP4:/data/models/GLM-5.3-Flash-NVFP4:ro
@@ -128,6 +135,11 @@ services:
       # without the parser thinking text leaks into content.
       - --reasoning-parser
       - glm45
+      # Enables the ReasonerGrammarBackend token-filter layer that
+      # SGLANG_MAX_THINK_TOKENS (above) attaches to. Without it the default
+      # path is byte-identical to upstream, so this flag is the budget's
+      # on/off switch.
+      - --enable-strict-thinking
       # GLM-5.3-Flash's chat template teaches the NEW no-newline tool-call
       # format (<tool_call>name<arg_key>k</arg_key>...</tool_call>). Without
       # this flag the raw block leaks into content and agent clients get no
