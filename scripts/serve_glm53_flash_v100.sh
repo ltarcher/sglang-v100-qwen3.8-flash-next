@@ -91,6 +91,10 @@ if [[ -z "${NCCL_P2P_LEVEL:-}" ]]; then
 fi
 # Volta has no bf16; the mamba/linear-attention path must run fp16 on sm70.
 export SGLANG_MAMBA_CONV_DTYPE=float16
+# KDA recurrent (temporal) state: fp16 is the production choice (2026-10-07
+# A/B: fp32 bought zero loop improvement at +143MB/rank and a pool trim).
+# The sm70 force-fp16 branch in mamba_utils.py only pins fp16 when this var
+# is unset, so an explicit float32 here is honored if ever needed.
 export SGLANG_MAMBA_SSM_DTYPE=float16
 export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_SM70_QWEN_FUSIONS=1

@@ -112,7 +112,11 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         and envs.SGLANG_SM70_FORCE_FP16.get()
     ):
         conv_dtype = torch.float16
-        ssm_dtype = torch.float16
+        # An explicit SGLANG_MAMBA_SSM_DTYPE outranks this branch (the
+        # env-first priority documented above); forced fp16 applies only to
+        # the unset case, else the env value would be silently dropped.
+        if envs.SGLANG_MAMBA_SSM_DTYPE.get() is None:
+            ssm_dtype = torch.float16
 
     logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
