@@ -1735,6 +1735,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.is_sm70 = _is_sm70()
         self.quant_mode = (
             "w4a16"
             if (
@@ -1837,6 +1838,26 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+
+        if self.is_sm70:
+            # No dense NVFP4 kernel exists below sm80: the marlin gptq path is
+            # stubbed out (gptq_marlin.cuh guards __CUDA_ARCH__ < 800) and the
+            # native backends require SM100+. Dequantize the packed weights to
+            # fp16 and fall back to the plain linear method; the u2 pool keeps
+            # serving the MoE experts. Scale folding follows convert_moe_layer_to_u2.
+            from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
+
+            scales = layer.weight_scale.data.to(torch.float32) * weight_scale_2
+            copy_or_rebind_param(
+                layer,
+                "weight",
+                dequantize_nvfp4(layer.weight.data, scales, None, layer.params_dtype),
+            )
+            del layer.input_scale
+            del layer.weight_scale
+            del layer.weight_scale_2
+            layer.quant_method = UnquantizedLinearMethod()
+            return
 
         if self.quant_mode == "w4a16":
             from flashinfer import prepare_bf16_fp4_weights
