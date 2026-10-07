@@ -48,9 +48,6 @@ def detect_periodic_loop(
         if last != token_ids[n - 1 - period]:
             continue
         block = token_ids[n - period :]
-        if n < period * min_repeats:
-            break
-        block = token_ids[n - period :]
         if block != token_ids[n - 2 * period : n - period]:
             continue
         if block != token_ids[n - 3 * period : n - 2 * period]:

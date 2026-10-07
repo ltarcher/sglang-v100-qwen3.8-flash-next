@@ -84,11 +84,13 @@ class TestOutputLoopDetector(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_LOOP_DETECTED)
 
     def test_env_off_keeps_legacy_behavior(self):
-        # Default is off: a looped tail under the cap must not finish at all,
-        # mirroring pre-feature behavior byte for byte.
+        # Off: a looped tail under the cap must not finish at all, mirroring
+        # pre-feature behavior byte for byte. Overridden so the case stays
+        # valid where a production env exports the flag as on.
         tokens = [7, 8, 9] + _loop_tokens(4, 3)
         req = _make_req(tokens, max_new_tokens=1000)
-        req.update_finish_state(new_accepted_len=1)
+        with envs.SGLANG_ENABLE_OUTPUT_LOOP_BREAK.override(False):
+            req.update_finish_state(new_accepted_len=1)
         self.assertFalse(req.finished())
 
     def test_ignore_eos_exemption(self):
@@ -138,9 +140,11 @@ class TestOutputLoopDetector(CustomTestCase):
         self.assertEqual(req.finished_reason.repeats, 3)
 
     def test_default_max_period_keeps_legacy_window(self):
-        # Unset env means the pre-extension behavior: a 600-token loop is not
-        # scanned at all, and the descriptor default is the phrase window.
-        self.assertEqual(envs.SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD.get(), 32)
+        # The descriptor default is the pre-extension phrase window: a
+        # 600-token loop is not scanned by it. Asserted on .default, not
+        # .get(), so the case stays valid where a production env widens
+        # the window.
+        self.assertEqual(envs.SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD.default, 32)
         self.assertIsNone(detect_periodic_loop(_loop_tokens(600, 3)))
         self.assertIsNone(detect_periodic_loop(_loop_tokens(600, 4)))
 
