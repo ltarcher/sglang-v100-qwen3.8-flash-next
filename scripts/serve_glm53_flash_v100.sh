@@ -115,6 +115,31 @@ export SGLANG_ENABLE_OUTPUT_LOOP_BREAK="${SGLANG_ENABLE_OUTPUT_LOOP_BREAK:-1}"
 # per-step scan stays ~0.25 ms via a first-element prefilter (measured on a
 # clean 20k-token tail). See docs/v100/GLM53_FLASH_PLAN.md K.14.
 export SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD="${SGLANG_OUTPUT_LOOP_BREAK_MAX_PERIOD:-2048}"
+# Thinking-discipline text appended server-side to every chat system message
+# (jinja chat-template path only; unset keeps prompts untouched). Same-quest
+# A/B on this checkpoint (agent shape, 5000-token budget): without it 14/16
+# runs entered a thinking-segment repetition loop, with it 0/5 finished as
+# normal tool calls. A strengthened addendum showed no further effect in a
+# 62k-token-context testbed (11/12 vs 10/12 loops), and loop rate is flat
+# from 7.5k to 62k prompt tokens, so the text stays as-is -- long-context
+# loops are a checkpoint property the breaker contains. Changing the text
+# shifts every prompt hash once (cold radix prefix cache rebuild). See
+# docs/v100/GLM53_FLASH_PLAN.md K.16 and
+# test/registered/unit/entrypoints/test_chat_system_suffix.py.
+export SGLANG_CHAT_SYSTEM_SUFFIX="${SGLANG_CHAT_SYSTEM_SUFFIX:-Reasoning effort: low. Keep your thinking short: sketch the plan in a few dozen lines at most, then write the final answer. Do not enumerate alternatives exhaustively.}"
+# Thinking budget (2026-10-07, K.17 follow-up): wired and live. K.17's
+# revert blamed the NEXTN verify path, but v1/v2 share the same
+# traverse_tree -> fill_vocab_mask; the real root cause was the GLM tool
+# constraint keying as full_assistant_ebnf, which ReasonerGrammarBackend
+# returned unwrapped, so the budget had no attach point. The fix wraps it
+# in owning mode under --enable-strict-thinking (accepts/fills forwarded
+# while thinking; budget exhaustion forces the </think> row) and a filter
+# that preserves the inner EBNF row instead of resetting it. Verified live:
+# a bare chat request stops at reasoning_tokens=4097 (= 4096 budget + the
+# forced </think>) and still emits content; prefill/decode/needle gates
+# unchanged. See docs/v100/GLM53_FLASH_PLAN.md K.18 and
+# test/registered/unit/constrained/test_reasoner_grammar_backend.py.
+export SGLANG_MAX_THINK_TOKENS="${SGLANG_MAX_THINK_TOKENS:-4096}"
 # P5-b A step: the mHC pre/post elementwise kernels run the fp16 TileLang
 # port. Measured on the u2 dsa-mtp c1024 recipe: ~7.6k prefill 1275-1300 ->
 # 1436-1454 tok/s (+12%), needle 5/5, near-full-pool eviction regression
@@ -207,7 +232,17 @@ args=(
   # no tool_calls field (2026-10-06 zcode incident); the glm45 key is the
   # GLM-4.5-era detector whose regex requires a newline after the name and
   # does NOT match this template -- glm47 is the exact-format detector.
+  # Thinking model: the template opens <|assistant|><think>, so generation
+  # starts INSIDE the thinking segment; without this parser the thinking text
+  # all lands in content (the 2026-10-06 runaway incident). glm45 splits
+  # <think>..</think> into reasoning_content vs content for display only.
+  --reasoning-parser glm45
   --tool-call-parser glm47
+  # Enables the ReasonerGrammarBackend token-filter layer that
+  # SGLANG_MAX_THINK_TOKENS attaches to (above). Without it the default
+  # path is byte-identical to upstream (the full-assistant EBNF stays
+  # unwrapped), so this flag is the budget's on/off switch.
+  --enable-strict-thinking
   --dtype float16
   --quantization modelopt_fp4
   "${ATTN_ARGS[@]}"

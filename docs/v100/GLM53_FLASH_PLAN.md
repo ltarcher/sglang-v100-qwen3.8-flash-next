@@ -1993,3 +1993,214 @@ kv_cache_dtype=float16 正是 fork 验证配方,无需动作)。期间打断器�
 **已知边界。** NVFP4 checkpoint 在该题上采样方差大:同题多轮出现 正常调用
 工具 / 幻觉一堆长工具名(runaway,已被打断器切)/ 直接拒答称无实时行情工具
 三种形态;后者是 checkpoint 行为,非引擎问题。
+
+### K.16 输出环治理收口:护栏定型、指令通道判死、模板 None 残片修复(2026-10-06 深夜—10-07 凌晨)
+
+**背景:workbuddy 实战暴露多轮形态高环率。** 用户 workbuddy(多轮 agent,
+OpenAI chat + tools + 结构化 grammar)写网页五子棋,客户端报
+`MAX_TOKENS` 截断。引擎侧复盘:该 Request ID 是网关(new-api)侧 ID,与引擎
+rid 对不上;15 分钟窗口内实为**三次环事件**(cut@607 period14 / cut@5971
+period49 / cut@50 period14,prompt 33-34k 多轮上下文)。护栏全部按设计工作:
+三次全部切在 50-5971 token(旧行为各烧 32768),accept 2.33-3.33,均在 fp16
+锁死前被 3 轮规则拦截;`finish_reason=length` 是环切的对外呈现,客户端
+MAX_TOKENS 报错即打断器在干活。
+
+**护栏可观测:loop Prometheus counter。** 新增
+`sglang:num_output_loop_breaks_total`,接线在
+`batch_result_processor._handle_finish_state_updated_req` 的 finished 分支,
+gate = FINISH_LOOP_DETECTED + enable_metrics + **is_stats_logging_rank**
+(打断器每 TP rank 都跑,不 gate 则 sum() 膨胀 4 倍,首轮实测 3.0×4)。已知
+行为:multiprocess 模式 0 值 counter 不导出——/metrics 看不到序列 = 零环。
+单测 4 例;commit baa5fa7d6f。
+
+**指令通道:五臂 A/B → 服务端化 → 强化附录判死。** 同题"网页五子棋"
+agent 形态 ×21(max_tokens 5000):重试多样化全灭(原样 3/4 环;nudge 提醒
+3/4 环且入环更快,@52/@158 token 乱码环;temp 0.9 与 frequency_penalty 0.4
+各 4/4 环);**思考纪律 system prompt 0/5 全部正常完成**。据判据 a 落地
+`SGLANG_CHAT_SYSTEM_SUFFIX`(environ.py EnvStr(None),append 到首条
+system/developer 消息、无则插入,只挂 jinja chat-template 路径;单测 6 例;
+commit 75dc7e62c8;注入实证 prompt_tokens +35,行为实证 55 token 直接
+tool_calls)。随后**强化附录 A/B 判死**:62k 文档 filler 测试台 12+12 交错,
+A 臂(现行文本)11/12 环 vs B 臂(+强化附录)10/12 环,统计无差别——与
+K.9 rep 1.15 判死同构:指令/采样扰动不破成环动力学,附录不上线,现行文本
+保持。
+
+**长度梯度证伪:环率是形态阈值,不是长度的函数。** 同 filler 只变长度
+(8 发/档):7.5k tok 6/8 环、14.2k tok 6/8 环、62k tok 11/12 环——7.5k 到
+62k 全平,且全部 0 干净完成;单轮短上下文(~300 token)纪律文本才有效
+(0/5)。推论:**workbuddy 侧历史压缩救不了环率**(压到几百 token 才有效,
+不现实)。本批 44 发环 period 全谱 4-646,>32 者占多数——K.14 扩窗(2048)
+承重,旧窗口(32)必漏、旧行为各烧 32768;打断器全部吸收,cut 92-4430
+token,无一烧到 LIMIT。**收口结论:损伤控制(纪律文本 + 打断器 + LIMIT +
+counter)已到当前 checkpoint 的正确形态;环率本身无便宜杠杆**——采样五臂/
+温度/乘法惩罚/指令附录全判死,唯一理论解(环后回滚重采样)工程大且
+attractor 预期再吸入,不立项;根治在 checkpoint 端。
+
+**权重调研(hf-mirror):无修复 checkpoint,换量化治不了环。** base
+`zai-org/GLM-5.3-Flash` 提交史:08-30(生产量化 LibertAIDAI 的日期)之后
+只有 README/模板/元数据提交,**权重从未更新**;全部 NVFP4(nvidia 09-29 /
+RedHatAI 09-18 / local-inference-lab 09-16 / LibertAIDAI 08-30)量化同一
+base。兼容性备查(将来若换):RedHatAI 最干净(W4A16 group16 对称、无 KV
+覆写、model_mtp.safetensors 独立);nvidia 要求 fp8 KV cache(Volta 不可);
+local-inference-lab 是 MIXED_PRECISION(不可);消审查变体改权重有质量代价。
+社区 #47([BUG] Reasoning Loop on Trivial Task,open)坐实环是跨引擎
+(sglang/vLLM)跨客户端(opencode/Cline)的 checkpoint 级已知问题。
+
+**模板 None 残片(真发现,已换装待 boot)。** 生产 chat_template.jinja
+(LibertAIDAI 08-30 版)缺 zai 09-04 的 `{% elif content is not none %}`
+守卫:sglang 渲染链(`_apply_jinja_template` 的 model_dump 不动 content;
+`normalize_assistant_tool_call_arguments` 只规范 tool_calls arguments)把
+`content=null` 的每个 assistant 工具轮渲染成
+`<think>…</think>None<tool_call>`——**字面量 None 每轮进上下文**,多轮
+agent 会话持续累积训练分布外残片,是多轮形态环率暴涨的具体机制候选(亦解释
+社区"client dependent"现象)。同批还缺工具结果重排 early-break 守卫
+(upstream 维护者称 purely positive fix)。**已换装 zai 当前版模板**:原件
+备份 `chat_template.jinja.bak-20261007`,md5 双验(16ffa9ab = hf-mirror 源);
+容器内 transformers `apply_chat_template` 权威路径离线验证渲染正常、
+`</think>None` 残片消失。生效 = 下次引擎 boot(u2 指纹只哈希 .json,换
+jinja 不触发 requant;多轮 radix 前缀部分失效可接受);回滚 = cp .bak 回
+再 boot。`clear_thinking` 两版默认均 false(历史轮思考全回放);社区有翻转
+默认治环的个案自补,upstream 未采纳——若换模板后多轮环仍高,下一档是翻转
+它(行为变化大,先做多轮 A/B)。
+
+**模板换装注意事项(操作契约)。** ①模板文件在模型工件目录(库外,容器
+:ro 挂载),**不在镜像也不在仓库**——镜像重建不会回滚它,但重新下载/更换
+checkpoint 目录会连同换装一起丢:今后换任何量化(如 RedHatAI)或重拉模型,
+必须重查重做本修复。②修复按目录逐目录生效,zai 模板只适用 glm5_next 家族
+。本机实测矩阵(容器内 transformers 渲染):GLM-5.3-Flash-NVFP4 已修
+(16ffa9ab);GLM-5.3-Flash-UNCENSORED-NVFP4-DFlash2 已修(2026-10-07,
+见下);nvidiaQwen3.8-Flash-Next-NVFP4 实测无此病(False,Qwen 模板自带
+null 处理),不要套用 GLM 修复。
+
+**UNC 模板修复(2026-10-07,最小补丁而非整文件替换)。** UNC 的模板不是
+生产同款:它是 Solstice-AI 十级认知推理定制模板(Hermes→Oracle 十级思考
+人格 + `{REASON:}`/`[MODE:]` 消息内标签解析 + reasoning_effort 档位选择),
+整文件换 zai 版会丢掉整套十级系统。其 content 渲染区与生产原版逐字相同,
+故按 zai 修复做最小补丁(5 处):①content None 守卫;②tc.name `+`→`~`;
+③校验 k 循环 + entry 循环 early-break 守卫;④tool_calls 去重 i/j 循环
+guard+break;⑤尾部两行错位缩进归位。备份
+`chat_template.jinja.bak-20261007`(md5 0be0f638)。容器内渲染验证 7 项:
+None 残片消失、tool_response 渲染正确、默认 L7 Hyperion 注入、
+reasoning_effort 3/9/0 三档选择逻辑完好(0 档无人格注入 + 空思考块开场)。③快判命令:
+`grep -q "elif content is not none" chat_template.jinja`(命中 = 已带
+09-04 守卫)。④生效与回滚:模板 boot 时加载,换文件需重启引擎;u2 指纹
+只哈希 .json,不触发 requant;回滚 = 恢复 .bak 再 boot。⑤离线验证法:
+容器内 transformers `apply_chat_template` 权威路径(裸 jinja2 需补
+`jinja2.ext.loopcontrols` 扩展与 tojson ensure_ascii 覆写,且 tool_calls
+arguments 必须传 dict——模板契约,sglang 渲染前会 normalize)。
+
+**登记。** `output_loop_detector.py` 清理编辑残留(51-53 行死检查 + 重复
+赋值,行为不变,容器内直测 4 向量确认);`SGLANG_CHAT_SYSTEM_SUFFIX` 已按
+规范同步 serve 脚本注释(本节);新模板验收口径 = workbuddy 实战环事件频率
+(取证通道 = 调度器 warning 日志,见下)。
+
+**生产验证(2026-10-07,模板换装后首次 boot,compose dsa-mtp 形态)。**
+boot ~370s、u2 缓存命中(指纹 `679d4588ac1e008b` 不变,`.jinja` 不进指纹、
+零 requant)、KV 池 230400 满额、余 3.00 GB/rank、日志零错误。模板生效的
+定量证据:多轮工具对话(content=null 助手轮 ×2)线上 `prompt_tokens=174`
+与 NEW 模板离线渲染逐 token 吻合(OLD=176,差 2 = 每轮字面量 `None`;
+suffix 折叠 174−139=35 亦吻合)。glm47 工具解析 `finish=tool_calls` 结构化
+参数无损;chat 形态 needle 5 深度 5/5(含 25700);decode 门 76.6-78.3 tok/s
+(基线带 76.9-77.3)、prefill 门 7936×9 中位 1760 tok/s(基线 1745)。
+循环打断器合成触发 cut@13(period=4,repeats=3,finish 元数据 + warning)。
+
+**已知缺口(待下次镜像重建):** 运行镜像(fa0a2ed888 重建)含打断器与
+`update_finish_state` 接线,但不含 `num_output_loop_breaks_total` 计数器
+(`metrics_collector.py` 的注册是重建之后的提交)——本 boot `/metrics` 无此
+指标,日环比验收要等镜像吸收 HEAD;当前取证通道 = 调度器
+"Periodic output loop" warning 日志(docker logs,首日实战即此通道)。
+
+### K.17 思考段环解剖与思考预算判死(2026-10-07 晨;试装即回退)
+
+**workbuddy 复测"问题还在"(用户实测)。** 模板换装后首次实战 40 分钟:
+4 个环全部被循环打断器切断(cut@584/956/1470/3852,period 44-129,全部
+超出默认 32 窗,靠 K.14 的 2048 接住),零逃逸;workbuddy 切断后原样重试
+(radix 33152 全命中)。用户可见症状 = 截断/空答案,即环形成率未降。
+
+**环解剖(20k 测试台 8 发,新旧模板 A/B)。** 新模板 6/8 环 = 旧模板基线
+6/8——**模板对环形成率零影响**(None 残片修复正确但不治环,该假设证伪)。
+8 发全部死在思考段(枚举式漂移,think 3.1k-21.8k 字符、content 全空),分
+两个种群:①锁死成精确周期 → 打断器切(6/8,period 4/4/19/79/259/803);
+②**漂移永不锁死 → 逃逸**(2/8,r1/r5 烧满 5000 预算返回空正文)——精确
+重复检测原理上接不住"从不重复"的枚举流,这是打断器的盲区。workbuddy 实战
+4 环 accept 2.3-2.5(正常),非 one-hot 锁死指纹,是块级重复。
+
+**思考预算试装(上游 strict-thinking 机制)与当晚回退。** 机制:
+`--enable-strict-thinking` + `SGLANG_MAX_THINK_TOKENS`(上游已有 EnvInt(-1),
+reasoner grammar 的 token filter,预算耗尽后 mask 全部 token 只留
+`</think>` 强制进正文;glm45 检测器另有 5 个 think_excluded_tokens 随旗标
+全程 mask)。试装 4096(= 正常思考 ~500 token 的 8 倍),boot 健康、chat
+sanity 通过;但 20k 测试台 8 发 **8/8 环切、全部空正文、预算从未触发**——
+铁证:r5 输出 4661 token 全思考,超 4096 预算却无强制 `</think>`。根因(未
+继续深挖):NEXTN(`--enable-linear-replayssm-spec`)v2 worker 的 verify
+带 grammar_barrier,不走 spec_utils 的 `fill_vocab_mask` DFS 分支,reasoner
+filter 在本引擎形态(MTP + cuda-graph + 工具 EBNF)上**没有接线**。8/8 vs
+基线 6/8 在噪声带内,但不排除排除-mask 改变思考分布的负向影响 → 判无收益
+即回退(compose 与 serve 脚本同步撤除,留回退注记)。
+
+**现状与后续。** 生产栈 = suffix(劝)+ top_k/temp(扰动)+ 循环打断器
+(切锁死)+ LIMIT(兜底);漂移种群无服务器侧便宜杠杆,残余是 checkpoint
+属性。真实修复只剩两条路:①查清 v2 worker verify 的 grammar_barrier 机制、
+把 reasoner filter 接进 spec verify(上游集成考古,做完才可复装思考预算);
+②流中注入 `</think>` 后继续生成(真正把"空答案"变"有答案",但涉及
+detokenizer/spec 状态/radix 的流中注入,是大改,需先设计)。登记:今晚
+a/b 数据在 /tmp/ab3_*(无旗标)与 /tmp/ab4_*(旗标)。
+
+### K.18 思考预算接线收口:owning 模式 + 行保真修复,预算正式生效(2026-10-07)
+
+**K.17 根因改判。** 考古证实 v1/v2 verify 共用同一条
+`traverse_tree → fill_vocab_mask` DFS(spec_utils.py;eagle_worker_v2.verify →
+run_eagle_verify → build_grammar_vocab_mask),grammar_barrier 只是调度侧挂起点,
+**"v2 不走 fill_vocab_mask 分支"不成立**。真实根因在包装层:GLM 工具约束以
+`("full_assistant_ebnf", …)` 为 key,`ReasonerGrammarBackend._init_value_dispatch`
+对该 key 无条件返回裸内层 grammar(上游 PR #38890 引入排除、无后续修复),
+`_apply_request_reasoning_config` 的 `isinstance(req.grammar, ReasonerGrammarObject)`
+检查失败 → `SGLANG_MAX_THINK_TOKENS` 预算没有挂载点 → K.17 的 4661>4096 铁证。
+旁证:1Cat-vLLM 的 thinking_token_budget 证明"预算强制 × 工具 grammar"可并存;
+上游 #40468 证明 strict 下工具 grammar 应当被包装。
+
+**修复一:owning 模式(`grammar_owns_thinking`,仅 `--enable-strict-thinking`
+启用)。** EBNF 的 `thinking_block ::= content "</think>"` 自己拥有思考段(含收束
+符),普通 Reasoner 包装会把内层 FSM 饿死(上游排除的动机)。owning 模式:思考期
+accept/fill 全部转发内层(FSM 与 wrapper 状态机同步推进),仅预算耗尽时跳过内层
+fill、用 `set_token_filter(reset=True, allow=think_end)` 整行覆盖强制 `</think>`;
+rollback 精确委托 k(思考 token 都进了内层)。无旗标时返回裸对象,默认路径与上游
+逐字节一致(零回归面)。
+
+**修复二:思考期排除过滤行保真(实战炸出的第二个 bug)。** 首轮容器实测即
+`ValueError: Tokens not accepted` 四 rank 连炸、引擎自杀。离线 xgrammar 复现
+(xgrammar 0.1.32,GrammarMatcher 自洽:行位与 accept 一致)定案:glm45 的
+think_excluded_tokens 非空,思考期排除过滤带 `reset_vocab_mask=True` 执行——
+**整行重置为全放行再剔除 4 个排除 token,把内层 EBNF 刚写的真 allow-set 踩掉**;
+spec DFS 对父行做位检查放行了 EBNF 实际禁止的 draft token,内层 `accept_token`
+raise → 调度器死。修法:owning 模式下排除过滤 `reset=False`(在真行上 AND-剔除),
+预算耗尽覆盖仍 reset=True;非 owning 路径保持 reset=True 与上游行为一致。
+修复前 9 发 20k A/B 跑在该 bug 上(行违例概率低故未即炸),崩在首个长思考探针。
+
+**单测。** `test_reasoner_grammar_backend.py` 34 例全绿(新增 owning 模式 6 例 +
+行保真 bug 回归 1 例;mock inner 需补 `allocate_vocab_mask.side_effect` 返回真
+tensor——wrapper 存在内层时优先走内层钩子)。constrained 全套 153 passed
+(e2e 文件环境性剔除:真起服务与生产引擎抢卡)。
+
+**实测(4×V100,docker 内核 255s boot,KV 230400 满额)。**
+- **预算铁证**:裸 chat 探针(无 tools,同挂 full_assistant_ebnf)
+  `reasoning_tokens: 4097` = 4096 预算 + 1 个强制 `</think>`,思考段截断在半句、
+  content 3276 字符非空;后续 finish=length 是正文写环被循环打断器切(period 12),
+  独立机制。
+- **tools 完成探针**:finish=tool_calls、67 token、4s——自然思考收束(自然
+  `</think>` 过 EBNF verify)+ budget + glm47 解析共存,无泄露。
+- **三门**:prefill ~7.4k×9 = 1688-1733 tok/s(参照带 1740-1746,-1.5% 噪声带内);
+  decode 512×3 greedy = 77.9/77.9/77.9(门 74,参照带 76.9-77.3);needle chat
+  5/5(1300..25700 逐案命中)。prompt_tokens=55(20 裸题 + 35 suffix)sanity ✓。
+- **环 A/B**:20k 测试台修复构建 4 发全部思考段环切(循环打断器行为与 K.17 一致);
+  环率对预算不敏感符合预期——预算的作用是把 EBNF 请求的思考损伤上限从 32768
+  (LIMIT)钳到 4096,并保证思考段结束后必然进入正文/工具阶段,不治环本身。
+  **修复构建 20k 测试台 4 发:r3 = 预算生效的活样本**(`rt=4097` 强制收束 →
+  `finish=tool_calls`、content 607 字符)——K.17 旗标臂同类场景 0/8 有正文,
+  预算把一次本会烧到空正文的漂移 runaway 转成了完整工具调用;其余 3 发在
+  4096 前环切(rt 1193/3821/1927),与基线环率一致。
+
+**生产接线。** compose(~/vllm-Qwen3.8/docker-compose-sglang-v100-glm53.yaml):
+`SGLANG_MAX_THINK_TOKENS: "4096"` + `--enable-strict-thinking` +
+reasoner_grammar_backend.py overlay mount(K.15 模式,commit 后镜像重建吸收);
+serve 脚本同步(参数 source of truth)。K.17 的复装前提已解除,回退注记改接线注记。
