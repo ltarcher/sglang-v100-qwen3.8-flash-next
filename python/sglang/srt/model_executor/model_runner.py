@@ -1695,7 +1695,13 @@ class ModelRunner:
         prefill cuda-graph path and the EagerRunner's eager extend path."""
         kwargs = self._pp_kwargs(pp_proxy_tensors)
         if forward_batch.input_embeds is not None:
-            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+            # Follow the model dtype, not a hardcoded bf16: DFlash feeds the
+            # draft's hidden stream through here, and on fp16-only Volta a
+            # bf16 stream mixed into fp16 modules overflows the residual
+            # add-norm to NaN, collapsing every draft candidate.
+            kwargs["input_embeds"] = forward_batch.input_embeds.to(
+                self.model_config.dtype
+            )
         if (
             forward_batch.replace_embeds is not None
             and forward_batch.replace_positions is not None

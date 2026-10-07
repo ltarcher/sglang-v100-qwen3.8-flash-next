@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.dflash_selector import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -460,17 +460,31 @@ class DFlashGroupedConv(nn.Module):
         torch._dynamo.mark_static(hidden_states, 1)
         torch._dynamo.mark_static(delta, 1)
         torch._dynamo.mark_static(delta, 2)
-        return _grouped_conv(
-            hidden_states,
-            delta,
-            self.base_kernel[side],
+        # fp16 has no headroom for coefficient*block products, and not even for
+        # the side=1 output itself: a trained base_kernel entry (~5) times an
+        # attention-output outlier (~1e3) exceeds 65504, and the downstream
+        # residual+RMSNorm turns that inf into exactly one NaN per token row.
+        # Compute in fp32; finish (side=1) stays fp32 for the residual island.
+        compute_dtype = (
+            torch.float32
+            if hidden_states.dtype == torch.float16
+            else hidden_states.dtype
+        )
+        out = _grouped_conv(
+            hidden_states.to(compute_dtype),
+            delta.to(compute_dtype),
+            self.base_kernel[side].to(compute_dtype),
             self.block_size,
             self.num_groups,
             self.group_size,
             self.taps,
         )
+        if side == 1 and hidden_states.dtype == torch.float16:
+            return out
+        return out.to(hidden_states.dtype)
 
     def prepare(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.to(self.kernel_projection.weight.dtype)
         coefficients = self.kernel_projection(hidden_states).reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
@@ -481,6 +495,18 @@ class DFlashGroupedConv(nn.Module):
 
     def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
         return self._convolve(hidden_states, coefficients, side=1)
+
+
+def _dflash_residual_norm(
+    residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    # fp32-island RMSNorm: fused_add_rmsnorm kernels reject fp32, so the add+norm
+    # over the fp32 residual stream is plain torch; the normed output is cast
+    # back to fp16 for the next fp16 GEMM (normalized values fit fp16).
+    xf = residual.float()
+    variance = xf.pow(2).mean(-1, keepdim=True)
+    xf = xf * torch.rsqrt(variance + eps)
+    return (xf * weight.float()).to(torch.float16)
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -530,9 +556,19 @@ class DFlashDecoderLayer(nn.Module):
             return hidden_states, residual
 
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
+        # The fp32-island branches carry the residual stream in fp32 whenever a
+        # conv finish handed back fp32 (fp16 model); plain torch does the add+norm
+        # because the fused kernels reject fp32.
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif hidden_states.dtype == torch.float32:
+            residual = residual + hidden_states
+            hidden_states = _dflash_residual_norm(
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -548,7 +584,15 @@ class DFlashDecoderLayer(nn.Module):
         if attention_kernel is not None:
             attn_out = self.attention_conv.finish(attn_out, attention_kernel)
 
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        if attn_out.dtype == torch.float32:
+            residual = residual + attn_out
+            hidden_states = _dflash_residual_norm(
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
         if self.mlp_conv is not None:
@@ -756,6 +800,11 @@ class DFlashDraftModel(nn.Module):
         if hidden_states.numel() != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
+            elif hidden_states.dtype == torch.float32:
+                residual = residual + hidden_states
+                hidden_states = _dflash_residual_norm(
+                    residual, self.norm.weight, self.norm.variance_epsilon
+                )
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
