@@ -46,6 +46,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         allocate_vocab_mask_fn=None,
         move_vocab_mask_fn=None,
         apply_vocab_mask_fn=None,
+        grammar_owns_thinking: bool = False,
     ):
         super().__init__()
         self.grammar = grammar
@@ -58,6 +59,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
+        # True when the inner grammar covers the thinking segment itself (the
+        # full-assistant EBNF): accepts and mask fills are forwarded during
+        # thinking so its FSM advances in lockstep, instead of being deferred
+        # to the generation phase.
+        self.grammar_owns_thinking = grammar_owns_thinking
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
@@ -139,7 +145,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # grammar's is updated, not the wrapper's), so the guard never fires and
         # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
         self.current_token = token
-        if self._is_generation() and self.grammar is not None:
+        if (
+            self.grammar_owns_thinking or self._is_generation()
+        ) and self.grammar is not None:
             self.grammar.accept_token(token)
         self.transfer_state(token)
 
@@ -150,9 +158,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
     def rollback(self, k):
         if self.grammar is not None:
-            steps_after = min(k, max(0, self.tokens_after_end))
-            if steps_after > 0:
-                self.grammar.rollback(steps_after)
+            if self.grammar_owns_thinking:
+                # The inner grammar consumed every accepted token (thinking
+                # included), so the rewind is the full k.
+                self.grammar.rollback(k)
+            else:
+                steps_after = min(k, max(0, self.tokens_after_end))
+                if steps_after > 0:
+                    self.grammar.rollback(steps_after)
         for _ in range(k):
             self.rollback_state()
 
@@ -163,21 +176,47 @@ class ReasonerGrammarObject(BaseGrammarObject):
             < self.max_think_tokens
         )
 
-    def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
+    def _do_token_filter(
+        self, vocab_mask, token_ids, idx, is_allowed=True, reset_vocab_mask=True
+    ):
         if self.token_filter_fn is not None:
-            self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
+            self.token_filter_fn(
+                vocab_mask,
+                token_ids,
+                idx,
+                is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self._is_thinking():
+            budget_exhausted = self.enable_token_filter and not self._can_think_more()
+            if (
+                self.grammar_owns_thinking
+                and self.grammar is not None
+                and not budget_exhausted
+            ):
+                # The inner grammar covers the thinking segment itself (the
+                # full-assistant EBNF): its row stays the source of truth so
+                # the FSM advances in lockstep and can consume the forced
+                # think-end sequence once the budget trips. Read-only on the
+                # FSM, so skipping it while exhausted is safe.
+                self.grammar.fill_vocab_mask(vocab_mask, idx)
             if not self.enable_token_filter:
                 return
-            if self._can_think_more():
+            if not budget_exhausted:
                 if self.think_excluded_token_ids is not None:
+                    # In owning mode the inner grammar already wrote its
+                    # allow-set into the row: only clear the excluded bits on
+                    # top of it. Resetting would clobber the row to
+                    # all-allowed and let invalid draft tokens past the
+                    # verify DFS into inner.accept_token (which raises).
                     self._do_token_filter(
                         vocab_mask,
                         self.think_excluded_token_ids,
                         idx,
                         is_allowed=False,
+                        reset_vocab_mask=not self.grammar_owns_thinking,
                     )
             else:
                 self._do_token_filter(
@@ -221,6 +260,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             allocate_vocab_mask_fn=self.allocate_vocab_mask_fn,
             move_vocab_mask_fn=self.move_vocab_mask_fn,
             apply_vocab_mask_fn=self.apply_vocab_mask_fn,
+            grammar_owns_thinking=self.grammar_owns_thinking,
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
@@ -322,7 +362,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return excluded_ids
 
     def _make_grammar_object(
-        self, grammar: Optional[BaseGrammarObject], reasoning: bool
+        self,
+        grammar: Optional[BaseGrammarObject],
+        reasoning: bool,
+        grammar_owns_thinking: bool = False,
     ) -> ReasonerGrammarObject:
         obj = ReasonerGrammarObject(
             grammar=grammar,
@@ -334,6 +377,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
+            grammar_owns_thinking=grammar_owns_thinking,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj
@@ -353,5 +397,15 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
-            return ret
+            # The full-assistant EBNF (GLM47 tool calls) covers the thinking
+            # segment itself, so the plain wrapper would starve its FSM of the
+            # thinking tokens and break the constraint -- and unwrapped, the
+            # thinking budget has nothing to attach to. Under strict thinking,
+            # wrap in owning mode: accepts and mask fills are forwarded during
+            # thinking, and only the exhausted-budget row override is layered
+            # on top. Without --enable-strict-thinking there is no budget
+            # layer, so the raw object stays (upstream behavior).
+            if not self.enable_strict_thinking:
+                return ret
+            return self._make_grammar_object(ret, reasoning, grammar_owns_thinking=True)
         return self._make_grammar_object(ret, reasoning)

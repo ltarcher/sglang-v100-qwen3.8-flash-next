@@ -255,7 +255,35 @@ class TestReasonerGrammarBackend(unittest.TestCase):
                 wrapped.accept_token(42)
                 inner_grammar.accept_token.assert_called_once_with(42)
 
-        bare = reasoner._init_value_dispatch(
+    def test_full_assistant_ebnf_wrapped_only_under_strict_thinking(self):
+        """Upstream leaves the full-assistant EBNF (GLM47 tool calls) unwrapped
+        because the plain wrapper starves its FSM of the thinking tokens; that
+        also silently dropped the thinking budget. Under strict thinking the
+        owning-mode wrapper must attach the budget while keeping the FSM fed;
+        without strict thinking the raw object must come back unchanged."""
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        inner_grammar = MagicMock()
+        backend._dispatch_result = inner_grammar
+
+        strict = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=True,
+        )
+        wrapped = strict._init_value_dispatch(
+            ("full_assistant_ebnf", 'root ::= "OK"'), reasoning=True
+        )
+        self.assertIsInstance(wrapped, ReasonerGrammarObject)
+        self.assertTrue(wrapped.grammar_owns_thinking)
+
+        plain = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+        bare = plain._init_value_dispatch(
             ("full_assistant_ebnf", 'root ::= "OK"'), reasoning=True
         )
         self.assertIs(bare, inner_grammar)
@@ -593,6 +621,129 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
 
         # Guard must have fired -> no second accept of 4913 into the inner grammar.
         inner_grammar.accept_token.assert_not_called()
+
+
+class TestReasonerGrammarObjectOwningMode(unittest.TestCase):
+    """grammar_owns_thinking: the inner grammar covers the thinking segment
+    itself (the full-assistant EBNF). The wrapper must keep the inner FSM in
+    lockstep (accepts/fills forwarded during thinking) so it can consume the
+    forced think-end sequence when the budget trips; the plain wrapper's
+    defer-until-generation contract would starve it (upstream #38890)."""
+
+    THINK_END = 7
+
+    def _make_owning_object(self, max_think_tokens=-1):
+        inner_grammar = MagicMock()
+        inner_grammar.is_terminated.return_value = False
+        # The wrapper prefers the inner grammar's mask hooks when present
+        # (mirrors XGrammarGrammar), so the mock must produce real tensors.
+        inner_grammar.allocate_vocab_mask.side_effect = lambda vs, bs, d: torch.full(
+            (bs, (vs + 31) // 32), -1, dtype=torch.int32
+        )
+        # Simulate the EBNF row: the grammar's own allowed set.
+        inner_grammar.fill_vocab_mask.side_effect = lambda vm, idx: vm[idx].fill_(-1)
+        obj = ReasonerGrammarObject(
+            grammar=inner_grammar,
+            think_end_ids=[self.THINK_END],
+            think_excluded_token_ids=[3, 5],
+            max_think_tokens=max_think_tokens,
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+            allocate_vocab_mask_fn=lambda vs, bs, d: torch.full(
+                (bs, (vs + 31) // 32), -1, dtype=torch.int32
+            ),
+            move_vocab_mask_fn=lambda vm, d: vm,
+            apply_vocab_mask_fn=lambda logits, vm: None,
+            grammar_owns_thinking=True,
+        )
+        obj.maybe_init_reasoning(True)
+        return obj, inner_grammar
+
+    def test_thinking_accepts_and_fills_are_forwarded_to_inner(self):
+        obj, inner = self._make_owning_object()
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.accept_token(10)
+        obj.fill_vocab_mask(mask, 0)
+
+        inner.accept_token.assert_called_once_with(10)
+        inner.fill_vocab_mask.assert_called_once_with(mask, 0)
+        # The EBNF row minus the strict-thinking exclusions.
+        allowed = _allowed_token_ids(mask, [0, 1, 3, 5, self.THINK_END, 8])
+        self.assertEqual(allowed, [0, 1, self.THINK_END, 8])
+
+    def test_exclusion_filter_preserves_the_inner_row(self):
+        # Bug regression: the exclusion filter ran with reset_vocab_mask=True,
+        # clobbering the EBNF row the inner fill had just written back to
+        # all-allowed; invalid draft tokens then passed the verify DFS row
+        # check and crashed the engine in inner.accept_token ("Tokens not
+        # accepted"). In owning mode the exclusions must only clear bits on
+        # top of the inner allow-set.
+        obj, inner = self._make_owning_object()
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        # The EBNF allow-set is {1, 3} only.
+        def restricted_row(vm, idx):
+            vm[idx].zero_()
+            for token_id in (1, 3):
+                vm[idx][token_id // 32] |= 1 << (token_id % 32)
+
+        inner.fill_vocab_mask.side_effect = restricted_row
+
+        obj.fill_vocab_mask(mask, 0)
+
+        allowed = _allowed_token_ids(mask, [0, 1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual(allowed, [1])
+
+    def test_budget_exhaustion_overrides_row_without_inner_fill(self):
+        obj, inner = self._make_owning_object(max_think_tokens=1)
+        obj.accept_token(10)  # the one budgeted thinking token
+        inner.fill_vocab_mask.reset_mock()
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        # The row must force the think-end sequence; the inner fill is
+        # skipped (read-only) so its row cannot resurrect other tokens.
+        inner.fill_vocab_mask.assert_not_called()
+        allowed = _allowed_token_ids(mask, [0, 1, 3, 5, self.THINK_END, 8, 10])
+        self.assertEqual(allowed, [self.THINK_END])
+
+    def test_forced_think_end_transitions_to_inner_governed_generation(self):
+        obj, inner = self._make_owning_object(max_think_tokens=1)
+        obj.accept_token(10)
+        obj.accept_token(self.THINK_END)  # forced end, forwarded to the FSM
+
+        self.assertTrue(obj._is_generation())
+        self.assertEqual(
+            [call.args[0] for call in inner.accept_token.call_args_list],
+            [10, self.THINK_END],
+        )
+
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+        inner.fill_vocab_mask.assert_called_once_with(mask, 0)
+
+    def test_rollback_rewinds_inner_exactly_across_the_boundary(self):
+        obj, inner = self._make_owning_object()
+        for token in (10, 11, self.THINK_END, 20):
+            obj.accept_token(token)
+        self.assertTrue(obj._is_generation())
+
+        obj.rollback(3)
+
+        # Every accepted token went to the inner grammar (thinking included),
+        # so the rewind is the full k, unlike the plain wrapper's generation-
+        # only clamp.
+        inner.rollback.assert_called_once_with(3)
+        self.assertTrue(obj._is_thinking())
+        # Back to the state right after the first thinking token: one think
+        # token remains (the think-end token itself is not counted).
+        self.assertEqual(obj.tokens_in_think, 1)
+
+    def test_copy_preserves_ownership_flag(self):
+        obj, inner = self._make_owning_object(max_think_tokens=1)
+        self.assertTrue(obj.copy().grammar_owns_thinking)
 
 
 if __name__ == "__main__":
