@@ -453,6 +453,11 @@ def handle_model_specific_adjustments(server_args: Any):
             # TILELANG_MHC_PRE=1 would otherwise walk into that branch and
             # NameError.
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            # The fused mHC post+pre boundary kernel (mhc_fused_post_pre)
+            # asserts bf16 residual/x; Volta runs fp16. Fall back to the
+            # unfused hc_post + hc_pre sequence, which is the measured
+            # TileLang pre/post production form.
+            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
