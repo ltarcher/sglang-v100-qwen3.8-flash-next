@@ -225,6 +225,16 @@ services:
       - "1"
       - --speculative-num-draft-tokens
       - "4"
+      # Draft proposals sample from q=softmax(logits/T) instead of argmax so
+      # they match the temperature-sampled verify. Measured A/B 2026-10-08:
+      # real-content accept 1.0-2.4 -> 2.58-2.75, client decode 20-50 -> 42-64
+      # tok/s. Unbiased (output distribution unchanged, loop-attractor
+      # families identical); greedy rows (top_k=1, incl. the temp-0 rewrite)
+      # still propose argmax so the greedy decode gate keeps its baseline
+      # fingerprint; zero per-step overhead (steps/s flat ~20-25/s). The
+      # spec accept-rate breaker above keeps its 0.96 threshold: healthy
+      # content sits at ~0.58 per-draft under RS, locks still read 1.0.
+      - --speculative-use-rejection-sampling
       - --enable-linear-replayssm-spec
       # Single stream: the mamba slot budget (8 slots, 5/request) clamps
       # concurrency to 1 at the 230k pool; raising this just logs a cap

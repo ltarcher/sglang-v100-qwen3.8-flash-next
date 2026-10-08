@@ -219,6 +219,15 @@ if [[ "$MODE" == mtp || "$MODE" == spill-mtp || "$MODE" == dsa-mtp ]]; then
   SPEC+=(--speculative-algorithm NEXTN --speculative-num-steps 3
          --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
          --enable-linear-replayssm-spec --max-running-requests 4)
+  # Draft proposals sample from q=softmax(logits/T) instead of argmax, so they
+  # match the temperature-sampled verify: measured A/B 2026-10-08 put
+  # real-content accept at 2.58-2.75 (baseline 1.0-2.4, decode 20-50 -> 42-64
+  # tok/s client-side). Unbiased: the output distribution is unchanged, and
+  # the loop-attractor families are identical. Greedy rows (top_k=1,
+  # including the temp-0 rewrite) still propose argmax, so the greedy decode
+  # gate keeps its baseline fingerprint (75.5-81.8 tok/s @ accept 4.00 /
+  # rate 1.00). Zero per-step overhead: steps/s flat ~20-25/s across phases.
+  SPEC+=(--speculative-use-rejection-sampling)
 fi
 
 # P5-a: light up the 11 DSA layers' indexer + topk + sparse attention on the
