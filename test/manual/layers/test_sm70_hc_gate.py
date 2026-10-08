@@ -38,7 +38,8 @@ def test_precomputed_gate_matches_mix_combine_and_graph(batch, seed, monkeypatch
     def run(enabled):
         monkeypatch.setenv("SGLANG_SM70_MTP_HC_GATE", str(int(enabled)))
         mixed, residual = layer.mix(x)
-        assert len(residual) == (3 if enabled else 2)
+        assert len(residual) == 2
+        assert (layer._pending_gate is not None) == enabled
         return mixed, layer.combine(block_output, residual)
 
     run(False)

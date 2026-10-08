@@ -2,8 +2,6 @@
 import os
 from dataclasses import dataclass, field
 
-import torch
-
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -27,6 +25,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    is_sm70,
+    volta_compute_dtype,
 )
 
 
@@ -67,6 +69,14 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_sample_rate: int | None = 32000
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
+
+    def __post_init__(self) -> None:
+        # Volta has no bf16. The W4A16 path also rejects a non-fp16 source.
+        if is_sm70():
+            if self.dit_precision == "bf16":
+                self.dit_precision = "fp16"
+            if tuple(self.text_encoder_precisions) == ("bf16",):
+                self.text_encoder_precisions = ("fp16",)
 
     def accepts_audio_input(self) -> bool:
         return True
@@ -267,7 +277,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 )
             if compute_mode == "sage_fp8":
                 capability = current_platform.get_device_capability()
-                if capability is None or capability.to_int() != 90:
+                if capability is None or capability.to_int() not in (90, 120):
                     found = (
                         capability.as_version_str()
                         if capability is not None
@@ -275,14 +285,21 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     )
                     raise ValueError(
                         "MiniMax-H3 SubBlock compute_mode='sage_fp8' currently "
-                        "requires SM90 (compute capability 9.0); "
+                        "requires SM90 or SM120 (compute capability 9.0 or 12.0); "
                         f"found {found}."
                     )
-                from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
-                    _load_sparge_attention_sm90_ops,
-                )
+                if capability.to_int() == 90:
+                    from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
+                        _load_sparge_attention_sm90_ops,
+                    )
 
-                _load_sparge_attention_sm90_ops()
+                    _load_sparge_attention_sm90_ops()
+                else:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                        _load_sm120_sage_ops,
+                    )
+
+                    _load_sm120_sage_ops()
         if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
             if server_args.ring_degree > 1:
                 raise ValueError(
@@ -307,7 +324,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
-            torch.bfloat16,
+            volta_compute_dtype(),
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
@@ -329,6 +346,7 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.dit_config.arch_config.has_gate_compress = True
 
     def validate_quality_deployment(self, server_args) -> None:
@@ -349,3 +367,38 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3SamplingParams,
+        MiniMaxH3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )

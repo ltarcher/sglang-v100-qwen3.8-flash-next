@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _MODEL = os.environ.get(
-    "DSV41_CHECKPOINT", "$HOME/models/DeepSeek-V4.1-Flash"
+    "DSV41_CHECKPOINT", os.path.expanduser("~/models/DeepSeek-V4.1-Flash")
 )
 
 

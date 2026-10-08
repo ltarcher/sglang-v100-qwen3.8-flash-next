@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from array import array
+from unittest import mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    kv_private_tokens,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.sticky_last_sequence import StickyLastSequenceCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,8 +64,8 @@ class _FakeInnerCache:
         self.matches = 0
         self.reset_calls = 0
 
-    def is_chunk_cache(self):
-        return True
+    def supports_prefix_sharing(self):
+        return False
 
     def match_prefix(self, params):
         self.matches += 1
@@ -71,11 +76,9 @@ class _FakeInnerCache:
             best_match_node=None,
         )
 
-    def cache_finished_req(self, req, is_insert=True, **kwargs):
-        self.finished.append(req)
-
-    def cache_unfinished_req(self, req, **kwargs):
-        return None
+    def checkpoint(self, req, *, up_to):
+        if req.finished():
+            self.finished.append(req)
 
     def reset(self):
         self.reset_calls += 1
@@ -112,13 +115,14 @@ class _FakeInnerCache:
 
 
 class _FakeReq:
-    def __init__(self, req_pool_idx, committed, allocated, origin, output=None, rid=None):
+    def __init__(
+        self, req_pool_idx, committed, allocated, origin, output=None, rid=None
+    ):
         self.rid = rid
         self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
             kv_allocated_len=allocated,
-            swa_evicted_seqlen=0,
             cache_protected_len=0,
         )
         self.origin_input_ids = list(origin)
@@ -128,6 +132,11 @@ class _FakeReq:
         self.finished_reason = None
         self.finished_len = None
         self.to_finish = None
+        self.skip_radix_cache_insert = False
+        self.extend_range = None
+
+    def finished(self):
+        return self.finished_reason is not None
 
     @property
     def output_ids_through_stop(self):
@@ -138,6 +147,17 @@ class _FakeReq:
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
+
+
+class _Range:
+    def __init__(self, end):
+        self.end = end
+
+
+def _release(cache, req):
+    """The tree calls release_kv_cache makes for a finished request."""
+    if not cache.claim_kv_row(req):
+        cache.checkpoint(req, up_to=req.kv.kv_allocated_len)
 
 
 def _key(ids, extra_key=None, cache_salt=None, limit=None):
@@ -167,14 +187,14 @@ class TestStickyLastSequence(CustomTestCase):
             origin=origin,
             output=output,
         )
-        cache.cache_finished_req(req, kv_len_to_handle=n)
+        _release(cache, req)
         return req, ids
 
     def test_exact_continuation_hits(self):
         cache, inner, allocator, pool = self._make()
         _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
-        self.assertEqual(cache.session_held_tokens(), 10)
-        self.assertEqual(cache.session_held_req_count(), 1)
+        (kv,) = cache.session_records().values()
+        self.assertEqual(kv_private_tokens(kv, cache.page_size), 10)
         self.assertFalse(allocator.freed)
         self.assertEqual(pool.free_slots, [])
 
@@ -187,6 +207,31 @@ class TestStickyLastSequence(CustomTestCase):
         self.assertEqual(result.device_indices.tolist(), list(range(10)))
         self.assertEqual(nxt.kv.req_pool_idx, 0)
         self.assertEqual(result.cache_protected_len, 0)
+
+    def test_pin_stops_at_the_csa2_image(self):
+        # Without the overlap loop the image ends before the last token.
+        cache, inner, allocator, pool = self._make()
+        target = "sglang.srt.mem_cache.sticky_last_sequence.csa2_image_len"
+        with mock.patch(target, return_value=9):
+            _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
+        self.assertEqual(cache._last_ids, tuple(last[:9]))
+        self.assertEqual(cache._slot.kv.kv_committed_len, 9)
+
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        result = cache.match_prefix(
+            MatchPrefixParams(key=_key(last + [50, 51]), req=nxt)
+        )
+        self.assertEqual(len(result.device_indices), 9)
+
+    def test_pin_ignores_an_image_outside_the_output(self):
+        # An image past the stop (overlap loop) or before the prompt end
+        # (another request's) keeps the full pin.
+        for image in (12, 5, None):
+            cache, *_ = self._make()
+            target = "sglang.srt.mem_cache.sticky_last_sequence.csa2_image_len"
+            with mock.patch(target, return_value=image):
+                _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
+            self.assertEqual(cache._last_ids, tuple(last))
 
     def test_shorter_prompt_misses_and_drops(self):
         cache, inner, allocator, pool = self._make()
@@ -222,7 +267,8 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=8,
             origin=list(range(8)),
         )
-        cache.cache_unfinished_req(partial)
+        partial.extend_range = _Range(8)
+        checkpoint_kv_cache(partial, cache)
         self.assertEqual(cache._cuts, [8])
         _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
         self.assertEqual(last, list(range(10)))
@@ -236,8 +282,40 @@ class TestStickyLastSequence(CustomTestCase):
         self.assertEqual(len(result.device_indices), 8)
         self.assertEqual(result.device_indices.tolist(), list(range(8)))
         self.assertEqual(nxt.kv.req_pool_idx, 0)
-        self.assertEqual(cache._last_ids, tuple(last))
+        self.assertEqual(cache._last_ids, tuple(last[:8]))
         self.assertEqual(cache._cuts, [8])
+
+    def test_each_tool_turn_resumes_at_the_previous_prompt_end(self):
+        """A turn's prompt-end stop must survive its own pin.
+
+        The next request re-renders the assistant reply, so it diverges inside
+        the pinned output and can only resume at that prompt end. Losing it
+        sent every turn back to the first prompt end.
+        """
+        cache, _, _, _ = self._make(row_len=64)
+        first = list(range(8))
+        prefill = _FakeReq(req_pool_idx=0, committed=8, allocated=8, origin=first)
+        prefill.extend_range = _Range(8)
+        checkpoint_kv_cache(prefill, cache)
+        self._pin(cache, origin=first, output=[8, 9])
+
+        second = first + [40, 41, 42, 43]
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        result = cache.match_prefix(MatchPrefixParams(key=_key(second), req=nxt))
+        self.assertEqual(len(result.device_indices), 8)
+        nxt.origin_input_ids = second
+        nxt.kv.kv_committed_len = nxt.kv.kv_allocated_len = len(second)
+        nxt.extend_range = _Range(len(second))
+        checkpoint_kv_cache(nxt, cache)
+        nxt.output_ids = [44, 45]
+        nxt.kv.kv_committed_len = nxt.kv.kv_allocated_len = len(second) + 2
+        _release(cache, nxt)
+        self.assertIn(len(second), cache._cuts)
+
+        third = second + [50, 51]
+        last = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        result = cache.match_prefix(MatchPrefixParams(key=_key(third), req=last))
+        self.assertEqual(len(result.device_indices), len(second))
 
     def test_unfinished_stop_is_extend_end_not_the_sampled_token(self):
         cache, _, _, _ = self._make()
@@ -250,8 +328,8 @@ class TestStickyLastSequence(CustomTestCase):
             origin=list(range(8)),
             output=[8],
         )
-        req.extend_range = type("Range", (), {"end": 8})()
-        cache.cache_unfinished_req(req)
+        req.extend_range = _Range(8)
+        checkpoint_kv_cache(req, cache)
         self.assertEqual(cache._cuts, [8])
 
     def test_chunk_stop_is_extend_end(self):
@@ -262,8 +340,8 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=4,
             origin=list(range(10)),
         )
-        req.extend_range = type("Range", (), {"end": 4})()
-        cache.cache_unfinished_req(req)
+        req.extend_range = _Range(4)
+        checkpoint_kv_cache(req, cache)
         self.assertEqual(cache._cuts, [4])
 
     def test_cuts_keep_the_newest_stops(self):
@@ -319,7 +397,7 @@ class TestStickyLastSequence(CustomTestCase):
             origin=list(range(4)),
         )
         req.finished_reason = FINISH_ABORT("too long")
-        cache.cache_finished_req(req, kv_len_to_handle=4)
+        _release(cache, req)
         self.assertIsNone(cache._last_ids)
         self.assertEqual(inner.finished, [req])
 
@@ -331,12 +409,12 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=12,
             origin=list(range(12)),
         )
-        req.extend_range = type("R", (), {"end": 4})()
-        cache.cache_unfinished_req(req)
-        req.extend_range = type("R", (), {"end": 8})()
-        cache.cache_unfinished_req(req)
+        req.extend_range = _Range(4)
+        checkpoint_kv_cache(req, cache)
+        req.extend_range = _Range(8)
+        checkpoint_kv_cache(req, cache)
         req.finished_reason = FINISH_ABORT("client")
-        cache.cache_finished_req(req)
+        _release(cache, req)
 
         self.assertEqual(cache._last_ids, tuple(range(8)))
         self.assertEqual(inner.finished, [])
@@ -371,9 +449,9 @@ class TestStickyLastSequence(CustomTestCase):
             allocated=8,
             origin=list(range(12)),
         )
-        req.extend_range = type("R", (), {"end": 8})()
+        req.extend_range = _Range(8)
         req.finished_reason = FINISH_ABORT("client")
-        cache.cache_finished_req(req)
+        _release(cache, req)
         self.assertEqual(cache._last_ids, tuple(range(8)))
         self.assertEqual(inner.finished, [])
         nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
@@ -390,7 +468,7 @@ class TestStickyLastSequence(CustomTestCase):
         self.assertEqual(pool.free_slots, [0])
         self.assertTrue(allocator.freed)
         self.assertEqual(inner.reset_calls, 1)
-        self.assertEqual(cache.session_held_tokens(), 0)
+        self.assertEqual(cache.session_records(), {})
 
     def test_second_finish_updates_last_ids(self):
         cache, inner, _, _ = self._make()
@@ -401,17 +479,21 @@ class TestStickyLastSequence(CustomTestCase):
         nxt.output_ids = [21]
         nxt.kv.kv_committed_len = 9
         nxt.kv.kv_allocated_len = 9
-        cache.cache_finished_req(nxt, kv_len_to_handle=9)
+        _release(cache, nxt)
         self.assertEqual(cache._last_ids, tuple(last + [20, 21]))
         self.assertEqual(inner.finished, [])
         self.assertFalse(nxt.kv.holds_kv)
 
-    def test_held_tokens_excluded_when_in_batch(self):
+    def test_request_on_the_pin_runs_on_the_session_record(self):
+        # Pool accounting counts the pin's row once: as session-held, and not
+        # again for a request whose kv record is that session record.
         cache, _, _, _ = self._make()
-        self._pin(cache, origin=list(range(5)), output=[5])
-        self.assertEqual(cache.session_held_tokens(), 6)
-        self.assertEqual(cache.session_held_tokens(active_pool_idxs={0}), 0)
-        self.assertEqual(cache.session_held_req_count(active_pool_idxs={0}), 0)
+        _, last = self._pin(cache, origin=list(range(5)), output=[5])
+        (kv,) = cache.session_records().values()
+        self.assertEqual(kv_private_tokens(kv, cache.page_size), 6)
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        cache.match_prefix(MatchPrefixParams(key=_key(last + [6]), req=nxt))
+        self.assertIs(nxt.kv, kv)
 
     def test_health_check_miss_does_not_drop_pin(self):
         cache, inner, allocator, pool = self._make()
@@ -439,7 +521,8 @@ class TestStickyLastSequence(CustomTestCase):
             origin=[0],
             rid="HEALTH_CHECK_abc",
         )
-        cache.cache_finished_req(req, kv_len_to_handle=1)
+        req.finished_reason = FINISH_LENGTH(1)
+        _release(cache, req)
         self.assertIsNone(cache._last_ids)
         self.assertEqual(inner.finished, [req])
 

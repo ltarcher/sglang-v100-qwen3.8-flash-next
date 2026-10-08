@@ -1,447 +1,201 @@
-<div align="center" id="sglang-v100-top">
+<div align="center" id="top">
 
-# SGLang&nbsp;V100
+# sglang-sxm2
 
-*"Cool-kids-on-more-steroids"-Release ;)*
+**An agentic-coding inference engine for N× V100-SXM2.**
 
-**Qwen3.8-Flash-Next** (125B MoE, NVFP4 W4A16, FP16 KV, 4× V100-32GB, 262k) — prefill ~3,000 tok/s, decode ~100 tok/s per stream, ~180 tok/s aggregate at 3 streams.
-
-**DeepSeek-V4.1-Flash** (official mixed MXFP8+MXFP4, DSpark, 8× V100-32GB, 256k, one stream) — short code ~9 tok/s, warm prefill ~560 tok/s.
-
-**GLM-5.3-Flash** (320B/18B MoE, 34× KDA linear attention + 11× DSA, NVFP4 checkpoint requantized to a 2-bit resident expert pool, 4× V100-32GB) — ship shape (Triton full attention): decode ~21 tok/s per stream, 8k prefill ~254 tok/s; `dsa` mode (sparse indexer + sm70 TileLang sparse attention, 2026-10-03): 8k prefill 1390 tok/s (+94%), decode 43.9 tok/s with MTP (accept 2.0–3.85); fp16-KV 230k-pool production landing with the TileLang mHC path default-on (2026-10-06, unified image, production compose): the full 230,400-token pool fits at mem-fraction 0.94 (single stream -- the 8-slot mamba cache hard-clamps concurrency to 1), 8k prefill 1740-1746 tok/s steady state (median 1745, +17.3% over the torch-mHC fallback stands; first pass 1686 = JIT warmup), decode 76.9-77.3 tok/s (128-in/512-out e2e, accept 3.13-3.50; protocol line: 74.7 at the u2-v2 closure), needle 5/5 at depths 1300-25700; 230k validated of 1M native.
-
-A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang). Those three models are the supported ones. Others may load; they are untested here.
+Current open-weight models on Volta GPUs, with long context, tool calls, and the native Anthropic Messages API, so Claude Code connects directly.
+SXM2 (NVLink) is only needed for speed. Any set of 32 GB V100s works, PCIe cards included.
 
 </div>
 
 ---
 
-## What this is
+## Models
 
-Upstream SGLang does not support Volta. CUDA 13 dropped sm70, FlashAttention needs sm80+, and Volta has no bfloat16. This fork serves frontier-class long-context models on V100s anyway, including agentic coding through the native Anthropic Messages API (Claude Code connects directly).
-
-**Qwen3.8-Flash-Next** is the soaked model: 125B MoE, a 51 GB host-offloaded PLE n-gram table, hybrid 36×GDN + 12×QSA attention, a built-in MTP draft head, and a vision tower. It runs at the model's native 262,144-token context on four 32 GB V100s, NVFP4 weights, FP16 KV. On the MTP recipe below, prefill holds about **3,000 tok/s** from 8k through 128k. One stream decodes at about **100 tok/s** (~46 target forwards/s, accept length ~2.1 on this padding workload). Three streams reach about **180 tok/s** aggregate. Full table: [Qwen](#qwen38-flash-next).
-
-**DeepSeek-V4.1-Flash** ([checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)) is the second engine, and the one this tree serves on Volta: CSA2 sparse attention, host Engram, MXFP4 expert spill, and the checkpoint's own DSpark draft, on eight 32 GB V100s. One resident agent session continues from a recorded prefix stop. A second session still prefills from scratch. Short code is about **9 tok/s**; warm 8k prefill is about **560 tok/s**. Vision support for casual image inference (semi-performant). Full table: [DeepSeek-V4.1-Flash](#deepseek-v41-flash).
-
-## Hardware and software requirements
-
-| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash |
+| Model | GPUs | Context | Use it for |
 |---|---|---|---|
-| GPUs | 4× V100 32 GB (SXM2 recommended; NVLink helps, a partial mesh is fine). Four cards are the Qwen shape | **8×** V100-SXM2-32GB, TP=8 / EP=8. Four cards are not enough | 4× V100 32 GB, TP=4 |
-| Host RAM | **~134 GB measured in use** at 262k with `--hicache-size 8`. 160 GB is a comfortable floor. The host cache tier scales with `--hicache-size` | Host Engram (~189 GiB) plus pinned expert spill, on a large RAM node next to the GPUs, with **1G hugepages** on that NUMA node | No resident expert state in the u2-pool mode (the spill modes pin ~80 GB). The 182 GB checkpoint streams through the page cache once |
-| Disk | 126 GB NVFP4 weights, plus the disk cache tier | ~476 GB (48 shards) | 182 GB NVFP4 (safetensors ×120), plus the u2 staging dir — **real disk, not tmpfs** |
-| Context | 262,144 | 262,144 advertised. 8k prefill is what has been smoked; 512k has not left ~300 MiB for the Engram MXFP8 unpack | 1,048,576 native. 8k is what has been smoked |
-| CUDA | 12.8 or 12.9. CUDA 13.x removed Volta | same | same |
-| Host compiler | GCC **≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, and many distros now default to it | same | same |
-| Python | 3.12 | 3.12 | 3.12 |
+| **[GLM-5.3-Flash](docs/v100/GLM-5.3-Flash.md)**, 320B MoE, NVFP4, MTP | 8× V100 32 GB | 240k | **Agentic coding.** The primary model |
+| **[Qwen3.8-Flash-Next](docs/v100/Qwen3.8-Flash-Next.md)**, 125B MoE, NVFP4, MTP | 4× V100 32 GB | 262k | Coding and chat on four cards, image input, up to 3 parallel requests |
+| **[DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md)**, official MXFP8 + MXFP4, DSpark | 8× V100 32 GB, ~300 GiB host RAM | 256k | **Best reasoning and world knowledge** of the four. The full official checkpoint, for agentic coding where answer quality matters more than speed |
+| **[MiniMax-H3](docs/v100/MiniMax-H3.md)**, video + audio | 4× V100 32 GB | 4–15 s clips | Text-to-video, keyframes, reference image/video/audio |
 
-The 32 GB-per-GPU figure is not negotiable for Qwen: the NVFP4 weights alone are ~22 GB per rank at TP=4. The host-RAM and disk figures are measured on a running system. Four PCIe-only V100s (P2P, no NVLink): set `SGLANG_CUSTOM_AR_ALLOW_PCIE=1` and `NCCL_P2P_LEVEL=PXB`. Those stay off by default; leave them off on an 8× hybrid NVLink mesh.
+Each model page has the full measurements, the exact launch recipe, and why each flag has its value. Other models may load, but they are untested here.
 
-## Quick start
+**Which one fits?**
+- **8 cards:** GLM-5.3-Flash for fast turns. DeepSeek-V4.1-Flash for the hardest problems, if the host has the RAM.
+- **4 cards:** Qwen3.8-Flash-Next for text and images, MiniMax-H3 for video.
+- **16 GB cards:** none of the recipes fit. Qwen's NVFP4 weights alone take ~22 GB per GPU on four cards.
+
+## Performance
+
+Measured on 8× V100-SXM2-32GB (two NVLink quads joined by bridges), one request at a time unless noted, temperature 0.
+
+### GLM-5.3-Flash: fast tool-call turns
+
+In an agent loop most turns append a tool result of a few hundred tokens to a long conversation. Those turns only prefill the new tokens, so the answer starts in well under a second even at 190k context.
+
+| Conversation length | First turn (cold) | Each following tool-call turn |
+|---|---:|---:|
+| 32k tokens | 16 s | 0.44–0.55 s |
+| 128k tokens | 68 s | 0.55–0.70 s |
+| 190k tokens | 105 s | 0.60–0.77 s |
+
+- **Decode:** ~175 tok/s (152–197 across six prompt types), with MTP accepting ~2.9 tokens per step.
+- **Subagents don't evict the main session.** Two conversations stay cached side by side. With a 190k main session, a fresh 20k subagent costs ~10 s once, then ~0.5 s per turn, and the next main turn still answers in ~0.7 s.
+
+### Qwen3.8-Flash-Next: fast tool-call turns on four cards
+
+The same agent-loop test as GLM, on half the GPUs.
+
+| Conversation length | First turn (cold) | Each following tool-call turn |
+|---|---:|---:|
+| 32k tokens | 9 s | 0.34–0.41 s |
+| 128k tokens | 40 s | 0.49–0.51 s |
+| 190k tokens | 62 s | 0.55–0.61 s |
+
+- **Decode:** ~113 tok/s for one stream (102–140 across the same six prompts as GLM), with MTP accepting ~2.4 tokens per step. Up to three streams run at once: 121 tok/s total with two, 134 with three.
+- **Subagents don't evict the main session.** With a 190k main session, a fresh 19k subagent costs ~6 s once, then 0.4–0.65 s per turn, and the next main turn still answers in ~0.6 s.
+
+### DeepSeek-V4.1-Flash: the most capable model, running locally
+
+DeepSeek-V4.1-Flash is the strongest model here for reasoning and world knowledge. It runs from the official checkpoint, with Engram tables in host RAM, experts spilled to the host, and sparse attention, on hardware it was never meant for. As far as we know, no other engine runs it on V100s, let alone for local agentic coding. It has carried a multi-hour Claude Code session.
+
+It is slow: about 11 tok/s on short code, about 7 on prose, and ~560 tok/s warm prefill. The resident conversation is never re-prefilled. A turn that adds a few dozen tokens reaches its first token in about 1 s, one that adds a 700-token tool result in about 3 s.
+
+### MiniMax-H3
+
+On 4 GPUs, a 5 s 960×544 clip takes 50 steps of 10–12 s each. A 5 s 1344×768 clip takes about 25 minutes.
+
+### What makes the turns fast
+
+- **Prefix cache:** a turn that extends a cached conversation prefills only the new tokens.
+- **Volta kernels for MTP verify:** they check 2–4 draft tokens per step and give each row the same result as batch 1.
+- **Tokenizer cache:** the server caches tokenized prompt pieces, so a long chat is not re-tokenized from scratch every turn.
+- **Startup warmup:** the kernels for a cache hit and for a grammar-constrained tool-call decode load at startup, not on the first real tool turn.
+
+## Requirements
+
+- **GPUs:** V100 with **32 GB**. SXM2 with NVLink is the measured setup. PCIe V100s run the same scripts, slower; GLM and Qwen need the interconnect switches under "PCIe V100s" on their pages.
+- **Host RAM:** GLM ~23 GB in use. Qwen ~134 GB in use with the host KV tier, so plan for 160 GB. DeepSeek needs ~190 GiB on 1 GiB hugepages for Engram plus ~104 GiB of pinned expert spill. H3 keeps the text encoder and VAEs on the host.
+- **Disk:** GLM 190 GB, Qwen 126 GB, DeepSeek 476 GB, plus the H3 checkpoint.
+- **CUDA 12.8 or 12.9.** CUDA 13 dropped Volta.
+- **GCC ≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, which many distros now default to.
+- **Python 3.12**, Linux. `ffmpeg` and `ffprobe` for MiniMax-H3.
+
+## Install
 
 ```bash
-git clone https://github.com/dg1kjd/sglang-v100-sxm2-qwen3.8-flash-next.git
-cd sglang-v100-sxm2-qwen3.8-flash-next
+git clone https://github.com/dg1kjd/sglang-sxm2.git
+cd sglang-sxm2
 
-# Full build: system deps, venv, patched FlashInfer, TurboMind, sglang-kernel,
-# Marlin. Takes roughly an hour, most of it nvcc.
+# System deps, Python env, patched FlashInfer, TurboMind, sglang-kernel, Marlin.
+# About an hour, most of it nvcc.
 bash scripts/install_v100.sh
+conda activate sglang-v100
 
-# Verify the SM70 stack registered correctly.
+# Check that the Volta kernels registered.
 bash scripts/smoke_v100.sh
 ```
 
-`install_v100.sh` plus `smoke_v100.sh` is the entire install. **[docs/v100/INSTALL.md](docs/v100/INSTALL.md)** documents each step and what to do when one fails. Run the smoke check. No prebuilt kernels are distributed (the `.so` files are build outputs), and the stock Marlin MoE kernel is an empty stub below sm80, so a server missing the V100 kernels starts, answers, and returns zero-valued expert output.
+Run the smoke check. A server that is missing the Volta kernels still starts and answers, but its MoE layers return zeros. [docs/v100/INSTALL.md](docs/v100/INSTALL.md) walks through each step and what to do when one fails, including running the server as a systemd service.
 
-One engine at a time. Qwen and DeepSeek bind the same address, `0.0.0.0:11435` (`SGLANG_V100_HOST` / `SGLANG_V100_PORT`), not port 30000.
+### Docker
+
+The image builds the same stack from source. No pre-built image is published. You need Docker with the NVIDIA Container Toolkit and a host driver from the R570 series or newer (the image uses CUDA 12.8).
 
 ```bash
-# Qwen, long context, no speculation
-bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh target
-
-# Qwen plus the built-in MTP draft head (recommended; the numbers below)
-bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
-
-# DeepSeek-V4.1-Flash, 8× V100
-bash scripts/serve_dsv41_v100.sh
-
-# GLM-5.3-Flash, 4× V100, 2-bit resident expert pool (mtp for the draft head)
-GLM53_MODEL=/data/models/GLM-5.3-Flash-NVFP4 bash scripts/serve_glm53_flash_v100.sh target
+docker compose -f docker/v100-compose.yaml build glm53  # about an hour; one image for all four
+docker compose -f docker/v100-compose.yaml up glm53     # or qwen38, dsv41, h3
 ```
 
-## Qwen3.8-Flash-Next
+Checkpoints are read from `MODELS_DIR` (default `~/models`) under the directory names used in [Run](#run). JIT kernels and caches persist in a Docker volume, so only the first launch compiles (about 10 minutes for GLM). Overrides such as `SGLANG_V100_PORT` or `GLM53_GPUS` pass through from the shell. DeepSeek-V4.1-Flash still needs the 1 GiB hugepages reserved on the host. [INSTALL.md](docs/v100/INSTALL.md#docker) describes how the image and the compose file are put together and how to run each model.
 
-### Get the model
+## Run
 
-The validated checkpoint is the NVFP4 quantisation of Qwen3.8-Flash-Next. 126 GB. It is the multimodal export, so the vision tower comes with it. `language_model_only: false` in `config.json` is the check. Other checkpoints of the same architecture may work; they are untested. The model stays under its own license.
+One language model at a time. All three bind `0.0.0.0:11435` (`SGLANG_V100_HOST`, `SGLANG_V100_PORT`). The first launch compiles JIT kernels for several minutes.
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
 
-export FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4
+# GLM-5.3-Flash, 8 GPUs
+hf download RadixArk/GLM-5.3-Flash-NVFP4 --local-dir ~/models/GLM-5.3-Flash-NVFP4
+GLM53_MODEL=~/models/GLM-5.3-Flash-NVFP4 bash scripts/serve_glm53_flash_nvfp4_v100.sh
+
+# Qwen3.8-Flash-Next, 4 GPUs, MTP on
+hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
+FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4 bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
+
+# DeepSeek-V4.1-Flash, 8 GPUs (reserve 1 GiB hugepages and turn MGLRU off first, see its page)
+hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir ~/models/DeepSeek-V4.1-Flash
+MODEL_PATH=~/models/DeepSeek-V4.1-Flash bash scripts/serve_dsv41_v100.sh
+
+# MiniMax-H3 video, 4 GPUs, port 30010
+hf download MiniMaxAI/MiniMax-H3 --local-dir ~/models/MiniMax-H3
+H3_MODEL=~/models/MiniMax-H3 bash scripts/serve_minimax_h3_v100.sh
 ```
 
-| | |
-|---|---|
-| checkpoint | [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) |
-| base model | [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) |
-| quantisation | NVFP4 W4A16 (modelopt), FP16 KV cache at runtime |
+The server is ready when the log says `The server is fired up and ready to roll!`.
 
-The launcher comments record why each OOM-sensitive flag is what it is. Read them before changing `--mem-fraction-static`, `--max-prefill-tokens`, or `--hicache-size`. On V100 (`--dtype float16`) the script passes `--ple-offload-embedding`, so the 51 GB PLE n-gram table lands in host memory. Without that offload the table is created on GPU and OOMs at load.
+## Connect
 
-### Talking to it
-
-Both API surfaces are native.
+OpenAI-compatible and Anthropic Messages endpoints are both native.
 
 ```bash
-# OpenAI-compatible
 curl http://127.0.0.1:11435/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen38next-nvfp4","messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
-
-# Anthropic Messages API — Claude Code connects to this directly
-curl http://127.0.0.1:11435/v1/messages \
-  -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
-  -d '{"model":"qwen38next-nvfp4","max_tokens":128,"messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"glm53-flash-nvfp4","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
 ```
 
-Image input works on both APIs. This model emits reasoning: an empty `content` alongside a large `completion_tokens` means the reply hit `max_tokens` while still inside a thinking block. Raise the limit.
-
-### Measured performance
-
-2026-09-24, `llm-decode-bench` 0.6.2, temperature 0, `scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp`. 4× V100-SXM2-32GB, TP=4, built-in MTP (3 steps / 4 draft tokens), `--mem-fraction-static 0.86`, `--max-running-requests 3`. This model's chat template leaves thinking on unless the request disables it, and the bench does not.
-
-**Prefill.** Client prompt tokens / TTFT, one scout each. The 8k row also matched the server counter (3,065 tok/s).
-
-| prompt tokens | TTFT | tok/s |
-|---|---:|---:|
-| 8,196 | 2.75 s | 2,977 |
-| 32,150 | 10.53 s | 3,054 |
-| 128,020 | 40.69 s | 3,146 |
-
-**Decode.** Aggregate tok/s, then per stream. Accept length is tokens per target forward. At one stream the engine is about 46 forwards/s; the ~2.1 accept length is this padding workload. The padding cells are 15 s of `ignore_eos`. The coding row is the same tool, one short Python prompt, 4 runs, a 256-token cap: thinking stayed on and every run hit the cap.
-
-| workload | C=1 | C=2 aggregate / per stream | C=3 aggregate / per stream |
-|---|---:|---:|---:|
-| padding, context 0 | **98.9** (accept 2.11) | **120.3** / 60.1 (2.02) | **177.9** / 59.3 (2.19) |
-| padding, context 8k | **100.4** (2.18) | **118.9** / 59.5 (2.12) | **150.2** / 50.1 (2.10) |
-| coding peak, 256-token cap | **119** median (117–119) | | |
-
-Concurrency 4 is absent because `--max-running-requests 3` drops it. Aggregate still climbs through C=3.
-
-### Reference recipe
-
-The wrapper is the supported entry. `mtp` is the recipe the numbers above were measured on.
+Claude Code:
 
 ```bash
-export FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4
-bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11435
+export ANTHROPIC_AUTH_TOKEN=placeholder
+export API_TIMEOUT_MS=3000000
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0   # keeps the prompt prefix stable, so turns hit the cache
+claude
 ```
 
-Expanded (what that script runs for `mtp`). The env block is not implied by the CLI flags. `SGLANG_NUMA_BIND_V2=0` keeps the host cache interleaved; the file tier must sit on a real disk, not a tmpfs `/tmp`.
+These models reason before they answer. An empty `content` with a large `completion_tokens` means the reply hit `max_tokens` while still thinking, so raise the limit. [Reasoning effort](docs/v100/Reasoning-Effort.md) lists how each model reads Claude Code's effort setting.
 
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_P2P_LEVEL=NVL
-export SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage
-export SGLANG_MAMBA_CONV_DTYPE=float16
-export SGLANG_MAMBA_SSM_DTYPE=float16
-export SGLANG_SM70_FORCE_FP16=1
-export SGLANG_SM70_DENSE_GEMV=1
-export SGLANG_SM70_QWEN_FUSIONS=1
-export SGLANG_NUMA_BIND_V2=0
-export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$HOME/hicache_storage
+## Limitations
 
-python -m sglang.launch_server \
-  --model-path "${FLASH_NEXT_MODEL}" \
-  --served-model-name qwen38next-nvfp4 \
-  --trust-remote-code \
-  --dtype float16 \
-  --quantization modelopt_fp4 \
-  --reasoning-parser auto \
-  --tool-call-parser auto \
-  --attention-backend tilelang_fa_v100 \
-  --linear-attn-prefill-backend tilelang \
-  --linear-attn-decode-backend triton \
-  --kv-cache-dtype auto \
-  --tensor-parallel-size 4 \
-  --context-length 262144 \
-  --mem-fraction-static 0.86 \
-  --max-running-requests 3 \
-  --max-mamba-cache-size 20 \
-  --chunked-prefill-size 4096 \
-  --max-prefill-tokens 4096 \
-  --enable-hierarchical-cache \
-  --hicache-size 8 \
-  --hicache-mem-layout page_first \
-  --hicache-storage-backend file \
-  --hicache-write-policy write_back \
-  --sleep-on-idle \
-  --cuda-graph-max-bs-decode 3 \
-  --cuda-graph-bs-decode 1 2 3 \
-  --mamba-radix-cache-strategy extra_buffer \
-  --mamba-full-memory-ratio 0.2 \
-  --enable-cache-report \
-  --enable-metrics \
-  --ple-offload-embedding \
-  --speculative-algorithm EAGLE \
-  --speculative-draft-model-path "${FLASH_NEXT_MODEL}" \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --host 0.0.0.0 \
-  --port 11435
-```
+- **One agent session per server** for GLM and DeepSeek (`--max-running-requests 1`). Further requests queue. Qwen takes up to three streams.
+- **DeepSeek-V4.1-Flash keeps one conversation resident.** A new conversation prefills from scratch. The last four are kept on disk, so returning to one of them loads it back instead of prefilling it again. A long uncached suffix runs at about 300 tok/s.
+- **Not soaked for days.** Qwen ran an hour of mixed load tests and DeepSeek a multi-hour Claude Code session. GLM is checked with benchmarks and GSM8K, with no multi-hour soak yet.
+- **Volta has no bf16 and no FP4/FP8 hardware.** Everything runs as fp16 with weight-only 4/8-bit kernels, so numerics differ slightly from a Hopper run of the same checkpoint.
 
-| knob | ship value | why |
-|---|---|---|
-| MTP | on, 3 steps / 4 draft tokens | The measured recipe. `target` is the same server with no draft head |
-| `--kv-cache-dtype` | `auto` (FP16 on V100) | The fast sm70 decode kernel reads only the selected top-k, so FP16 costs no decode speed and accepts better than `fp8_e5m2`. The 1-byte cache is `FLASH_NEXT_EXTRA_ARGS='--kv-cache-dtype fp8_e5m2'` plus a lower mem-fraction |
-| `--mem-fraction-static` | 0.86 | 0.88 OOMed prefill under a beyond-spec 32k / np 8 load. 0.86 costs about 12% of the KV pool and still holds long agent contexts at 3 streams |
-| `--max-running-requests` | 3 | Aggregate decode peaks here. A fourth stream adds no throughput and stretches TTFT. CUDA graphs are captured for batch 1–3 only |
-| prefill chunk | 4096 | An 8k GDN chunk OOMed in the headroom left after the KV pool. Long prompts still run, in 4k chunks |
-| `--hicache-size` | 8 per rank | Host KV and host Mamba, so total is `N × 2 × 4` ranks = 64 GB. N=16 left the box near thrashing. `page_first` is required for the Mamba host pool |
-| write policy | `write_back` | `write_through` saturated the disk and made prefix readback collapse. Disk writes happen on eviction and shutdown |
-| `--ple-offload-embedding` | on | The 51 GB n-gram table stays in host RAM. On GPU it OOMs at load |
-| `--sleep-on-idle` | on | Without it each rank busy-spins a core while idle |
-| `--enable-cache-report` | on | Surfaces prefix-cache hits to Claude Code. The cache already hits without the flag; the flag only reports them |
+## Relationship to SGLang
 
-`target` drops the four `--speculative-*` lines. Leave `SGLANG_CUSTOM_AR_ALLOW_PCIE` unset on an NVLink mesh.
+This is a fork of [SGLang](https://github.com/sgl-project/sglang) that is synced with upstream `main` regularly. Upstream's engine (radix and hierarchical caches, speculative decoding, the OpenAI and Anthropic servers, parsers) is used as-is wherever possible. This fork adds the Volta kernels, the model support listed above, and serving recipes tuned for one agentic session.
 
-## DeepSeek-V4.1-Flash
-
-Official `deepseek-ai/DeepSeek-V4.1-Flash` on 8× V100-SXM2-32GB. This snapshot has carried a multi-hour Claude Code session on a single conversation. Continuations that match a recorded chunk or request stop are not re-prefilled (a few dozen new tokens is a few seconds). A suffix of several thousand tokens that was never computed is still about 60 tok/s: each rank holds 30 experts on the GPU and a chunk often touches more, so the spill cache thrashes inside the chunk. Each rank's weight load reads only the experts it owns, and the draft reads only `mtp.*`. On this 8-card shape that was 1347 s for the target and 17 s for the draft, about 24 minutes until the server was ready (previously about 36 minutes, almost all of it weight load). Hugepages and the RAM layout are in `scripts/serve_dsv41_v100.sh` and [docs/v100/INSTALL.md](docs/v100/INSTALL.md).
-
-### Get the model
-
-Use the official DeepSeek mixed-quant checkpoint. Dense weights are block FP8 (`quant_method: fp8`, 32×32 `ue8m0`); routed experts are native FP4 (`expert_dtype: fp4`, MXFP4). The DSpark draft lives in the same repo. Runtime on this port is FP16 activations and an FP8-E4M3 KV cache. Leave the dense MXFP8 packed; unpacking it to FP16 does not fit in 32 GB. Skip third-party NVFP4 / GPTQ / AWQ re-quants, and skip DeepSeek-V4-Flash: that is a different architecture.
-
-Weights: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
-
-```bash
-pip install -U "huggingface_hub[cli]"
-hf download deepseek-ai/DeepSeek-V4.1-Flash \
-  --local-dir ~/models/DeepSeek-V4.1-Flash
-
-export MODEL_PATH=~/models/DeepSeek-V4.1-Flash
-```
-
-~476 GB (48 shards). The export is multimodal. The vision tower is one fp32 copy on rank 0; each GEMM streams through that GPU as fp16 and is dropped. The model is MIT-licensed.
-
-| | |
-|---|---|
-| checkpoint | https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash |
-| quantisation | native mixed: MXFP8 dense (e4m3 + UE8M0, 32×32) + MXFP4 routed experts |
-| do not use | https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash , https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731 , https://huggingface.co/nvidia/DeepSeek-V4-Flash-nvfp4-DSpark (V4-Flash NVFP4, not V4.1) |
-
-### Measured performance
-
-2026-09-24, `llm-decode-bench` 0.6.2, the 8-card recipe (DSpark on, sticky last-seq, radix cache off, advertised 256k, `np=1`). Temperature 0. The server was not started with `--enable-metrics`, so this run has no speculative-accept gauge. The ship script pins `--max-running-requests 1`.
-
-| check | result |
-|---|---|
-| Coding peak, `merge_sorted`, natural stop at 104 tokens, 3 runs | **9.3** tok/s median (8.8–9.3) |
-| Sustained padding decode, 20 s, `ignore_eos` | **2.8** tok/s (ITL 322 ms) |
-| Cold prefill scout, server counted 5,286 prompt tokens | TTFT **45.3 s**, **117** tok/s |
-| Warmer one-token prefill, 8,004 tokens, spill already touched | TTFT **14.3 s**, **558** tok/s |
-
-The 2.8 tok/s cell is greedy padding, the case this model loops on. It is a different number from the 9.3 tok/s coding rate and from the ~60 tok/s uncached suffix above. The 117 tok/s scout is the cold first touch; 558 tok/s is the same box after that spill was already warm. Temperature 0 is right for short code and wrong for long prose. Use `temperature=1`, `top_p=0.95` for chat. The ship script leaves `/health` as a liveness probe (no generation), so a load balancer GET does not drop the sticky pin.
-
-### Reference recipe
-
-The wrapper is the supported entry. It exports the env knobs that are not CLI flags, then launches the server.
-
-```bash
-export MODEL_PATH=~/models/DeepSeek-V4.1-Flash
-export SGLANG_DSV41_DSPARK=1
-export SGLANG_DSV41_STICKY_LAST_SEQ=1
-export SGLANG_DSV41_CONTEXT_LEN=262144
-bash scripts/serve_dsv41_v100.sh
-```
-
-Expanded (what the script actually runs when DSpark is on). Spill, Engram, and sticky are set by the env block, not implied by the CLI flags.
-
-```bash
-export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
-export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=private
-export SGLANG_DSV41_EXPERT_SPILL_APPLY=1
-export SGLANG_DSV41_EXPERT_SPILL_GB=13
-export SGLANG_DSV41_SPILL_LANDING=36
-export SGLANG_DSV41_STICKY_LAST_SEQ=1
-export NCCL_ALGO=allreduce:tree
-export NCCL_BUFFSIZE=2097152
-export NCCL_MIN_NCHANNELS=1
-export NCCL_MAX_NCHANNELS=4
-
-python -m sglang.launch_server \
-  --model-path "${MODEL_PATH}" \
-  --tp 8 --ep-size 8 \
-  --dtype float16 \
-  --moe-runner-backend marlin \
-  --attention-backend dsv4 \
-  --context-length 262144 \
-  --chunked-prefill-size 2048 \
-  --mem-fraction-static 0.87 \
-  --max-running-requests 1 \
-  --max-total-tokens 262144 \
-  --max-prefill-tokens 262144 \
-  --pre-warm-nccl \
-  --disable-prefill-cuda-graph \
-  --cuda-graph-max-bs-decode 1 \
-  --disable-radix-cache \
-  --reasoning-parser deepseek-v41 \
-  --tool-call-parser deepseekv41 \
-  --trust-remote-code \
-  --disable-custom-all-reduce \
-  --speculative-algorithm DSPARK \
-  --speculative-draft-model-path "${MODEL_PATH}" \
-  --host 0.0.0.0 \
-  --port 11435
-```
-
-| knob | ship value | why |
-|---|---|---|
-| DSpark | on (`γ=5` from the checkpoint) | Best measured TG on this box. `SGLANG_DSV41_DSPARK=0` is greedy Tree |
-| sticky last-seq | on | One resident conversation. Exact continuation, or a shorter prefix saved at a chunk or request stop. Anything else, including a second conversation, drops the pin and prefills from 0. Radix stays off (a radix hit desyncs CSA2 pending state) |
-| context / max tokens | 262144 | Advertised window. 8k prefill is what has been smoked; 512k has not left ~300 MiB for the Engram MXFP8 unpack |
-| `--mem-fraction-static` | 0.87 | 0.99 OOMs the Engram unpack on T=6 verify capture. 0.88 OOMed the same 300 MiB unpack on a 461-token sticky prefill (TP7 had 284 MiB). 0.86 raises: no KV pool after draft weights |
-| expert spill | 13 GiB/rank (landing 36) | Spill 12 left 8k ~8 MiB short of that unpack |
-| `--max-running-requests` | 1 | DSpark would otherwise inflate this |
-| `--chunked-prefill-size` | 2048 | Vestigial SWA floor is sized for this chunk |
-
-Leave `--speculative-dspark-block-size` at the checkpoint default. Checkpoint weights stay mixed MXFP4 experts + packed MXFP8 dense.
-
-## GLM-5.3-Flash
-
-320B/18B-activation MoE, 45 layers = 34× KDA linear attention + 11× DSA (first 3 dense), a built-in MTP head, modelopt NVFP4 checkpoint, ~182 GB. The ship deployment is the **2-bit resident expert pool**: at boot the NVFP4 routed experts are requantized once to a 2-bit (u2b2, group-128) format and the FULL 288-expert pool stays in VRAM, ~19 GiB per rank. No expert is ever on the host: no spill pool, no page-in, no landing pool. The grid was tuned to the theoretical 4-level bound (end-to-end MoE cosine 0.830 vs the NVFP4 truth) and gated against the u4+spill engine on the same server: first-token top-1 agreement 91.7% over 24 mixed prompts, 5/5 needle retrieval on both arms. The full record — grid counterfactuals, the boot-time requantization path, and the trace anatomy — is `docs/v100/GLM53_FLASH_PLAN.md` appendix G.
-
-### Get the model
-
-The validated checkpoint is the modelopt NVFP4 export of GLM-5.3-Flash (safetensors ×120 with its config). Point `GLM53_MODEL` at it; on the dev box it lives at `/data/models/GLM-5.3-Flash-NVFP4`.
-
-### Measured performance
-
-2026-10-02, temperature 0, flushed-radix protocol (`/flush_cache` + a unique suffix per rep, so no radix self-hits), 4× V100-32GB TP=4, `scripts/serve_glm53_flash_v100.sh`, chunked prefill 1024, Triton attention backend. The right-hand column is the identical bench the same day against the prior deployment shape (u4 NVFP4 + host expert spill).
-
-| check | u2 pool (ship) | u4 + spill (prior shape) |
-|---|---:|---:|
-| prefill ~7.6k tokens, cold | **254** tok/s | 102 tok/s |
-| prefill ~3.8k | **401** tok/s | 103 tok/s |
-| prefill ~1.9k | **598** tok/s | 103 tok/s |
-| decode, real text, 1 stream, target-only | **21.1** tok/s | 4.6 tok/s |
-| decode, 1 stream, MTP-3/4 (accept 2.0–2.8) | 12.2 tok/s | 4.1–4.3 tok/s (P1.6 record) |
-
-Honest reading of those numbers:
-
-- **Prefill falls with context** (598 → 254 tok/s from 2k to 8k). A GPU trace of the 8k request shows why: in this table's shape the 11 DSA layers run FULL attention through the Triton backend, and that one kernel is 75% of prefill busy time. The 2-bit MoE itself is 5% — the expert side is no longer on any critical path. The sparse DSA path (next section) removes that wall: 1390 tok/s at 8k, and its 2k→8k prefill rate is flat.
-- **MTP accepts well but nets −42% at one stream** (12.2 vs 21.1 tok/s): target decode got 5.7× faster while the fixed draft+verify cost (~195 ms/step) did not move, and accept 2.3 needs ≤ ~108 ms/step to break even. That step cost contains a known ~114 ms unlocated item from the earlier decode survey; until that probe lands, use `target` mode for interactive single-stream work. MTP on this engine still beats every spill-era MTP number by 2.4–3×.
-- One engine per host still applies; this binds the same `SGLANG_V100_HOST`/`SGLANG_V100_PORT` address as the other two.
-
-### DSA sparse attention mode (P5-a, 2026-10-03)
-
-`bash scripts/serve_glm53_flash_v100.sh dsa` (or `dsa-mtp`) lights up the 11 DSA layers' indexer + fused topk + sparse attention on sm70: the indexer writes the pooled fp8 cache through uint8-pointer Triton kernels (in-kernel e4m3 encode; sm70 Triton has no fp8e4nv), selection goes through the JIT fused group-topk (GLM emits 2051 columns = topk 2048 + pool_size−1 tail, consumed only via the fused page-table path: `SGLANG_DSA_FUSE_TOPK=1 --dsa-topk-backend sgl-kernel`, `SGLANG_OPT_USE_TOPK_V2=0`), and attention runs the `tilelang_sparse_sm70` kernel (GLM runs tail_dim=0, guarded at trace time).
-
-Same protocol as the table above (flushed radix, temperature 0), 2-bit u2 pool weights, WIP-tree boot:
-
-| check | triton full-attn (ship) | dsa mode |
-|---|---:|---:|
-| prefill ~7.6k tokens | 254 tok/s | **1390** tok/s (gate ≥800; +94% vs the 717 same-day full-attn baseline) |
-| decode, 1 stream, target-only | 21.1 tok/s | 23.8 tok/s |
-| decode, 1 stream, dsa-mtp NEXTN-3/4 | 12.2 tok/s | **43.9 tok/s** (accept 2.0–3.85) |
-
-Correctness gates, all passed: 24-prompt greedy top-1 identical to the triton arm (top-8 differences are meta-preamble near-tie phrasings only), needle 5/5 at ~1k (full-select regime) and ~2.5k (discriminative group-topk regime), prefix cache intact, llama-glm5 CPU oracle same-family text, and the Qwen3.8 NVFP4 regression gate clean (the six-file diff is bit-identical in Qwen throughput vs the image baseline; a full-tree bind-mount arm reads −15% prefill purely from dev-checkout artifact drift — stale local Marlin `.so` + hidden compiled rust extensions — see `docs/v100/GLM53_FLASH_PLAN.md` H.5.6). The image was rebuilt from `dev-ltarcher` and dsa-mtp re-validated in image form (top-1 24/24, needles 10/10, decode 43.9 tok/s, accept 2.08–3.88 — identical to the WIP-tree numbers); the production compose now runs `dsa-mtp` on the rebuilt image.
-
-Long context on the dsa mode (2026-10-03 ladder, same WIP-tree boots): sparse prefill stays flat with context — 32k 1,414 tok/s and 64k 1,531 tok/s (needle 5/5 both, decode flat ~23 tok/s), so the old full-attention "262k prefill = hours" extrapolation does not apply (linear extrapolation ≈ 3 min). The 262k rung is memory-bound, not perf-bound: the KV cell is 11.85 KB/token/rank (DSA latent + fp8 indexer keys), the 0.92 boot pools 112k tokens, mem-fraction 0.98 pools 195k with 0.57 GiB to spare and OOMs in the ~190k eager prefill attention workspace — 262k needs both a smaller KV cell (fp8 latent, quality-gated) or ~5% u2-pool trim, AND prefill-workspace headroom. Full record: `docs/v100/GLM53_FLASH_PLAN.md` G.9.
-
-### mHC fp16 TileLang prefill kernels (P5-b A step, 2026-10-05)
-
-GLM's 34 KDA layers each run an mHC pre/post block around the MoE; in torch eager that block cost ~4.2 ms per layer per 1k-token chunk (~150 ms of every 8k prefill). The A step ports the elementwise kernels to fp16 TileLang (the projection GEMM stays chunked cuBLAS fp32 — the sm70 TileLang MMA emitter has no fp32 operand form), enabled by default in `serve_glm53_flash_v100.sh` via `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=1`: ~7.6k prefill 1275-1300 → **1436-1454 tok/s** (+12%) on the u2 dsa-mtp c1024 recipe. Gates: 16-case torch-oracle suite (fp16 layer diff ≤9.8e-4 ≈ 1 ulp; the `hc_mult=3` sinkhorn is rewritten onto shared memory + a serial thread because the fragment AllReduce lowering needs power-of-two extents), needle 5/5, near-full-pool eviction regression clean, decode/accept unchanged. `chunked-prefill-size 2048` OOMs at mem-fraction 0.94 (Marlin's 128 MB `intermediate_cache13` transient vs 86 MiB free) and would cap at ~1570 tok/s anyway. Full record: `docs/v100/GLM53_FLASH_PLAN.md` appendix J.
-
-### u2 transposed-word GEMM (P5-b B step, 2026-10-05)
-
-The Marlin u2 MoE GEMM (~218 ms per 1k-token chunk) is the last big prefill item, so the 2-bit words get their own sm70 kernel: `sm70_u2_gemm_v2`, added to the pinned Marlin build via `patches/marlin-v100-u2-gemm-v2.patch` (`bash scripts/setup_v100_marlin.sh` rebuilds the `.so`). At boot the u2 pool can re-bind its words into a layout where each 32-bit word IS an HMMA B-operand tile (`u2_packed_to_T`, one-time repack); the kernel dequantizes fp16 in-register through the same WMMA fragment path as the other sm70 TileLang work. Prefill GEMM w13 1.51× / w2 1.61× vs Marlin u2 at the production shapes, bit-exact on both stages against the production Marlin output.
-
-Same boot, only `SGLANG_USE_SM70_U2_GEMM_V2` flipped (7936-token prefill ×9, flushed radix): 1343 → **1490 tok/s (+10.9%)**, spec-decode 68.2 → 74.7 tok/s (+9.5%; the M=4 verify step takes the v2 path too, M=1 decode stays Marlin), accept 3.39 unchanged, needle 5/5. Because a lost flag here means Marlin silently reads the wrong bytes, the flag is plumbed through `fused_marlin_moe` and guarded by a boot-time binding self-test that requires bit equality between the two word layouts through the full fused entry point — a stale `.so` or a broken kwarg chain fails the boot instead of serving garbage. Qwen3.8 NVFP4 regression on the shared `.so`: clean (8k protocol prefill 3031 tok/s, decode 165 tok/s, smoke exit 0). Default off in the serve script pending the production-compose re-validation; full record: `docs/v100/GLM53_FLASH_PLAN.md` appendix K.
-
-### Reference recipe
-
-The wrapper is the supported entry. `target` (u2 pool, no speculation) is what the numbers above were measured on; `mtp` adds the NEXTN draft; `spill`/`spill-mtp` reproduce the pre-P4 shape for A/B.
-
-```bash
-export GLM53_MODEL=/data/models/GLM-5.3-Flash-NVFP4
-bash scripts/serve_glm53_flash_v100.sh target
-```
-
-Key knobs (the script header carries the full list):
-
-| knob | ship value | why |
-|---|---|---|
-| u2 pool | on (`target`/`mtp` modes) | The whole point: a resident full pool ends page-in. Requantization runs at boot — first layer ~30 s (kernel warmup), remaining 41 layers under 2 min |
-| `SGLANG_SM70_U2_STAGE_DIR` | `~/.cache/sglang-glm53-u2-stage` | Boot-time requant staging memmaps. MUST be real disk; tmpfs is host RAM |
-| `--mem-fraction-static` | 0.92 | 18.9 GiB expert pool + ~8 GiB dense/attention on a 32 GB card. The measured OOM chain on this engine is at boot/capture, not under load |
-| `--context-length` | 8192 | The validated ceiling. Raising it re-opens the KV/activation trade on the pool path; do not bump it and the mem fraction together on faith |
-| `--chunked-prefill-size` | 1024 | The benched configuration; larger chunks are untested on the pool path. 2048 OOMs at mem-fraction 0.94 (Marlin 128 MB transient) and would cap at ~1570 tok/s |
-| `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST` | 1 (set by the script) | fp16 TileLang mHC pre/post, +12% 8k prefill; unset falls back to torch |
-| `SGLANG_USE_SM70_U2_GEMM_V2` | 0 (default pending compose re-validation) | Bind the u2 pool to the transposed-word GEMM: +10.9% 8k prefill, +9.5% spec decode. Needs the rebuilt Marlin `.so` (boot fails hard without the op) and a restart when flipped |
-| `GLM53_U2_GROUP` | 128 | The tuned grid's group; 64/32 are kernel fallbacks and were measured worse per byte |
-
-## What the port adds
-
-None of this exists upstream. The Volta port itself — sm70 kernels, Qwen3.8 model support, and that serving recipe — is [haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100). This repository re-lands that work onto a much newer SGLang, fixes what the move broke, and adds the DeepSeek-V4.1-Flash path. Credit and lineage are at the bottom.
-
-- **NVFP4 W4A16 on sm70** — a JIT CUDA path for FP4 weights on hardware with no FP4 support, plus the Marlin V100 GPTQ/AWQ repack kernels.
-- **TileLang attention for Volta** (`tilelang_fa_v100`) — paged prefill, decode and verify kernels, registered as a first-class attention backend.
-- **QSA sparse attention** with a compressed index cache, and its own KV pool (`QSATokenToKVPool`) carrying the compressed-key buffers.
-- **GDN linear attention** in TileLang and Triton, tuned for sm70 occupancy.
-- **TurboMind sm70 backend** for block-FP8 and FP16 MoE, plus an exact AWQ dequantiser.
-- **FP16 / FP8-E5M2 KV cache** on hardware without native FP8. The FP16 path — the production dtype — uses a fast sm70 sparse decode kernel that reads only the selected top-k K/V, so its higher per-token precision costs no decode speed on this sparse-attention model.
-- **PLE host offload** — the 51 GB n-gram table lives in host RAM, with the per-request n-gram and short-conv state riding the mamba slot lifecycle.
-- **Single-stage custom all-reduce**, because two-stage is pathological on a partial NVLink mesh.
-- **fp16 forcing** throughout, since Volta has no bf16 (`SGLANG_SM70_FORCE_FP16`).
-
-## Limitations and known gaps
-
-- **Qwen3.8-Flash-Next is the soaked model.** DeepSeek-V4.1-Flash on this snapshot has run a multi-hour Claude Code session on one conversation (prefix reuse at recorded stops, no crash in that session). It is still one conversation: a second session prefills from zero, and the image does not survive a restart. A long uncached suffix is about 60 tok/s. Leftover HBM after load is a few GiB, and open-ended greedy (temperature 0) can loop. Other architectures may load; several upstream model paths still assume sm80+ kernels.
-- **`multimodal_gen` (diffusion / video generation) is not ported.** It carries upstream's code, not this fork's Volta adaptations. The Qwen3.8 vision tower is a different subsystem, and it works. DeepSeek-V4.1 image requests stream the rank-0 tower through GPU GEMMs.
-- **Stability was hammered, not soaked.** A ~1-hour sustained load — agentic prompts at np 1/2/4 plus a beyond-spec 32k-token / np 8 phase — ran with no crash and no incorrect output at the current `--mem-fraction-static 0.86`. It did surface one prefill OOM at the previous 0.88 default under the beyond-spec load; the 0.86 retune fixed it (rationale in the serve-script comment). A multi-day soak has not been run.
-- **Greedy output is not bit-reproducible across cache states.** A property of the FP16 mamba-hybrid pipeline with a radix cache: the cache replays an approximate GDN (linear-attention) state for a cached prefix, so a prompt's exact tokens can differ a little between a cold and a warm prefix, and prompts sitting on a token decision boundary can vary across runs. Every output is a valid completion.
-- **A cold FlashInfer JIT cache costs several minutes** on first launch, and four TP ranks will compile in parallel. Subsequent launches are fast.
-- **The dense NVFP4 linear path is unverified.** It matters only if a checkpoint quantises weights outside the MoE experts; Qwen3.8-Flash-Next does not.
-
-## Relationship to upstream
-
-This is a downstream of [haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100), which is itself a fork of [sgl-project/sglang](https://github.com/sgl-project/sglang). The V100 port was cut from upstream around 2026-06-01 and had not been re-synced since; this repository re-lands it onto upstream `main` as of 2026-09-02 (`99b910955`), about 4,250 commits later. Upstream's engine — including the unified radix cache, the hierarchical KV cache and the speculative decoding stack — is used as-is wherever possible; this fork adds the sm70 layer, Qwen3.8-Flash-Next, and an initial DeepSeek-V4.1-Flash serve path on top.
-
-This is not a pure 3-way merge between the two upstream repos. Beyond re-landing the port, the tree carries hand-crafted optimizations and bug fixes, and it is ruggedized, tested, and plug-and-play — it runs as shipped. It is also ongoing: we intend to keep pulling in upstream improvements as well as continuing our own work on top.
-
-Every deviation from upstream carries its reasoning in the commit that made it; `git log` is the record.
-
-Bug reports about the sm70 path belong here. Bug reports about SGLang itself belong upstream.
+Report bugs in the Volta path here. Report bugs in SGLang itself upstream.
 
 ## Credits
 
-**The Volta port is [haohervchb](https://github.com/haohervchb/sglang-V100)'s work.** Every sm70 kernel in here — the TileLang attention backend, QSA, the GDN linear-attention kernels, NVFP4 on hardware with no FP4 support, the TurboMind sm70 backend, the PLE host offload, the Qwen4-Exp model support — was written there, along with the serving recipe and the tuning that makes it fit in 32 GB. If this is useful to you, that is where the credit belongs. The patched sm70 FlashInfer the build uses is also theirs ([haohervchb/flashinfer](https://github.com/haohervchb/flashinfer)).
+Built on [SGLang](https://github.com/sgl-project/sglang) (Apache 2.0, SGLang Team), which does the hard part.
 
-This repository's contribution is narrower: re-landing that port onto an SGLang roughly 4,250 commits newer, fixing what the move broke, and adding the DeepSeek-V4.1-Flash path.
+Incorporates work from:
 
-Both are derivative works of [SGLang](https://github.com/sgl-project/sglang) (Apache 2.0, Copyright 2023-2024 SGLang Team), which does the hard part.
+- **[haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100)**: the original Volta port of SGLang, including the TileLang attention backend, the QSA and GDN kernels, the NVFP4 path for hardware without FP4, the TurboMind sm70 integration and the PLE host offload. Also [haohervchb/flashinfer](https://github.com/haohervchb/flashinfer) (sm70 FlashInfer) and [GooseLLM](https://github.com/haohervchb/GooseLLM) (TileLang FlashAttention for V100).
+- **[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)**: the vLLM fork for V100 whose TurboMind sm70 block-FP8 and FP16 MoE backend the build compiles.
+- **[Horacio Vico](https://github.com/hvico)** ([hvico/sglang-V100](https://github.com/hvico/sglang-V100)): the opt-in custom all-reduce over PCIe P2P for GPUs without NVLink (`SGLANG_CUSTOM_AR_ALLOW_PCIE`).
+- **[ltarcher](https://github.com/ltarcher)** ([ltarcher/sglang-v100-qwen3.8-flash-next](https://github.com/ltarcher/sglang-v100-qwen3.8-flash-next)): the import guards that treat an installed but unloadable DeepGEMM wheel as missing, and the measurement showing that `NCCL_P2P_LEVEL=NVL` slows PCIe-only cards, after which the scripts leave that choice to NCCL.
+- **[Divy Vasal](https://github.com/divyvasal)** ([sgl-project/sglang#42812](https://github.com/sgl-project/sglang/pull/42812)): DSpark's accept step returns copies instead of views of buffers that the next verify step overwrites, so tensor-parallel ranks cannot commit different token counts under the overlap scheduler.
 
-The Volta build also stands on [marlin_v100](https://github.com/zhinianqin/marlin_v100), [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (TurboMind sm70), [CUTLASS](https://github.com/NVIDIA/cutlass), [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [TileLang](https://github.com/tile-ai/tilelang). None are redistributed here — the build fetches them at pinned revisions. Full attribution in [NOTICE](NOTICE).
+Volta kernels by: [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy), [marlin_v100](https://github.com/zhinianqin/marlin_v100), [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100), [v100-skinny](https://github.com/dnv2003/v100-skinny) (QPN8 FP8 decode GEMV), [CUTLASS](https://github.com/NVIDIA/cutlass), [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [TileLang](https://github.com/tile-ai/tilelang).
 
-## License and disclaimer
+None of these are redistributed here. The installer fetches them at pinned revisions. See [NOTICE](NOTICE) for licenses.
 
-Apache 2.0, inherited from SGLang — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+## License
 
-This is an **independent community fork**. It is not affiliated with, endorsed by, or supported by the SGLang project, LMSYS, NVIDIA, or the model's authors.
+Apache 2.0, inherited from SGLang. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-Provided **as is, without warranty or condition of any kind**, per Section 7 of the Apache License. It drives hardware its vendor no longer supports, using kernels written specifically for that purpose; validate it in your own environment before relying on it for anything that matters.
+This is an independent project. It is not affiliated with, endorsed by, or supported by the SGLang project, LMSYS, NVIDIA, or the model authors. It is provided as is, without warranty of any kind (Apache 2.0, Section 7). It drives hardware its vendor no longer supports, so validate it on your own setup before you rely on it.
 
-No model weights are distributed here. Any checkpoint you use remains subject to its own license and terms, which you must satisfy independently.
+No model weights are distributed here. Each checkpoint stays under its own license.
 
 ## Contact
 
-Issues and pull requests are the preferred channel. For anything that does not belong in public, `git@jens-david-consulting.com`.
+Issues and pull requests are the preferred channel. For anything that does not belong in public: `git@jens-david-consulting.com`.

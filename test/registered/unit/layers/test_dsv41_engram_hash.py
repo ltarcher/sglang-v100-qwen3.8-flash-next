@@ -36,7 +36,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 torch.set_num_threads(2)
 
 HF_ENGRAM_CANDIDATES = (
-    "$HOME/models/DeepSeek-V4.1-Flash/inference/engram.py",
+    os.path.expanduser("~/models/DeepSeek-V4.1-Flash/inference/engram.py"),
     "/tmp/dsv41-hf/inference/engram.py",
 )
 HF_SOURCE = (

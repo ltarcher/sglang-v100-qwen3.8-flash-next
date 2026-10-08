@@ -14,10 +14,12 @@ from sglang.srt.utils import get_device_capability
 
 def _qsa_mqa_kernel_dtype(device: torch.device) -> str:
     """SM70 tilelang MMA only supports FP16; newer archs use bf16."""
-    if get_device_capability(device.index)[0] < 8:
+    if device.type == "cuda" and get_device_capability(device.index)[0] < 8:
         return "float16"
     return "bfloat16"
 
+
+from sglang.srt.utils.common import is_hip
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -117,6 +119,28 @@ def torch_qsa_mqa_decode(
     if copy_len:
         logits[:, :copy_len] = scores[:, :copy_len]
     return logits
+
+
+# TileLang dtype names of the scoring-kernel operands. The logits stay fp32.
+_TILELANG_DTYPES = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+}
+
+
+def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
+    """The dtype both GEMM operands run in: fp8 only when Q and K already are."""
+    if q.dtype == torch.float8_e4m3fn or k.dtype == torch.float8_e4m3fn:
+        if q.dtype != k.dtype:
+            raise ValueError(
+                "QSA fp8 scoring needs Q and the compressed K in the same dtype, "
+                f"got q={q.dtype} k={k.dtype}"
+            )
+        return torch.float8_e4m3fn
+    if _qsa_mqa_kernel_dtype(q.device) == "float16":
+        return torch.float16
+    return torch.bfloat16
 
 
 if HAS_TILELANG:
@@ -318,9 +342,8 @@ def tilelang_qsa_mqa_prefill(
     # torch.cat would allocate and copy the entire [rows, keys] FP32 matrix,
     # temporarily doubling the dominant prefill buffer for long contexts.
     logits = torch.empty((padded_rows, keys), dtype=torch.float32, device=q.device)
-    dtype = _qsa_mqa_kernel_dtype(q.device)
-    torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
-    q_padded = q.to(torch_dtype).contiguous()
+    scoring_dtype = _scoring_dtype(q, k)
+    q_padded = q.to(scoring_dtype).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
     if padding:
@@ -329,10 +352,13 @@ def tilelang_qsa_mqa_prefill(
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
     _tilelang_qsa_mqa_prefill_kernel(
-        heads=heads, head_dim=head_dim, block_q=block_q, dtype=dtype
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_padded.reshape(-1, head_dim),
-        k[:, 0].to(torch_dtype).contiguous(),
+        k[:, 0].to(scoring_dtype).contiguous(),
         logits,
         starts,
         ends,
@@ -375,15 +401,18 @@ def tilelang_qsa_mqa_decode(
     )
     if not q.shape[0] or not max_model_len:
         return logits
-    # The validated MMA layout requires N (the Q-head dimension) to be a
-    # multiple of eight; the SM70 (V100) MMA path additionally needs a
-    # multiple of 16. Zero-padding preserves the weight-free head sum.
+    # CUDA MMA accepts an eight-wide N dimension. ROCm MFMA and the
+    # SM70 (V100) MMA path need sixteen. Zero-padding preserves the
+    # weight-free head sum. The kernel dtype is fp16 on SM70.
     query_heads, head_dim = q.shape[1:]
-    align = 16 if get_device_capability(q.device.index)[0] < 8 else 8
+    align = (
+        16
+        if is_hip() or get_device_capability(q.device.index)[0] < 8
+        else 8
+    )
     kernel_heads = max(align, ((query_heads + align - 1) // align) * align)
-    dtype = _qsa_mqa_kernel_dtype(q.device)
-    torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
-    q_kernel = q.to(torch_dtype)
+    scoring_dtype = _scoring_dtype(q, k_cache)
+    q_kernel = q.to(scoring_dtype)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
             [
@@ -393,10 +422,13 @@ def tilelang_qsa_mqa_decode(
             dim=1,
         )
     _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads, head_dim=head_dim, page_size=page_size, dtype=dtype
+        heads=kernel_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_kernel.unsqueeze(1).contiguous(),
-        k_cache.to(torch_dtype).contiguous(),
+        k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,

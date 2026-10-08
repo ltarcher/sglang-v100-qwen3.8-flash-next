@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WO-13 D6: geometry / split-K sweep for DeepSeek-V4.1-Flash decode Marlin.
+"""Geometry / split-K sweep for DeepSeek-V4.1-Flash decode Marlin.
 
 Shapes match fused_marlin_moe on SM70 (M=1, top-6, hidden=5120, intermediate=2304):
 
@@ -10,7 +10,7 @@ Does not load the 476 GiB checkpoint. Uses random MXFP4-shaped Marlin buffers.
 Set SM70_MARLIN_MOE_* around each launch so marlin_v100 picks that CTA; the
 sglang shape pin is skipped via _sm70_marlin_user_tuning.
 
-Usage (GPU must be free; stop dsv41-wo10 first):
+Usage (GPU must be free; stop any running server first):
 
   CUDA_VISIBLE_DEVICES=0 python scripts/dsv41_sm70_marlin_decode_sweep.py
 """
@@ -339,7 +339,7 @@ def main() -> int:
     parser.add_argument("--top-k-fine", type=int, default=8)
     parser.add_argument(
         "--out",
-        default="/tmp/wo13/d6_marlin_sweep.json",
+        default="/tmp/dsv41_marlin_decode_sweep.json",
     )
     args = parser.parse_args()
 

@@ -331,7 +331,7 @@ def main() -> int:
     p.add_argument("--max-tokens-turn2", type=int, default=0)
     p.add_argument(
         "--jsonl",
-        default="$HOME/dsv41-v100-logs/2026-09-18/self-assess.jsonl",
+        default="dspark-self-assess.jsonl",
     )
     args = p.parse_args()
     self_test()

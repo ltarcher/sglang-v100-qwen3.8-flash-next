@@ -16,7 +16,6 @@ from sglang.srt.layers.moe.dsv41_expert_spill import (
     v1_spill_plan,
 )
 from sglang.srt.mem_cache.dsv41_host_placement import (
-    DOCUMENTED_NODE_TOTAL_GIB,
     GIB,
     PRE_H1_NODE_TOTAL_GIB,
     EngramNumaError,
@@ -224,7 +223,7 @@ class TestRoutedExpertLru(CustomTestCase):
         self.assertGreater(plan.spill_gib, 8.0)
 
     def test_dspark_draft_moe_does_not_inherit_target_spill(self):
-        """WO-15: 12 GiB spill is for 384-expert target, not 128-expert draft."""
+        """12 GiB spill is for 384-expert target, not 128-expert draft."""
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.dsv41_expert_spill import plan_gpu_expert_slots
 
@@ -298,7 +297,7 @@ class TestRoutedExpertLru(CustomTestCase):
         self.assertEqual(int(mapped5[0, 1]), lru.physical_ids([6])[0])
 
     def test_cold_set_placement_gathers_original_rows(self):
-        """WO-13 D2: a non-tail cold set; every id must still gather its own row."""
+        """A non-tail cold set; every id must still gather its own row."""
         import random
 
         import torch
@@ -346,7 +345,7 @@ class TestRoutedExpertLru(CustomTestCase):
             self.assertTrue(torch.equal(lru.gather_rows([e])[0], w13[e]))
 
     def test_ensure_unique_exceeds_slots_thrashes_not_raises(self):
-        """WO-13 D3: prefill unique(batch) > n_kept_routed must not refuse."""
+        """Prefill unique(batch) > n_kept_routed must not refuse."""
         import torch
 
         # 3 routed + 1 shared; 2 GPU routed slots, 1 spilled host row.
@@ -358,9 +357,118 @@ class TestRoutedExpertLru(CustomTestCase):
         self.assertIn(2, lru._id_to_slot)
         self.assertTrue(torch.equal(lru.gather_rows([2])[0], w13[2]))
         self.assertGreater(lru.n_thrash, 0)
-        # Intra-batch thrash still yields the original row per id at compute time.
+        # Rows survive the churn; batch exactness is the multi-pass test below.
         for e in (0, 1, 2):
             self.assertTrue(torch.equal(lru.gather_rows([e])[0], w13[e]))
+
+    def test_prefill_over_slots_runs_every_expert_choice_once(self):
+        """A prefill batch needing more experts than GPU slots stays exact.
+
+        One ensure over the whole batch evicted earlier ids of the same batch
+        and their tokens mapped to -1, silently dropping those experts.
+        """
+        from typing import NamedTuple
+
+        import torch
+
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            run_moe_with_expert_spill,
+        )
+
+        class _TopK(NamedTuple):
+            topk_weights: torch.Tensor
+            topk_ids: torch.Tensor
+
+        class _Dispatch(NamedTuple):
+            topk_output: _TopK
+
+        class _Combine(NamedTuple):
+            hidden_states: torch.Tensor
+
+        # 6 routed + 1 shared (id 6); 3 spilled leaves 3 GPU routed slots.
+        rows = torch.tensor([1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6]).reshape(7, 1)
+        lru = RoutedExpertLru(rows.clone(), n_shared=1, n_spilled=3)
+        lru.apply_shrink()
+        moe = type("Moe", (), {})()
+        moe._dsv41_expert_lru = lru
+
+        def apply(layer, dispatch_output):
+            ids = dispatch_output.topk_output.topk_ids
+            weights = dispatch_output.topk_output.topk_weights
+            gpu = layer._dsv41_expert_lru._gpu[:, 0]
+            picked = torch.where(ids >= 0, gpu[ids.clamp(min=0).long()], 0.0)
+            return _Combine(hidden_states=(picked * weights).sum(dim=1))
+
+        ids = torch.tensor([[0, 3, 6], [1, 4, 6], [2, 5, 6]] * 3, dtype=torch.int32)
+        weights = torch.full(ids.shape, 1.0)
+        out = run_moe_with_expert_spill(
+            moe, _Dispatch(_TopK(weights, ids.clone())), apply
+        )
+        expected = rows[ids.long(), 0].sum(dim=1)
+        self.assertTrue(torch.equal(out.hidden_states, expected))
+
+    def test_prefill_landing_passes_run_every_choice_once(self):
+        """Prefill through the landing pool stays exact and leaves GPU residency
+        alone: kept ids run in one pass only, and each landing pass maps only
+        its own host rows, including when an unused host row splits the runs."""
+        from typing import NamedTuple
+
+        import torch
+
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            SpillLandingPool,
+            run_moe_with_expert_spill,
+        )
+
+        class _TopK(NamedTuple):
+            topk_weights: torch.Tensor
+            topk_ids: torch.Tensor
+
+        class _Dispatch(NamedTuple):
+            topk_output: _TopK
+
+        class _Combine(NamedTuple):
+            hidden_states: torch.Tensor
+
+        rows = torch.tensor([1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6]).reshape(7, 1)
+        lru = RoutedExpertLru(rows.clone(), n_shared=1, n_spilled=4)
+        lru.apply_shrink()
+        pool = SpillLandingPool(
+            n_landing=2,
+            tensors={"w13_weight": torch.zeros(2, 1)},
+            attrs=["w13_weight"],
+            dst_ptrs=torch.zeros(1),
+            row_bytes=torch.zeros(1),
+            slot_host_row=torch.zeros(2),
+            land_ids=None,
+            quant_info=None,
+        )
+        moe = type("Moe", (), {})()
+        moe._dsv41_expert_lru = lru
+        moe._dsv41_landing_pool = pool
+        moe._dsv41_spill_host = {"w13_weight": lru._host}
+
+        def apply(layer, dispatch_output):
+            ids = dispatch_output.topk_output.topk_ids
+            weights = dispatch_output.topk_output.topk_weights
+            gpu = layer._dsv41_expert_lru._gpu[:, 0]
+            picked = torch.where(ids >= 0, gpu[ids.clamp(min=0).long()], 0.0)
+            land = layer._dsv41_land_ids
+            landed = pool.tensors["w13_weight"][:, 0]
+            picked = picked + torch.where(
+                land >= 0, landed[land.clamp(min=0).long()], 0.0
+            )
+            return _Combine(hidden_states=(picked * weights).sum(dim=1))
+
+        # Host rows 0, 2, 3 are used (row 1 is not); two landing slots -> two passes.
+        ids = torch.tensor([[0, 2, 6], [1, 4, 6], [5, 1, 6]] * 3, dtype=torch.int32)
+        weights = torch.full(ids.shape, 1.0)
+        out = run_moe_with_expert_spill(
+            moe, _Dispatch(_TopK(weights, ids.clone())), apply
+        )
+        expected = rows[ids.long(), 0].sum(dim=1)
+        self.assertTrue(torch.equal(out.hidden_states, expected))
+        self.assertEqual(lru.n_swaps, 0)
 
     def test_ensure_prefers_non_needed_occupant_before_thrash(self):
         import torch
@@ -514,7 +622,7 @@ class TestRoutedExpertLru(CustomTestCase):
             self.assertTrue(_decode_shaped_topk(ids2))
 
     def test_remap_t6_verify_is_decode_shaped_not_lru(self):
-        """WO-15 D15-1: T=6 target-verify must page-in, not prefill ensure()."""
+        """T=6 target-verify must page-in, not prefill ensure()."""
         import torch
         from torch import nn
         from unittest.mock import patch
@@ -660,6 +768,43 @@ class TestSpillNumaFailover(CustomTestCase):
         self.assertEqual(used, 0)
         self.assertEqual(seen, [1, 0])
         self.assertEqual(moe._dsv41_spill_host_node, 0)
+
+
+class TestGpuLocalNumaDefault(CustomTestCase):
+    """Unset NUMA envs must follow the GPUs' node, not one machine's layout."""
+
+    def _spill_nodes(self, gpu_node, host_nodes):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.dsv41_expert_spill import _spill_numa_nodes
+        from sglang.srt.mem_cache.dsv41_host_placement import NumaNodeMem
+
+        nodes = {n: NumaNodeMem(n, GIB, GIB) for n in host_nodes}
+        with envs.SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES.override(None), patch(
+            "sglang.srt.layers.moe.dsv41_expert_spill.gpu_numa_node",
+            return_value=gpu_node,
+        ), patch(
+            "sglang.srt.layers.moe.dsv41_expert_spill.read_numa_nodes",
+            return_value=nodes,
+        ):
+            envs.SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES.clear()
+            return _spill_numa_nodes()
+
+    def test_spill_starts_on_gpu_node(self):
+        self.assertEqual(self._spill_nodes(1, [0, 1]), [1, 0])
+        self.assertEqual(self._spill_nodes(0, [0, 1]), [0, 1])
+        self.assertEqual(self._spill_nodes(0, [0]), [0])
+
+    def test_engram_node_follows_gpu_unless_set(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache import dsv41_host_placement as hp
+
+        with envs.SGLANG_DSV41_ENGRAM_NUMA_NODE.override(None), patch.object(
+            hp, "gpu_numa_node", return_value=0
+        ):
+            envs.SGLANG_DSV41_ENGRAM_NUMA_NODE.clear()
+            self.assertEqual(hp.engram_numa_node(), 0)
+            envs.SGLANG_DSV41_ENGRAM_NUMA_NODE.set(1)
+            self.assertEqual(hp.engram_numa_node(), 1)
 
 
 class TestSpillHostMarlinReady(CustomTestCase):

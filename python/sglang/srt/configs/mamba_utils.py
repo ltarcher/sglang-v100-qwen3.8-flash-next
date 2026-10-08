@@ -103,9 +103,10 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         else:
             ssm_dtype = dtype_map[env_ssm_dtype]
 
-    # SM70 has no native BF16 execution. ModelRunner therefore forces model
-    # compute to FP16 by default, and the recurrent cache must follow it:
-    # assigning FP16 GDN convolution states into a BF16 cache is an error.
+    # SM70 has no native BF16 execution. The convolution cache follows the
+    # FP16 compute dtype. The recurrent SSM cache stays at the resolved dtype:
+    # KDA keeps its fp32 state, and a GDN server that wants fp16 sets
+    # SGLANG_MAMBA_SSM_DTYPE=float16.
     if (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability()[0] < 8

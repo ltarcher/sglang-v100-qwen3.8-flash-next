@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DSV4.1 vision release check. Unit tests need one GPU. Live tests need the
-# ship server on :11435. See docs/v100/PUBLISH.md.
+# DeepSeek-V4.1 server on :11435.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -n "${SGLANG_V100_PYTHON:-}" && -x "${SGLANG_V100_PYTHON}" ]]; then

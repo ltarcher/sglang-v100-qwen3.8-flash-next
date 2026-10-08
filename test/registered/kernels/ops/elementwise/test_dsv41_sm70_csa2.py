@@ -397,7 +397,7 @@ class TestSm70Dsv41Csa2Gpu(CustomTestCase):
         self.assertFalse(torch.isnan(out).any().item())
 
     def test_backend_sm70_dispatch_is_wired(self):
-        repo = Path(__file__).resolve().parents[4]
+        repo = Path(__file__).resolve().parents[5]
         src = (repo / "python/sglang/srt/layers/attention/deepseek_v4_backend.py").read_text()
         self.assertIn("sm70_forward_low_ratio_sources", src)
         self.assertNotIn("not implemented on SM70 yet", src)

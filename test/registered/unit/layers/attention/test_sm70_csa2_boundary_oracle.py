@@ -1,7 +1,7 @@
 """GPU oracle: rewind SM70 CSA2 by restoring only the ring and pending.
 
 A stale ratio-2 pending pair or SWA ring still produces fluent attention.
-This checks the WO-17 path, not a full-state clone: prefill to a stop, copy
+This checks the stop-point resume path, not a full-state clone: prefill to a stop, copy
 the ring and pending through ``Csa2BoundaryStore``, overwrite them (and the
 compressed rows past the stop), restore, extend the real suffix, and match a
 one-shot prefill. Tolerance is the T=700 decode oracle (hidden atol/rtol
@@ -351,6 +351,84 @@ class TestSm70Csa2BoundaryOracle(CustomTestCase):
             f"verify commit={commit_n}/{block}",
         )
         self._check_topk(get_state(ref_be), get_state(be), f"verify commit={commit_n}")
+
+    def _verify_step(self, be, layers, start: int, real: int, commit: int, seed: int):
+        """One verify block: ``real`` true inputs, then junk; publish ``commit``."""
+        block = GAMMA_BLOCK
+        x = self.x[start : start + block].clone()
+        ql = self.q_lora[start : start + block].clone()
+        q = self.q[start : start + block].clone()
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        n = block - real
+        x[real:] = (torch.randn(n, self.hidden, generator=g).to(FP16) * 0.2).to(self.dev)
+        ql[real:] = (torch.randn(n, self.q_lora_r, generator=g).to(FP16) * 0.2).to(
+            self.dev
+        )
+        q[real:] = (torch.randn(n, self.heads, 512, generator=g).to(FP16) * 0.2).to(
+            self.dev
+        )
+        positions = torch.arange(start, start + block, dtype=torch.int64, device=self.dev)
+        self._run(be, layers, x, ql, q, positions, verify=True)
+        sm70_commit_target_verify(
+            be,
+            torch.tensor([commit], dtype=torch.int32, device=self.dev),
+            num_positions=block,
+        )
+        csa2_finish_forward([be], start + commit, from_extend=False, start=start)
+
+    def _cut_to_pin(self, *, overlap: bool, check: bool = True) -> float:
+        """Verify past the stop, resume at the pin, match a one-shot prefill.
+
+        The request stops on an accepted draft at an odd pin, so the
+        suffix's first token pools with pending. The tokens published past
+        the pin are not the next turn's, as in a live session. Returns the
+        largest row difference.
+        """
+        stop0, pin, suffix = 700, 703, 32
+        end = pin + suffix
+        ref_be = self._backend()
+        ref = self._extend(ref_be, self._layers(), 0, end)
+
+        be = self._backend()
+        layers = self._layers()
+        self._extend(be, layers, 0, stop0)
+        csa2_finish_forward([be], stop0, from_extend=True)
+        csa2_prepare_decode([be])
+        self._verify_step(be, layers, stop0, pin - stop0, 5, seed=1001)
+        if overlap:
+            self._verify_step(be, layers, stop0 + 5, 0, 3, seed=1002)
+        csa2_prepare_extend([be], pin)
+        got = self._extend(be, layers, pin, end)
+        tag = f"cut to pin overlap={overlap}"
+        if check:
+            self._check_rows({lid: ref[lid][pin:] for lid in LAYER_ORDER}, got, tag)
+            self._check_topk(get_state(ref_be), get_state(be), tag)
+        return max(self._maxdiff(ref[lid][pin:], got[lid]) for lid in LAYER_ORDER)
+
+    def test_verify_past_the_pin_is_cut_back(self):
+        self._cut_to_pin(overlap=False)
+
+    def test_overlap_step_past_the_pin_is_cut_back(self):
+        self._cut_to_pin(overlap=True)
+
+    def test_relabel_past_the_pin_is_measurably_off(self):
+        """Control: without the cut the same resume drifts from the oracle.
+
+        These small weights keep the drift inside the oracle tolerance, so
+        compare it with the cut, which matches the one-shot rows exactly.
+        """
+        from unittest import mock
+
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+            Csa2BoundaryStore,
+        )
+
+        cut = self._cut_to_pin(overlap=False, check=False)
+        with mock.patch.object(Csa2BoundaryStore, "trim_tip", return_value=False):
+            relabel = self._cut_to_pin(overlap=False, check=False)
+        print(f"cut maxabs={cut:.6f} relabel maxabs={relabel:.6f}")
+        self.assertLess(cut, 1e-3)
+        self.assertGreater(relabel, 5e-3)
 
     def test_disk_session_then_suffix_matches_oneshot(self):
         """Spill the image, clobber it, load it, then extend the real suffix."""

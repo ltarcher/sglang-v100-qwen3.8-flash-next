@@ -54,7 +54,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -192,25 +191,7 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
-        )
-        # V4.1 has no HF chat template, so the probe above says "merge".
-        # The custom encoder renders a mid-conversation system turn at its
-        # own position. Folding Claude Code's trailing harness reminder into
-        # the leading system block rewrites the token prefix on the next
-        # turn, and the sticky cache drops the pin.
-        if getattr(openai_serving_chat, "chat_encoding_spec", None) == "dsv41":
-            self._merge_inline_system = False
-
-    def _chat_template(self) -> Optional[str]:
-        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
-        if tokenizer_manager is None:
-            return None
-        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
-        if tokenizer is None:
-            return None
-        return getattr(tokenizer, "chat_template", None)
+        self._merge_inline_system = not openai_serving_chat.supports_inline_system
 
     @staticmethod
     def _session_key_from_metadata(
@@ -262,8 +243,8 @@ class AnthropicServing:
             and raw_request.headers.get("x-data-parallel-rank") is not None
         ):
             return
-        dp_size = get_parallel().dp_size
-        if dp_size <= 1:
+        num_dp_ranks = get_parallel().num_dp_ranks
+        if num_dp_ranks <= 1:
             return
 
         session_key = None
@@ -277,7 +258,7 @@ class AnthropicServing:
         # sha256, not builtin hash(): the latter is PYTHONHASHSEED-salted per
         # process and would re-shuffle every session across an engine restart.
         digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
-        chat_request.routed_dp_rank = int(digest, 16) % dp_size
+        chat_request.routed_dp_rank = int(digest, 16) % num_dp_ranks
         logger.debug(
             "Pinned Anthropic session %s to DP rank %d",
             session_key,
@@ -650,6 +631,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            **anthropic_request.pd_routing_kwargs(),
         }
 
         if anthropic_request.temperature is not None:

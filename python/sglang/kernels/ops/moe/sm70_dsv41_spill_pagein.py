@@ -1,4 +1,4 @@
-"""WO-13 D4-G: SM70 UVA page-in of spilled expert rows into a landing pool."""
+"""SM70 UVA page-in of spilled expert rows into a landing pool."""
 
 from __future__ import annotations
 

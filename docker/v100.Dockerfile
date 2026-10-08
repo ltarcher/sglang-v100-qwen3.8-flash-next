@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-# Reproducible SGLang image for NVIDIA V100 (Volta, SM70). Expensive native
-# builds are deliberately separate layers; a later validation failure never
-# invalidates completed FlashInfer, sglang-kernel, or Marlin compilation.
+# sglang-sxm2 image for NVIDIA V100 (Volta, SM70). Serves GLM-5.3-Flash,
+# Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash and MiniMax-H3 through the same
+# scripts as a host install; see docker/v100-compose.yaml for the usage.
+# Expensive native builds are separate layers, so a later validation failure
+# never invalidates completed FlashInfer, sglang-kernel, or Marlin compilation.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -18,7 +20,7 @@ ENV CUDA_HOME=/usr/local/cuda \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates cmake curl ffmpeg git g++-12 libnuma-dev \
+      build-essential ca-certificates cmake curl ffmpeg git g++-12 g++-14 libnuma-dev \
       ninja-build patch pkg-config protobuf-compiler python3.12 python3.12-dev \
       python3-pip python3-venv \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
@@ -37,57 +39,12 @@ WORKDIR /opt/sglang
 COPY scripts/v100_safe_jobs.sh /usr/local/bin/v100-safe-jobs
 RUN chmod +x /usr/local/bin/v100-safe-jobs
 
-# Install SGLang's current runtime dependency list while deliberately excluding
-# the four packages replaced below by CUDA 12.8 / SM70 builds.
-COPY python/pyproject.toml /tmp/sglang-pyproject.toml
+# Install the validated V100 dependency set without resolution. Upstream's
+# pyproject pins target CUDA 13 and cannot resolve against torch 2.9.1 / cu128.
+COPY requirements.txt /tmp/requirements-v100.txt
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    python -m pip install --upgrade \
-      pip setuptools wheel setuptools-scm setuptools-rust scikit-build-core \
-      ninja psutil packaging \
-    && python -m pip install \
-      torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-      --index-url https://download.pytorch.org/whl/cu128 \
-    && python - <<'PY'
-import subprocess
-import sys
-import tomllib
-from packaging.requirements import Requirement
-
-with open("/tmp/sglang-pyproject.toml", "rb") as file:
-    project = tomllib.load(file)["project"]
-
-dependencies = [
-    *project["dependencies"],
-    *project["optional-dependencies"]["diffusion-v100"],
-]
-
-replaced = {
-    "flashinfer-python",
-    # Skipped too: every sgl-deep-ep release on PyPI pins torch==2.13.0, which
-    # cannot coexist with the torch 2.9.1 pinned here (and conflicts with
-    # compressed-tensors' torch<2.11). sglang imports deep_ep behind
-    # try/except (use_deepep / use_deepep_v2 fall back to False), and DeepEP
-    # has no SM70 path, so nothing on V100 ever loads it.
-    "sgl-deep-ep",
-    "sglang-kernel",
-    "torch",
-    "torchaudio",
-    "torchvision",
-}
-dependencies = [
-    dependency
-    for dependency in dependencies
-    if Requirement(dependency).name.lower().replace("_", "-") not in replaced
-]
-subprocess.check_call([sys.executable, "-m", "pip", "install", *dependencies])
-PY
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    python -m pip install \
-      grpcio==1.81.1 grpcio-health-checking==1.81.1 \
-      grpcio-reflection==1.81.1 protobuf==6.33.6 tilelang==0.1.8 \
-    && python -m pip uninstall -y nvidia-nccl-cu13 || true \
-    && python -m pip install --force-reinstall --no-deps \
-      nvidia-nccl-cu12==2.27.5
+    python -m pip install --upgrade pip \
+    && python -m pip install --no-deps -r /tmp/requirements-v100.txt
 
 # Patched FlashInfer SM70 source. This is editable because its JIT headers and
 # Python sources are both needed at runtime.
@@ -184,19 +141,13 @@ RUN --mount=type=cache,target=/opt/deps/marlin-v100,sharing=locked \
 # sgl-deep-gemm 0.2.0 pins -- but sgl-deep-gemm never imports on SM70
 # (ENABLE_JIT_DEEPGEMM requires SM90+), so the tilelang-era 0.1.9 wins.
 COPY python /opt/sglang/python
-# setup.py reads rust/Cargo.toml, a workspace manifest whose members are
-# sglang-grpc, sglang-mm, and sglang-server, so the whole rust/ tree is
-# needed -- copying only sglang-grpc fails the editable install.
-# SGLANG_BUILD_RUST_EXTS (substring match on extension names) excludes
-# sglang-radix-tree: its TreeCore links torch via tch and gates torch to
-# 2.11-2.13, while this image pins 2.9.1. That crate is a Unified Radix
-# Cache backend that postdates the proven V100 build; the other three
-# crates do not link torch and build fine against 2.9.1.
-RUN --mount=type=bind,source=rust,target=/mnt/sglang-rust,ro \
+# The Rust radix tree needs torch >= 2.11 and is optional (the Python tree is
+# the default backend), so build only the other extensions.
+ENV SGLANG_BUILD_RUST_EXTS=grpc,multimodal,server
+RUN --mount=type=bind,source=rust,target=/mnt/rust,ro \
     --mount=type=bind,source=proto,target=/mnt/proto,ro \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    mkdir -p /opt/sglang/rust \
-    && cp -a /mnt/sglang-rust/. /opt/sglang/rust/ \
+    cp -a /mnt/rust /opt/sglang/rust \
     && cp -a /mnt/proto /opt/sglang/proto \
     && export SGLANG_BUILD_RUST_EXTS=grpc,multimodal,server \
     && python -m pip install --no-deps --no-build-isolation -e /opt/sglang/python \
@@ -222,10 +173,17 @@ marlin = [
     marlin_dir / "_sm70_marlin_v100_moe.abi3.so",
 ]
 turbomind = marlin_dir / "_sm70_turbomind_v100.so"
-grpc_core = list(
-    Path("/opt/sglang/python/sglang/srt/rust_extensions").glob("_grpc*.so")
-)
-assert len(grpc_core) == 1, grpc_core
+# The runtime stage has no rust/ workspace, so the loader uses these bundled
+# extension modules and never invokes Cargo.
+pkg = Path("/opt/sglang/python")
+for module in (
+    "sglang.srt.rust_extensions._server",
+    "sglang.srt.rust_extensions._grpc",
+    "sglang.srt.rust_extensions._multimodal",
+):
+    *parent, name = module.split(".")
+    found = list(pkg.joinpath(*parent).glob(f"{name}*.so"))
+    assert len(found) == 1, (module, found)
 assert Path("/opt/deps/flashinfer-sm70/flashinfer/sampling.py").is_file()
 assert Path(
     "/opt/sglang/python/sglang/srt/layers/attention/"
@@ -246,8 +204,6 @@ def validate_sm70(binary, required_strings):
     for value in required_strings:
         assert value in strings, (binary, value)
 
-# gptq_gemm was removed from the sm70 sgl-kernel by the 2026-09-19 remasure
-# commit; GPTQ on V100 goes through the Marlin extension validated below.
 validate_sm70(common_ops[0], ["all_reduce", "causal_conv1d_fwd"])
 validate_sm70(marlin[0], ["marlin_gemm"])
 validate_sm70(marlin[1], ["moe_wna16_marlin_gemm"])
@@ -257,31 +213,32 @@ PY
 
 FROM base AS runtime
 
-ENV NCCL_P2P_LEVEL=NVL \
-    SGLANG_MAMBA_CONV_DTYPE=float16 \
-    SGLANG_MAMBA_SSM_DTYPE=float16 \
-    SGLANG_SM70_DENSE_GEMV=1 \
-    SGLANG_SM70_QWEN_FUSIONS=1 \
-    HF_HOME=/root/.cache/huggingface \
+# Model-specific settings live in the serve scripts, as on a host install.
+ENV HF_HOME=/root/.cache/huggingface \
     FLASHINFER_WORKSPACE_BASE=/root/sglang-v100-jit \
     TILELANG_CACHE_DIR=/root/sglang-v100-jit/tilelang \
     TRITON_CACHE_DIR=/root/sglang-v100-jit/triton \
     TORCHINDUCTOR_CACHE_DIR=/root/sglang-v100-jit/torchinductor \
-    SGLANG_V100_PYTHON=/opt/venv/bin/python
+    SGLANG_V100_PYTHON=/opt/venv/bin/python \
+    SGLANG_V100_VENV=/opt/venv
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/deps/flashinfer-sm70 /opt/deps/flashinfer-sm70
 COPY --from=builder /opt/sglang/python /opt/sglang/python
 COPY scripts/smoke_v100.sh \
-      scripts/serve_qwen38_flash_next_nvfp4_v100.sh \
-      scripts/serve_glm53_flash_v100.sh \
-      scripts/serve_dsv41_v100.sh \
-      /opt/sglang/scripts/
+     scripts/serve_glm53_flash_nvfp4_v100.sh \
+     scripts/serve_glm53_flash_v100.sh \
+     scripts/serve_qwen38_flash_next_nvfp4_v100.sh \
+     scripts/serve_dsv41_v100.sh \
+     scripts/dsv41_flash_cold_set_ep8.json \
+     scripts/serve_minimax_h3_v100.sh \
+     /opt/sglang/scripts/
 COPY docker/v100-entrypoint.sh /usr/local/bin/v100-entrypoint
-RUN chmod +x /opt/sglang/scripts/smoke_v100.sh /usr/local/bin/v100-entrypoint
+RUN chmod +x /opt/sglang/scripts/*.sh /usr/local/bin/v100-entrypoint
 
 WORKDIR /opt/sglang
-EXPOSE 8082
+# Language models on 11435, MiniMax-H3 on 30010.
+EXPOSE 11435 30010
 
 ENTRYPOINT ["/usr/local/bin/v100-entrypoint"]
-CMD ["--help"]
+CMD ["glm53"]

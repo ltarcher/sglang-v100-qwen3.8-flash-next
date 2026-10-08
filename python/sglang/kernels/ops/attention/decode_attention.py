@@ -352,7 +352,9 @@ def _fwd_kernel_stage1(
             # uint8 and is decoded to fp16 inside the tile.
             if SM70_FP8_KV:
                 k = fp8_sm70_to_fp32(k, SM70_FP8_E5M2).to(tl.float16)
-            qk = tl.sum(q[None, :] * k, 1)
+            # Reduce in fp32; a bf16 tl.sum rounds each partial sum in compiler order.
+            # Cast the product, not q and k, to avoid a fp32 [BLOCK_N, D] tile.
+            qk = tl.sum((q[None, :] * k).to(tl.float32), 1)
             qk *= sm_scale_withk
 
             if logit_cap > 0:

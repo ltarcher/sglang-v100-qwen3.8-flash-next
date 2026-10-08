@@ -39,10 +39,13 @@ class DeepseekSparseAttnBackendKPoolMixin:
         dsa_impl: _DSA_IMPL_T,
         phase: str,
     ) -> None:
+        # SM70 sparse MLA walks the index list and skips negatives, so the
+        # extra live tail columns are ordinary selected keys.
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or getattr(self, "device_capability", None) == (7, 0)
         ):
             return
         raise NotImplementedError(

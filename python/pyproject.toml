@@ -3,7 +3,7 @@ requires = [
   "setuptools>=61.0",
   "setuptools-rust>=1.11",
   "setuptools-scm>=8.0",
-  "torch==2.13.0",
+  "torch==2.14.1",
   "wheel",
 ]
 build-backend = "setuptools.build_meta"
@@ -67,9 +67,10 @@ dependencies = [
   "python-multipart",
   "pyzmq>=25.1.2",
   "quack-kernels>=0.3.0",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2",
   "sgl-deep-gemm==0.2.0",
@@ -85,11 +86,13 @@ dependencies = [
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchvision",
   "tqdm",
-  "transformers==5.12.1",
+  "transformers==5.17.0",
   "uvicorn",
   "uvloop",
   "watchfiles",
-  "xgrammar==0.1.32",
+  "xgrammar==0.2.1",
+  "xxhash",
+  "zstandard",
   "smg-grpc-servicer>=0.9.0",
   "kernels==0.14.1",
 ]
@@ -213,7 +216,7 @@ test = [
   # Pinned: a bump moves scoring for every eval test at once, so re-baseline
   # MODEL_SCORE_THRESHOLDS in test/registered/eval/test_text_models_gsm8k_eval.py
   # and the mmlu thresholds of run_eval's other callers before changing it.
-  "sgl-eval==0.1.0",
+  "sgl-eval==0.1.2",
   "sglang[fastokens]",
   "tabulate",
 ]
@@ -232,6 +235,8 @@ vsa = ["setuptools", "torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
+"Documentation" = "https://docs.sglang.io"
+"Cookbook" = "https://docs.sglang.io/cookbook"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]
@@ -251,6 +256,8 @@ killall_sglang = "sglang.cli.killall:main"
   "kernels/aot/**/*",
   "srt/mem_cache/rust_tree_core/mem_cache_inspection*.so",
 ]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [

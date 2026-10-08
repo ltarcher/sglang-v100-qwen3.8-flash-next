@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// WO-13 D6-e: SM70 decode GEMV for dense MXFP8 e4m3fn + UE8M0 g32 (M<=4).
+// SM70 decode GEMV for dense MXFP8 e4m3fn + UE8M0 g32 (M<=4).
 // marlin_v100 FP8 W8A16 instantiates group_size {-1, 128} only, so official
 // DSV4.1-Flash g32 stays packed in HBM. Dequant uses fp32 UE8M0 (exp<<23)
 // so bytes 109-112 survive; do not store those scales as fp16.

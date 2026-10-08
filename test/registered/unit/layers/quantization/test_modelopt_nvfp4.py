@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -18,6 +19,17 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def test_only_interleaving_backends_support_the_fusion(self):
+        for backend, expected in (
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTLASS, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUDNN, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_TRTLLM, False),
+            (Fp4GemmRunnerBackend.MARLIN, False),
+        ):
+            with self.subTest(backend=backend):
+                self.assertEqual(backend.supports_swiglu_fusion(), expected)
+
     def _make_layer(self):
         return MergedColumnParallelLinear(
             input_size=16,
@@ -131,6 +143,48 @@ class TestModelOptNvfp4(CustomTestCase):
                 group_size=16,
                 use_per_token_activation=True,
             )
+
+    def test_shared_expert_fusion_requires_matching_fp4_precision(self):
+        quantized_shared = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+        )
+        bf16_shared = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.*.mlp.shared_experts*"],
+        )
+
+        gate_only_bf16 = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.*.mlp.shared_expert_gate"],
+        )
+
+        self.assertTrue(quantized_shared.can_fuse_shared_expert())
+        self.assertFalse(bf16_shared.can_fuse_shared_expert())
+        # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
+        self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
+
+    def test_torch_nvfp4_quantizer_rounds_half_to_even_low_nibble_first(self):
+        """The pre-SM100 load-time quantizer must match FlashInfer's E2M1 rounding
+        and the ModelOpt nibble order, or converted experts decode to other values."""
+        from sglang.srt.layers.quantization.nvfp4_online import _nvfp4_quantize_torch
+        from sglang.test.quant_ref_utils import break_fp4_bytes
+
+        # Block amax 6 with decode scale 1/448 gives block scale 1, so values are codes.
+        values = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -6]
+        values += [0.25, 0.75, 1.25, 1.75, 2.5, 3.5]
+        expected = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -6, 0, 1, 1, 2, 2, 4]
+        weight = torch.tensor([values])
+        packed, block_scales = _nvfp4_quantize_torch(
+            weight=weight, weight_scale_2=torch.tensor(1 / 448)
+        )
+
+        self.assertEqual(packed.shape, (1, 8))
+        self.assertEqual(block_scales.dtype, torch.float8_e4m3fn)
+        decoded = break_fp4_bytes(packed) * block_scales.float() / 448
+        torch.testing.assert_close(decoded[0], torch.tensor(expected).float())
 
 
 if __name__ == "__main__":

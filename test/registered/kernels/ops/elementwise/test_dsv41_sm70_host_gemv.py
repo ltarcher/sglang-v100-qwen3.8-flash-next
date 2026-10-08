@@ -1,4 +1,4 @@
-"""WO-13 D4-H: host MXFP4 GEMV vs SM70 GPU decode at DSV4.1 Flash shapes.
+"""Host MXFP4 GEMV vs SM70 GPU decode at DSV4.1 Flash shapes.
 
 Not registered for GPU CI (V100 worktree only).
 """

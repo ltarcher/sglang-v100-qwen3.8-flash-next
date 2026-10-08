@@ -69,9 +69,41 @@ class SM70FP16MoEMethod(UnquantizedFusedMoEMethod):
         super().__init__(use_triton_kernels=False)
 
     def create_moe_runner(self, layer, moe_runner_config):
-        self.moe_runner_config = moe_runner_config
+        # The Triton runner serves configs the TurboMind kernels do not implement.
+        super().create_moe_runner(layer, moe_runner_config)
+        self.use_turbomind = False
+
+    @staticmethod
+    def _turbomind_unsupported_reason(cfg) -> str | None:
+        # The gated epilogue is a plain silu(gate) * up; the unpermute only
+        # applies the router weights.
+        if cfg.activation != "silu" or not cfg.is_gated:
+            return f"activation={cfg.activation} is_gated={cfg.is_gated}"
+        if cfg.swiglu_limit is not None or cfg.gemm1_clamp_limit is not None:
+            return "clamped SwiGLU"
+        if cfg.gemm1_alpha is not None or cfg.gemm1_beta is not None:
+            return "SwiGLU alpha/beta"
+        if cfg.apply_router_weight_on_input or cfg.no_combine:
+            return "router weight on input or no combine"
+        if cfg.wide_output_scale != 1.0 or cfg.gate_up_input_scale != 1.0:
+            return "FP16 range scaling"
+        if cfg.num_experts != cfg.num_local_experts:
+            return "expert parallelism"
+        return None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        reason = self._turbomind_unsupported_reason(self.moe_runner_config)
+        if reason is not None:
+            logger.info("SM70 FP16 MoE: %s needs the Triton runner", reason)
+            super().process_weights_after_loading(layer)
+            return
+        self.use_turbomind = True
+        scale = self.moe_runner_config.routed_scaling_factor
+        self.output_scale = (
+            None
+            if scale in (None, 1.0) or layer.should_fuse_routed_scaling_factor_in_topk
+            else float(scale)
+        )
         num_experts, w13_n, hidden_size = layer.w13_weight.shape
         intermediate_size = w13_n // 2
         # TurboMind's gated epilogue expects gate/up rows interleaved.
@@ -174,6 +206,8 @@ class SM70FP16MoEMethod(UnquantizedFusedMoEMethod):
         )
 
     def apply(self, layer, dispatch_output):
+        if not self.use_turbomind:
+            return super().apply(layer, dispatch_output)
         x = dispatch_output.hidden_states
         topk = dispatch_output.topk_output
         tokens = x.shape[0]
@@ -281,4 +315,6 @@ class SM70FP16MoEMethod(UnquantizedFusedMoEMethod):
             k,
             output,
         )
+        if self.output_scale is not None:
+            output.mul_(self.output_scale)
         return StandardCombineInput(hidden_states=output)

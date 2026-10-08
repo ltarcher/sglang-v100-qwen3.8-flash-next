@@ -1,4 +1,4 @@
-"""WO-13 D4-H: SM70 host MXFP4 GEMV for spilled decode experts."""
+"""SM70 host MXFP4 GEMV for spilled decode experts."""
 
 from __future__ import annotations
 

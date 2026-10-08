@@ -3,7 +3,7 @@
 Used by ``DeepseekV4AttnBackend`` for ratio-0/1/2 layers on SM70. Hopper/DeepGEMM stay off.
 Replay flags are off: every query sees its exact 128-token window.
 
-D3 (WO-13): all per-sequence state lives in static, position-indexed device
+All per-sequence state lives in static, position-indexed device
 buffers so the bs=1 decode path has no host sync, no Python-side sequence
 state and a fixed launch shape (CUDA-graph capturable):
 
@@ -784,7 +784,7 @@ def _prefill_low_ratio_sources(backend, layer, x, q_lora, positions, forward_bat
 def _select_topk(scores: torch.Tensor, lens32: torch.Tensor, k: int) -> torch.Tensor:
     """Row 0 top-k indices over ``scores[:, :lens]``; -1 where absent or -inf."""
     if k in _FAST_TOPK_K:
-        from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+        from sglang.kernels.ops.attention.fast_topk import fast_topk
 
         idx = fast_topk(scores, lens32, k)
     else:

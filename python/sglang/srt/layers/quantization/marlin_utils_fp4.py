@@ -7,10 +7,14 @@ import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
+    _sm70_marlin_v100_gemm_op,
+    _sm70_marlin_v100_repack_ops,
     marlin_make_workspace,
     marlin_permute_bias,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
+    sm70_nvfp4_marlin_process_global_scale,
+    sm70_nvfp4_marlin_process_scales,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import is_cuda
@@ -19,7 +23,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
@@ -108,6 +112,63 @@ def apply_fp4_marlin_linear(
         dtype=input.dtype,
     )
 
+    sm70_gemm = _sm70_marlin_v100_gemm_op()
+    if sm70_gemm is not None:
+        # M=1 Marlin on these tiles is launch-bound. Stream the same packed
+        # weights with a GEMV when N is a multiple of 256 (the four-tile
+        # interleave). Larger prefill batches stay on Marlin.
+        if (
+            reshaped_x.dtype == torch.float16
+            and 1 <= reshaped_x.shape[0] <= 4
+            and padded_size_n % 256 == 0
+            and padded_size_k % 16 == 0
+            and weight.dtype == torch.int32
+            and (bias is None or bias.numel() == 0)
+        ):
+            from sglang.kernels.ops.gemm.sm70_glm_nvfp4_gemv import (
+                sm70_glm_nvfp4_gemv,
+                sm70_glm_nvfp4_gemv_available,
+            )
+
+            if sm70_glm_nvfp4_gemv_available():
+                output = sm70_glm_nvfp4_gemv(
+                    reshaped_x,
+                    weight,
+                    weight_scale,
+                    weight_global_scale,
+                )
+                if output is not None:
+                    if padded_size_n != size_n:
+                        output = output[:, :size_n].contiguous()
+                    return output.reshape(out_shape)
+
+        # The in-tree Marlin GEMM is an empty stub below SM80. marlin_v100
+        # consumes the logical scale layout prepared above and applies bias.
+        output = sm70_gemm(
+            reshaped_x,
+            None,
+            weight,
+            bias,
+            weight_scale,
+            None,
+            weight_global_scale,
+            None,
+            None,
+            None,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            reshaped_x.size(0),
+            padded_size_n,
+            padded_size_k,
+            True,
+            use_atomic_add,
+            use_fp32_reduce,
+            False,
+        )
+        if padded_size_n != size_n:
+            output = output[:, :size_n].contiguous()
+        return output.reshape(out_shape)
+
     output = gptq_marlin_gemm(
         a=reshaped_x,
         c=None,
@@ -181,36 +242,78 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     perm = torch.empty(0, dtype=torch.int, device=device)
     qweight = layer.weight.view(torch.int32).T.contiguous()
-    marlin_qweight = gptq_marlin_repack(
-        b_q_weight=qweight,
-        perm=perm,
-        size_k=padded_size_k,
-        size_n=padded_size_n,
-        num_bits=4,
-    )
+    sm70_repack, _ = _sm70_marlin_v100_repack_ops()
+    if sm70_repack is not None:
+        # The in-tree repack kernel returns without writing below SM80.
+        marlin_qweight = sm70_repack(qweight, perm, padded_size_k, padded_size_n, 4)
+    else:
+        marlin_qweight = gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=padded_size_k,
+            size_n=padded_size_n,
+            num_bits=4,
+        )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
-    weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
-    weight_scale = marlin_permute_scales(
-        s=weight_scale,
-        size_k=padded_size_k,
-        size_n=padded_size_n,
-        group_size=16,
-    )
-    weight_scale = nvfp4_marlin_process_scales(weight_scale)
-    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+    if sm70_repack is not None:
+        # Logical [K/16, N], then the S0E5M3 encoding the V100 iterator reads.
+        logical_scales = layer.weight_scale.T.unsqueeze(0).contiguous()
+        encoded, scale_factor = sm70_nvfp4_marlin_process_scales(
+            logical_scales, param_dtype
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            encoded[0].contiguous(), requires_grad=False
+        )
+        global_scale = sm70_nvfp4_marlin_process_global_scale(
+            layer.weight_global_scale, param_dtype
+        )
+        if scale_factor != 1.0:
+            global_scale = global_scale / scale_factor
+        layer.weight_global_scale = torch.nn.Parameter(
+            global_scale.reshape(-1).contiguous(), requires_grad=False
+        )
+    else:
+        weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
+        weight_scale = marlin_permute_scales(
+            s=weight_scale,
+            size_k=padded_size_k,
+            size_n=padded_size_n,
+            group_size=16,
+        )
+        weight_scale = nvfp4_marlin_process_scales(weight_scale)
+        layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
-    weight_global_scale = layer.weight_global_scale.to(param_dtype)
-    weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
-    layer.weight_global_scale = torch.nn.Parameter(
-        weight_global_scale, requires_grad=False
-    )
+        weight_global_scale = layer.weight_global_scale.to(param_dtype)
+        weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
+        layer.weight_global_scale = torch.nn.Parameter(
+            weight_global_scale, requires_grad=False
+        )
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
         bias = torch.nn.functional.pad(layer.bias, (0, padded_size_n - part_size_n))
-        bias = marlin_permute_bias(bias)
+        if sm70_repack is None:
+            bias = marlin_permute_bias(bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+
+    if (
+        sm70_repack is not None
+        and padded_size_n % 256 == 0
+        and padded_size_k % 16 == 0
+        and not (
+            hasattr(layer, "bias")
+            and layer.bias is not None
+            and layer.bias.numel() > 0
+        )
+    ):
+        from sglang.kernels.ops.gemm.sm70_glm_nvfp4_gemv import (
+            prepack_glm_nvfp4_weight,
+            sm70_glm_nvfp4_gemv_available,
+        )
+
+        if sm70_glm_nvfp4_gemv_available():
+            prepack_glm_nvfp4_weight(layer.weight)
 
 
 def mxfp4_marlin_process_scales(

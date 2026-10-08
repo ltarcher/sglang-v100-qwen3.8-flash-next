@@ -1,4 +1,4 @@
-"""WO-13 D4-G: SM70 UVA spill page-in copies host rows into landing slots.
+"""SM70 UVA spill page-in copies host rows into landing slots.
 
 Not registered for GPU CI (V100 worktree only).
 """
@@ -69,7 +69,7 @@ class TestSm70Dsv41SpillPagein(CustomTestCase):
 
     @unittest.skipUnless(_sm70(), "SM70 required")
     def test_page_in_accepts_dspark_landing_36(self):
-        """WO-15: kMaxLanding was 16; DSPARK sets SGLANG_DSV41_SPILL_LANDING=36."""
+        """kMaxLanding was 16; DSPARK sets SGLANG_DSV41_SPILL_LANDING=36."""
         from sglang.kernels.ops.moe.sm70_dsv41_spill_pagein import spill_page_in
 
         device = torch.device("cuda")

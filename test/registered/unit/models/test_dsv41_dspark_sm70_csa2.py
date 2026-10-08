@@ -78,7 +78,10 @@ class TestDsv41DsparkSm70Csa2(CustomTestCase):
             _SelectExpertsSinglePassGatherer,
         )
 
-        g = SimpleNamespace(_data=torch.zeros(40, 384, dtype=torch.int))
+        g = SimpleNamespace(
+            _data=torch.zeros(40, 384, dtype=torch.int),
+            _expert_location_metadata=SimpleNamespace(num_physical_experts=384),
+        )
         ids = torch.tensor([[1, 2, 3]])
         _SelectExpertsSinglePassGatherer.on_select_experts(g, None, ids)
         self.assertEqual(int(g._data.sum()), 0)

@@ -53,7 +53,7 @@ greedy next token and that token is comma (id 14), not emdash (id 965).
 
 Example::
 
-  PYTHONPATH=python $HOME/sglang-v100-venv/bin/python \\
+  PYTHONPATH=python python \\
     test/manual/dsv41_v100/test_target_verify_vs_ar.py \\
     --base http://127.0.0.1:11435
 """
@@ -69,9 +69,7 @@ import urllib.request
 from typing import Any
 
 DEFAULT_BASE = "http://127.0.0.1:11435"
-DEFAULT_OUT = (
-    "$HOME/dsv41-v100-logs/2026-09-18/prefill-vs-ar-target-verify.json"
-)
+DEFAULT_OUT = "prefill-vs-ar-target-verify.json"
 
 # Official DeepSeek-V4.1-Flash tokenizer ids used on this unit.
 COMMA_ID = 14

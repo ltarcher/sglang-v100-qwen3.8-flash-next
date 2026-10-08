@@ -218,7 +218,7 @@ def test_dense_prefill_selection_skip_still_updates_keys():
         update_key_state_and_compress=Mock(),
     )
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, positions=positions)
-    output = QSAIndexer.forward_cuda(
+    output = QSAIndexer._forward_impl(
         indexer, hidden, positions, batch, metadata, skip_prefill_selection=True
     )
     assert output.shape == (3, 0)  # Physical DP padding does not create semantic rows.
@@ -238,7 +238,7 @@ def test_selection_skip_rejects_decode_and_speculation(mode):
     from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
     with pytest.raises(ValueError, match="ordinary prefill"):
-        QSAIndexer.forward_cuda(
+        QSAIndexer._forward_impl(
             object(),
             None,
             None,

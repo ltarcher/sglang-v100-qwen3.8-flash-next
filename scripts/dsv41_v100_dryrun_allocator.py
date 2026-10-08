@@ -4,7 +4,7 @@
 CPU only. No weight download. No GPU.
 
     PYTHONPATH=/tmp/sglang-dsv41-v100/python \\
-      $HOME/sglang-v100-venv/bin/python \\
+      python \\
       scripts/dsv41_v100_dryrun_allocator.py
 
 Exit 1 if any rank's HBM is over 31 GiB. Exit 2 if Engram/spill cannot sit on

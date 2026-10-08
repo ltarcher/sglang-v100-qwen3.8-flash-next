@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
@@ -346,6 +346,16 @@ def handle_gpu_memory_settings(server_args: Any):
             "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
         )
 
+    # ------------------------------------------------------------------
+    # Input logprob chunk size
+    # ------------------------------------------------------------------
+
+    # 32 GB Volta deployments run static fractions near 0.93; a 2048-row chunk
+    # of full-vocab fp32 logits (1.2 GiB at a 150k vocab, held twice) OOMs.
+    # 256 is arbitrary. LoRA reads the same env var, so its passes stay aligned.
+    if get_platform().is_sm70 and not envs.SGLANG_LOGPROB_CHUNK_SIZE.is_set():
+        envs.SGLANG_LOGPROB_CHUNK_SIZE.set(256)
+
 
 def reserve_for_graph_mb(server_args: Any) -> float:
 
@@ -361,14 +371,14 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         reserved_mem += decode_cuda_graph_config.max_bs * 2
 
     if (
-        resolved_view(server_args).enable_dp_attention
+        attn_dp_enabled_of(resolved_view(server_args))
         and cfg.disaggregation_mode != "prefill"
     ):
         # DP attention needs more padding for some operations, and much more for large
         # cuda graph max bs (torch allocator / implementation inefficiencies).
-        reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 3
+        reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 3
         if decode_cuda_graph_config.max_bs > 300:
-            reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 1.5
+            reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 1.5
 
     if (
         cfg.disaggregation_mode != "decode"

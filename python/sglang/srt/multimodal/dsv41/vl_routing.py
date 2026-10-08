@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
@@ -21,6 +22,18 @@ def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_facto
 
 
 def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
+    weights, indices, packed_topk = _vision_topk(
+        moe, logits, input_ids, num_token_non_padded
+    )
+    # This replaces select_experts, so it owes the distribution recorder the same
+    # hook; the recorder drops padded (-1) and fused shared-expert ids itself.
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=indices)
+    if packed_topk is not None:
+        return StandardTopKOutputPacked(weights, indices, logits, packed_topk)
+    return StandardTopKOutput(weights, indices, logits)
+
+
+def _vision_topk(moe, logits, input_ids, num_token_non_padded):
     config = moe.topk.topk_config
     num_fused_shared_experts = config.num_fused_shared_experts
     if num_fused_shared_experts:
@@ -65,9 +78,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             num_fused_shared_experts,
             config.fused_shared_experts_scaling_factor,
         )
-        if packed_topk is not None:
-            return StandardTopKOutputPacked(weights, indices, logits, packed_topk)
-        return StandardTopKOutput(weights, indices, logits)
+        return weights, indices, packed_topk
     scores = F.softplus(logits.float()).sqrt()
     if input_ids is None:
         bias = moe.gate.e_score_correction_bias
@@ -103,4 +114,4 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
     if num_token_non_padded is not None:
         _mask_topk_ids_padded_region(indices, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
-    return StandardTopKOutput(weights, indices, logits)
+    return weights, indices, None

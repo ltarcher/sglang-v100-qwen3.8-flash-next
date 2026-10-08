@@ -1,4 +1,4 @@
-"""WO-13 D6-e: SM70 dense MXFP8 e4m3+UE8M0 linear (DeepSeek-V4.1-Flash).
+"""SM70 dense MXFP8 e4m3+UE8M0 linear (DeepSeek-V4.1-Flash).
 
 Decode M<=4 is a packed GEMV. Prefill M>4 dequants into a transient fp16
 weight and uses ``F.linear``. marlin_v100 FP8 has no group-32; this is not

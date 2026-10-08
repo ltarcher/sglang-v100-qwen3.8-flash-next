@@ -83,6 +83,24 @@ def _act_quant_kernel(
     tl.store(s_ptrs, scale, mask=s_mask)
 
 
+def _act_quant_sm70(
+    x: torch.Tensor, block_size: int, scale_fmt: Optional[str]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Block fp8 quant for Volta, whose Triton rejects ``fp8e4nv``.
+
+    The scale matches the Triton kernel: ``amax / 448``, or the next power of
+    two of that when ``scale_fmt`` is set. The bytes follow torch's e4m3fn cast.
+    """
+    from sglang.kernels.ops.attention.kpool_sm70 import act_quant_sm70
+
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert block_size == 128, f"SM70 act_quant supports block_size 128, got {block_size}"
+    assert x.size(-1) % block_size == 0, (
+        f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    )
+    return act_quant_sm70(x, round_scale=scale_fmt is not None)
+
+
 def act_quant(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -98,6 +116,9 @@ def act_quant(
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
+    if x.is_cuda and torch.cuda.get_device_capability(x.device) == (7, 0):
+        return _act_quant_sm70(x, block_size, scale_fmt)
+
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert x.size(-1) % block_size == 0, (
         f"Last dimension size must be divisible by block_size (block_size={block_size})"

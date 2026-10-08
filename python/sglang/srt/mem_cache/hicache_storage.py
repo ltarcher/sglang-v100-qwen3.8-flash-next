@@ -44,17 +44,10 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
+    # Page hashes preceding the call's keys, from the sequence start;
+    # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
-
-
-@dataclass(frozen=True)
-class PrefetchTimeoutConfig:
-    """Knobs for the linear prefetch-timeout policy used by HiCache."""
-
-    base: float = 2.0  # seconds, fixed overhead unrelated to token count
-    per_ki_token: float = 0.1  # seconds per 1024 tokens
-    max: float = 30.0  # seconds, upper bound for the linear timeout
 
 
 class PoolName(str, Enum):
@@ -122,6 +115,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Full IDs backing a dependent device allocation: resident tensors or
+    # slices of the full rows allocated by this load, in transfer order.
+    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
 
 
 @dataclass(frozen=True)
@@ -454,6 +450,7 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
+        self._mismatched_pages_removed = 0
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -462,13 +459,6 @@ class HiCacheFile(HiCacheStorage):
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
-
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -494,9 +484,16 @@ class HiCacheFile(HiCacheStorage):
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
-                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+                stored = os.fstat(f.fileno()).st_size
+                if stored == expected:
+                    buf = memoryview(
+                        target_location.view(torch.uint8).contiguous().numpy()
+                    )
+                    if f.readinto(buf) != expected:
+                        raise IOError(f"Short read for {suffixed}")
+            if stored != expected:
+                self._remove_mismatched_page(suffixed, tensor_path, stored, expected)
+                return None
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
@@ -506,6 +503,32 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove(suffixed)
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
             return None
+        except OSError as e:
+            # A raise here would end the prefetch IO thread; a miss is recomputed.
+            logger.warning(f"Failed to read {key} from HiCacheFile storage: {e}")
+            return None
+
+    def _remove_mismatched_page(
+        self, suffixed: str, tensor_path: str, stored: int, expected: int
+    ) -> None:
+        # The file has the size of another build's page layout, so its bytes cannot
+        # be this page. set() never overwrites an existing key, so remove it.
+        try:
+            os.remove(tensor_path)
+        except FileNotFoundError:
+            pass
+        self._evictor.forget(suffixed)
+        if self.metadata_cache is not None:
+            self.metadata_cache.remove(suffixed)
+        self._mismatched_pages_removed += 1
+        removed = self._mismatched_pages_removed
+        # Logs the 1st, 2nd, 4th, 8th, ... removal.
+        if removed & (removed - 1) == 0:
+            logger.warning(
+                f"HiCacheFile: removed {removed} stored page(s) whose size does not "
+                f"match this build's page layout (latest {suffixed}.bin: {stored} "
+                f"bytes, expected {expected}). They are recomputed and stored again."
+            )
 
     def batch_get(
         self,

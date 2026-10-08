@@ -6,12 +6,7 @@ from itertools import pairwise
 
 import pytest
 import torch
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
-    MiniMaxH3DiTArchConfig,
-)
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    backend_name_to_enum,
-)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -25,8 +20,8 @@ def _has_tilelang_v100() -> bool:
 
 def test_tilelang_v100_backend_is_selectable_for_h3():
     backend = AttentionBackendEnum.TILELANG_FA_V100
-    assert backend_name_to_enum("TILELANG_FA_V100") is backend
-    assert backend in MiniMaxH3DiTArchConfig()._supported_attention_backends
+    assert AttentionBackendEnum[backend.name] is backend
+    assert backend in MiniMaxH3DiTModel._supported_attention_backends
 
 
 @pytest.mark.skipif(

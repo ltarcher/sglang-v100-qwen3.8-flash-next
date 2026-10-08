@@ -38,7 +38,7 @@ def test_native_hc_mix_matches_fp32_reference(seed, rows):
 
 
 def test_hc_unaligned_input_uses_triton_fallback(monkeypatch):
-    from sglang.srt.layers.hc_mix_triton import sm70_hc_down_gemv_silu
+    from sglang.kernels.ops.gemm.hc_mix import sm70_hc_down_gemv_silu
 
     x = torch.randn(10241, device="cuda", dtype=torch.float16)[1:].view(1, 10240)
     weight = torch.randn(320, 10240, device="cuda", dtype=torch.float16) * 0.01

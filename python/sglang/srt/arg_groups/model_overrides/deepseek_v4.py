@@ -4,7 +4,7 @@ Architectures: DeepseekV4ForCausalLM, DeepseekV41ForCausalLM.
 HF remaps DeepseekV41ForCausalLM → DeepseekV4ForCausalLM; both names are
 registered so overrides apply before or after that remap.
 
-SM70 (V100) declarations (WO-2): moe_runner_backend=marlin, dtype float16,
+SM70 (V100) declarations: moe_runner_backend=marlin, dtype float16,
 refuse BF16, keep page_size=256 (CSA2 pool / dsv4 backend hardcode). Engram
 host-table residency is the SM70-conditional env default in environ.py, not
 a ServerArgs field.

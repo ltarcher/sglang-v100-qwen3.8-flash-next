@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// WO-13 D6: SM70 decode GEMV for DeepSeek-V4.1-Flash MXFP4 MoE (M<=4).
+// SM70 decode GEMV for DeepSeek-V4.1-Flash MXFP4 MoE (M<=4).
 // Reads marlin_v100 packed weights [E, K/16, N*2] + logical UE8M0 [E, K/32, N].
 // Do not reuse sm70_nvfp4_moe_decode (NVFP4 E4M3 g16 + FP32 global_scale).
 #include <sgl_kernel/tensor.h>

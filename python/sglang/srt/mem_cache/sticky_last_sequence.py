@@ -28,12 +28,14 @@ import torch
 
 from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
     BOUNDARY_KEEP,
+    csa2_image_len,
     evict_recent,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -91,6 +93,44 @@ def _longest_cut(
     return best
 
 
+def _cuts_still_on(
+    cuts: Sequence[int],
+    ids: Sequence[int],
+    previous: Optional[tuple[int, ...]],
+    limit: int,
+) -> list[int]:
+    """Cuts that are stops of ``ids``.
+
+    A cut past ``len(previous)`` was stashed by the request now pinning, on
+    top of the image ``previous`` described, so it needs no comparison.
+    """
+    return [
+        length
+        for length in cuts
+        if 0 < length <= limit
+        and (
+            previous is None
+            or length > len(previous)
+            or tuple(ids[:length]) == previous[:length]
+        )
+    ]
+
+
+def _imaged_len(origin_len: int, length: int) -> int:
+    """How many of the finished tokens the CSA2 image holds.
+
+    The last token gets its image only from a forward that reads it. The
+    overlap loop runs one more verify step after the stop and writes it;
+    without that loop the image ends one token short. Pinning that token
+    would make the next turn resume past the image, so the pin stops at the
+    image and the next turn reads the token again.
+    """
+    image = csa2_image_len()
+    if image is None or not origin_len <= image < length:
+        return length
+    return image
+
+
 def _is_exact_continuation(new_ids: Sequence[int], last_ids: tuple[int, ...]) -> bool:
     n = len(last_ids)
     if n == 0 or len(new_ids) < n:
@@ -142,11 +182,15 @@ class StickyLastSequenceCache(BasePrefixCache):
     def disable(self, value):
         self.inner.disable = value
 
-    def is_chunk_cache(self) -> bool:
-        return True
+    def supports_prefix_sharing(self) -> bool:
+        return self.inner.supports_prefix_sharing()
 
-    def supports_streaming_session(self) -> bool:
-        return False
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        """The pin, so pool accounting counts its row as held while idle and
+        a request running on it as not owning that row."""
+        if self._slot is None or not self._slot.kv.holds_kv:
+            return {}
+        return {"sticky-last-seq": self._slot.kv}
 
     def reset(self) -> None:
         self._drop_slot("reset")
@@ -200,8 +244,12 @@ class StickyLastSequenceCache(BasePrefixCache):
         slot = self._slot
         slot.restore_to_req(req)
         self._free_tail(req.kv, prefix_len)
-        if prefix_len < len(self._last_ids):
+        pinned_len = len(self._last_ids)
+        if prefix_len < pinned_len:
+            # The tail past the cut is freed here and dropped by the worker
+            # restore, so the pin now describes only the shared prefix.
             self._cuts = [c for c in self._cuts if c <= prefix_len]
+            self._last_ids = self._last_ids[:prefix_len]
 
         device_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefix_len
@@ -211,7 +259,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         logger.info(
             "sticky last-seq event=%s pinned=%d new=%d prefix=%d extend=%d cuts=%s",
             event,
-            len(self._last_ids),
+            pinned_len,
             len(new_ids),
             prefix_len,
             max(0, len(new_ids) - prefix_len),
@@ -225,29 +273,43 @@ class StickyLastSequenceCache(BasePrefixCache):
             cache_protected_len=0,
         )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def claim_kv_row(self, req: Req) -> bool:
+        """Keep this request's kv row for the next turn.
+
+        ``release_kv_cache`` frees the row unless this returns True after the
+        record has been detached onto the pin.
+        """
         if is_health_check_generate_req(req):
-            self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
-            return
+            return False
         if isinstance(req.finished_reason, FINISH_ABORT):
             # A chunked prefill that already snapshotted a prefix must stay
-            # pinned. ``release_kv_cache`` frees the row unless we detach it
-            # here, and the inner cache would free the same pages.
+            # pinned. Otherwise the request frees the row: forget a pin it
+            # was running on, or drop one it was not.
             if self._pin_aborted_prefix(req):
-                return
+                return True
             if self._slot is not None and req.kv is self._slot.kv:
                 self._clear_pin()
             else:
                 self._drop_slot("abort")
-            self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
-            return
+            return False
+        self._pin_finished(req)
+        return True
 
+    def _pin_finished(self, req: Req) -> None:
         ids = _finished_token_ids(req)
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
         self._trim_overshoot(req, finished_len)
         ids = list(req.origin_input_ids) + list(req.output_ids[:finished_len])
+        imaged = _imaged_len(len(req.origin_input_ids), len(ids))
+        if imaged < len(ids):
+            logger.info(
+                "sticky last-seq pin stops at the CSA2 image: %d of %d tokens",
+                imaged,
+                len(ids),
+            )
+            ids = ids[:imaged]
 
         is_first = self._slot is None
         if is_first:
@@ -263,20 +325,19 @@ class StickyLastSequenceCache(BasePrefixCache):
             "sticky last-seq pin %d tokens cuts=%s", len(self._last_ids), self._cuts
         )
 
-    def cache_unfinished_req(self, req: Req, **kwargs):
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs):
         ids = list(req.origin_input_ids) + list(req.output_ids)
-        if ids:
+        if ids and not req.finished():
             # Prefill appends the sampled token before this runs. That token
-            # is not in the CSA2 image yet; the snap is extend_range.end.
-            extend_range = getattr(req, "extend_range", None)
-            stop = int(extend_range.end) if extend_range is not None else None
-            self._note_cut(ids, stop=stop)
+            # is not in the CSA2 image yet; the snap is ``up_to``, which
+            # checkpoint_kv_cache passes as extend_range.end.
+            self._note_cut(ids, stop=up_to)
             logger.info(
                 "sticky last-seq stop %d tokens cuts=%s",
                 self._cuts[-1] if self._cuts else 0,
                 self._cuts,
             )
-        self.inner.cache_unfinished_req(req, **kwargs)
+        self.inner.checkpoint(req, up_to=up_to, **kwargs)
 
     def insert(self, *args, **kwargs):
         return self.inner.insert(*args, **kwargs)
@@ -298,36 +359,6 @@ class StickyLastSequenceCache(BasePrefixCache):
         if isinstance(node, _VirtualNode):
             return DecLockRefResult()
         return self.inner.dec_lock_ref(node, params)
-
-    def _pin_idle(self, active_pool_idxs: Optional[set]) -> bool:
-        slot = self._slot
-        if slot is None or not slot.kv.holds_kv:
-            return False
-        if active_pool_idxs is not None and slot.kv.req_pool_idx in active_pool_idxs:
-            return False
-        return True
-
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        # ChunkCache has no tree-protected prefix; the whole pin is uncached.
-        if not self._pin_idle(active_pool_idxs):
-            return 0
-        return ceil_align(self._slot.kv.kv_allocated_len, self.page_size)
-
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return self.session_held_tokens(active_pool_idxs)
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        if not self._pin_idle(active_pool_idxs):
-            return 0
-        allocated = ceil_align(self._slot.kv.kv_allocated_len, self.page_size)
-        return allocated - self._slot.kv.swa_evicted_seqlen
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        # Counted as allocatable in Scheduler.get_num_allocatable_reqs.
-        return int(self._pin_idle(active_pool_idxs))
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
 
     def protected_size(self):
         return self.inner.protected_size()
@@ -357,16 +388,18 @@ class StickyLastSequenceCache(BasePrefixCache):
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
 
-    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
-        return self.inner.pop_prefetch_loaded_span(req_id)
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
+        return self.inner.pop_prefetch_loaded_span(handle)
 
     def finish_storage_prefetch_admission(
-        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+        self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
-        self.inner.finish_storage_prefetch_admission(req_id, fulfilled_tokens, reason)
+        self.inner.finish_storage_prefetch_admission(handle, fulfilled_tokens, reason)
 
-    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
-        self.inner.discard_storage_prefetch_accounting(req_id)
+    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
+        self.inner.discard_storage_prefetch_accounting(handle)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
@@ -466,7 +499,8 @@ class StickyLastSequenceCache(BasePrefixCache):
         request_load(saved_key)
         self._slot.restore_to_req(req)
         self._free_tail(req.kv, prefix_len)
-        self._last_ids = tuple(int(token) for token in meta.get("ids") or [])
+        saved_ids = tuple(int(token) for token in meta.get("ids") or [])
+        self._last_ids = saved_ids[:prefix_len]
         self._cuts = [
             int(cut) for cut in meta.get("cuts") or [] if 0 < int(cut) <= prefix_len
         ]
@@ -477,7 +511,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         ].to(dtype=torch.int64)
         logger.info(
             "sticky last-seq event=session pinned=%d new=%d prefix=%d extend=%d cuts=%s",
-            len(self._last_ids),
+            len(saved_ids),
             len(params.key.raw_token_ids()),
             prefix_len,
             max(0, len(params.key.raw_token_ids()) - prefix_len),
@@ -541,7 +575,6 @@ class StickyLastSequenceCache(BasePrefixCache):
             req_pool_idx=idx,
             kv_committed_len=prefix_len,
             kv_allocated_len=prefix_len,
-            swa_evicted_seqlen=0,
             cache_protected_len=0,
         )
         return True
@@ -577,12 +610,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         self._last_ids = prefix
         self._last_extra_key = getattr(req, "extra_key", None)
         self._last_cache_salt = getattr(req, "cache_salt", None) or None
-        self._cuts = [
-            length
-            for length in self._cuts
-            if 0 < length <= pin_len
-            and (previous is None or tuple(ids[:length]) == previous[:length])
-        ]
+        self._cuts = _cuts_still_on(self._cuts, ids, previous, pin_len)
         if pin_len not in self._cuts:
             self._cuts.append(pin_len)
         self._cuts = evict_recent(self._cuts, BOUNDARY_KEEP)
@@ -620,13 +648,7 @@ class StickyLastSequenceCache(BasePrefixCache):
         self.req_to_token_pool.free(slot)
 
     def _note_cut(self, ids: Sequence[int], stop: Optional[int] = None) -> None:
-        previous = self._last_ids
-        if previous is not None:
-            self._cuts = [
-                length
-                for length in self._cuts
-                if length <= len(ids) and tuple(ids[:length]) == previous[:length]
-            ]
+        self._cuts = _cuts_still_on(self._cuts, ids, self._last_ids, len(ids))
         length = len(ids) if stop is None else int(stop)
         if length <= 0 or length > len(ids):
             return
@@ -647,16 +669,16 @@ class StickyLastSequenceCache(BasePrefixCache):
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
         kv.kv_allocated_len = prefix_len
         kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
-        kv.swa_evicted_seqlen = min(kv.swa_evicted_seqlen, prefix_len)
+        kv.clamp_evicted_seqlens(prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         target = len(req.origin_input_ids) + finished_len
-        if self.page_size > 1 and req.kv.swa_evicted_seqlen > target:
+        if self.page_size > 1 and req.kv.max_evicted_seqlen > target:
             target = (target // self.page_size) * self.page_size
         self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
-        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
+        req.kv.clamp_evicted_seqlens(target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:

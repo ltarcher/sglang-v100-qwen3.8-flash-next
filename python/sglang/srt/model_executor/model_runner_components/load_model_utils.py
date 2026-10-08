@@ -100,6 +100,23 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
     model_config.dtype = torch.float16
 
 
+def cast_bf16_parameters_for_sm70(model) -> None:
+    """BF16 matmul is not implemented on Volta. Checkpoint tensors that stay
+    BF16 (the indexer compress gate is allocated that way) have to follow the
+    FP16 activation dtype after they are loaded."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] >= 8:
+        return
+    if not envs.SGLANG_SM70_FORCE_FP16.get():
+        return
+    converted = 0
+    for param in model.parameters():
+        if param.dtype == torch.bfloat16:
+            param.data = param.data.to(torch.float16)
+            converted += 1
+    if converted:
+        logger.info("SM70: cast %d BF16 parameters to FP16", converted)
+
+
 def maybe_trigger_remote_instance_nccl_send_group(
     *, tp_rank: int, load_format: str | None = None
 ) -> None:
@@ -354,6 +371,7 @@ def load_model_with_memory_saver(
                 model_config=model_config,
                 device_config=device_config,
             )
+            cast_bf16_parameters_for_sm70(model)
         if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info

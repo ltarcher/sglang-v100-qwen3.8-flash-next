@@ -15,6 +15,9 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.openai.chat_encoding import (  # noqa: E402
+    spec_supports_inline_system,
+)
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -37,6 +40,12 @@ class _FakeOpenAIServingChat:
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
+        # Mirrors OpenAIServingChat._resolve_inline_system_support.
+        self.supports_inline_system = (
+            spec_supports_inline_system(chat_encoding_spec)
+            if chat_encoding_spec is not None
+            else detect_inline_system_support(chat_template)
+        )
 
     def supports_native_reasoning_history(self):
         return self.native_reasoning_history
@@ -57,6 +66,8 @@ class _FakeOpenAIServingChat:
 
 class _FakeNonStreamingErrorOpenAI:
     """Returns a configurable error response from the OpenAI handler."""
+
+    supports_inline_system = False
 
     def __init__(self, status_code=400, body=None, content=None):
         self._status_code = status_code
@@ -198,6 +209,23 @@ class TestAnthropicServing(unittest.TestCase):
         if tools is not None:
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
+
+    def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
+        """PD routers inject bootstrap fields into /v1/messages bodies; dropping
+        them in the Chat Completions conversion strands the decode request."""
+        request = self._anthropic_request(
+            bootstrap_host="prefill.internal",
+            bootstrap_port=8998,
+            bootstrap_room=2**62 + 17,
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+        )
+        converted = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(converted.bootstrap_host, "prefill.internal")
+        self.assertEqual(converted.bootstrap_port, 8998)
+        self.assertEqual(converted.bootstrap_room, 2**62 + 17)
+        self.assertEqual(converted.routed_dp_rank, 3)
+        self.assertEqual(converted.disagg_prefill_dp_rank, 2)
 
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
@@ -890,7 +918,7 @@ class TestAnthropicServing(unittest.TestCase):
             ("low", "low"),
             ("medium", "medium"),
             ("high", "high"),
-            ("xhigh", "max"),  # OpenAI Literal has no xhigh
+            ("xhigh", "xhigh"),  # forwarded unchanged, see serving.py
             ("max", "max"),
         ]:
             with self.subTest(anthropic_effort=anthropic_effort):
@@ -1479,11 +1507,11 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
 
     def test_dsv41_keeps_midconversation_system_inline_without_chat_template(self):
-        """V4.1 ships without an HF chat template, so the inline-system probe
-        says merge. Claude Code appends a harness reminder as a later system
-        turn; folding that into the leading block changes the token prefix
-        and the sticky cache misses. The V4.1 encoder renders the turn in
-        place, so the adapter must leave it there."""
+        """V4.1 ships without an HF chat template, so the template probe
+        would say merge. Claude Code appends a harness reminder as a later
+        system turn; folding that into the leading block changes the token
+        prefix and the sticky cache misses. The V4.1 encoder renders the turn
+        in place (spec_supports_inline_system), so the adapter leaves it."""
         serving = self._serving(chat_encoding_spec="dsv41")
         self.assertFalse(serving._merge_inline_system)
         request = self._anthropic_request(
@@ -1505,6 +1533,28 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertIn("system-reminder", chat_request.messages[2].content)
+
+    def test_inline_system_support_comes_from_the_prompt_renderer(self):
+        """Native encoders have no Jinja template to probe, so Messages must use
+        the serving chat's renderer decision instead of hoisting inline system."""
+        chat = _FakeOpenAIServingChat(chat_template=None)
+        chat.supports_inline_system = True
+        serving = AnthropicServing(chat)
+        request = self._anthropic_request(
+            stream=False,
+            system="Stable instructions",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "New instruction"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        converted = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in converted.messages],
+            ["system", "user", "system", "user"],
+        )
+        self.assertEqual(converted.messages[0].content, "Stable instructions")
 
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages

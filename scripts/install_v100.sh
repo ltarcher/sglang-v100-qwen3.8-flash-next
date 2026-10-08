@@ -41,8 +41,19 @@ fi
 log "Installing host compiler and CUDA 12.8 prerequisites"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" apt-get install -y \
-  build-essential ca-certificates cmake curl git g++-12 ninja-build \
-  pkg-config wget
+  build-essential ca-certificates cmake curl git g++-12 g++-14 libnuma-dev \
+  ninja-build pkg-config wget
+
+# SGLang's Rust extensions use edition 2024 (rustc 1.85+); distro cargo is often
+# older, so fall back to a user-local rustup toolchain.
+[[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
+rust_minor="$(rustc --version 2>/dev/null | sed -n 's/^rustc 1\.\([0-9]*\).*/\1/p')"
+if [[ -z "$rust_minor" ]] || (( rust_minor < 85 )); then
+  log "Installing a Rust toolchain with rustup"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal
+  . "$HOME/.cargo/env"
+fi
 
 if [[ ! -x /usr/local/cuda-12.8/bin/nvcc ]]; then
   # shellcheck disable=SC1091
@@ -93,15 +104,14 @@ export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$MAX_JOBS}"
 export NVCC_THREADS="${NVCC_THREADS:-1}"
 log "Build parallelism: MAX_JOBS=$MAX_JOBS (CPU=$CPU_JOBS, RAM-safe=$SAFE_JOBS), NVCC_THREADS=$NVCC_THREADS"
 
-python -m pip install --upgrade pip setuptools wheel scikit-build-core ninja psutil
-python -m pip install \
-  torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-  --index-url https://download.pytorch.org/whl/cu128
-python -m pip install \
-  grpcio==1.81.1 grpcio-health-checking==1.81.1 \
-  grpcio-reflection==1.81.1 protobuf==6.33.6 tilelang==0.1.8 \
-  cuda-tile==1.5.0
-python -m pip install -e "$REPO_ROOT/python[diffusion-v100]"
+# The validated V100 set, without resolution: upstream's pyproject pins target
+# CUDA 13 and cannot resolve against torch 2.9.1 / cu128.
+python -m pip install --upgrade pip
+python -m pip install --no-deps -r "$REPO_ROOT/requirements.txt"
+# The Rust radix tree needs torch >= 2.11 and is optional (the Python tree is
+# the default backend).
+SGLANG_BUILD_RUST_EXTS=grpc,multimodal,server \
+  python -m pip install --no-deps --no-build-isolation -e "$REPO_ROOT/python"
 
 prepare_patched_repo() {
   local name=$1 url=$2 rev=$3 destination=$4

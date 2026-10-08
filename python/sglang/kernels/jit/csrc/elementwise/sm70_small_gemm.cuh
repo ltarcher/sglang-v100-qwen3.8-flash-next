@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Reuse each vectorized weight load across two or four verification rows.
+// Reuse each vectorized weight load across two to four verification rows.
+// With the same lanes per output, every row is bitwise the one-row
+// sm70_dense_gemv result: same per-lane order, same shuffle reduction.
 #include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/utils.cuh>
@@ -40,7 +42,7 @@ __global__ void kernel(const half* __restrict__ x, const half* __restrict__ w, h
 }
 template <int M, int NT, int L>
 void run(tvm::ffi::TensorView x, tvm::ffi::TensorView w, tvm::ffi::TensorView o) {
-  static_assert(M == 2 || M == 4);
+  static_assert(M >= 2 && M <= 4);
   using namespace host;
   auto dev = SymbolicDevice{};
   dev.set_options<kDLCUDA>();

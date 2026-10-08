@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// WO-13 D4-H: in-graph spill_request / spill_join against the host mailbox.
+// In-graph spill_request / spill_join against the host mailbox.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 

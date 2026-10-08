@@ -103,6 +103,18 @@ def get_allocator_from_storage(allocator_type):
             return HostTensorAllocator()
     elif allocator_type == "shm":
         return ShmHostTensorAllocator()
+    elif allocator_type == "tensorcast":
+        try:
+            from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
+                get_tensorcast_host_allocator_from_runtime,
+            )
+
+            return get_tensorcast_host_allocator_from_runtime()
+        except ImportError:
+            logger.warning(
+                "TensorCast's tensor allocator requires tensorcast >= 0.1.1. Please install TensorCast by 'pip install tensorcast' or build from source by following https://tensorcast.ai/development/build-from-source/. Fallback to use default allocator"
+            )
+            return HostTensorAllocator()
     else:
         return HostTensorAllocator()
 
@@ -126,12 +138,23 @@ def get_allocator_type() -> str:
 
 
 def _cuda_host_register(
-    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+    buffer: torch.Tensor,
+    registration_granularity_bytes: int | None = None,
+    *,
+    flags: int = 0,
+    nbytes: int | None = None,
 ) -> None:
     # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
+    if nbytes is not None:
+        if nbytes < total:
+            raise ValueError(
+                f"cudaHostRegister nbytes={nbytes} is smaller than the tensor "
+                f"({total})"
+            )
+        total = nbytes
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
@@ -160,7 +183,7 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            rc = int(cudart.cudaHostRegister(ptr, size, flags))
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
@@ -215,8 +238,13 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     if not registered_ranges:
         return
 
+    # Clear in place before unregistering. A hugepage tensor's free-time
+    # finalizer shares this list and must not unregister a second time.
+    snapshot = list(registered_ranges)
+    if isinstance(registered_ranges, list):
+        registered_ranges.clear()
     remaining_ranges = _cuda_host_unregister_ranges(
-        cudart, registered_ranges, operation="host-pool destroy"
+        cudart, snapshot, operation="host-pool destroy"
     )
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
 
@@ -233,6 +261,22 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
+    if pin_memory and type(allocator) is HostTensorAllocator:
+        # Local import: host_hugepage registers through this module.
+        from sglang.srt.mem_cache.host_hugepage import (
+            qwen_host_hugepage_preferred,
+            try_alloc_pinned_1g_hugepage,
+        )
+
+        if qwen_host_hugepage_preferred():
+            huge = try_alloc_pinned_1g_hugepage(
+                dims,
+                dtype,
+                purpose="HiCache host pool",
+                registration_granularity_bytes=registration_granularity_bytes,
+            )
+            if huge is not None:
+                return huge
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
@@ -315,5 +359,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "xpu": alloc_with_pin_memory,
     },
 )

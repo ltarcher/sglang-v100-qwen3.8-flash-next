@@ -1,6 +1,7 @@
 """NUMA placement for DSV4.1 Engram host tables and expert-spill pins.
 
-Bind mappings to ``SGLANG_DSV41_ENGRAM_NUMA_NODE`` (the GPU-local node).
+Bind mappings to the GPU-local node (``gpu_numa_node``, or
+``SGLANG_DSV41_ENGRAM_NUMA_NODE`` when set).
 Engram host tables may consume the boot-reserved 1 GiB hugetlb pool.
 Routed-expert spill must not take those pages: anonymous + THP on the
 preferred node. Fail loud rather than let Linux silently place pages
@@ -13,12 +14,22 @@ the V100 budget unit tests and dry-run, not runtime defaults.
 from __future__ import annotations
 
 import ctypes
+import functools
 import logging
 import mmap
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
+
+import numpy as np
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    _MADV_POPULATE_WRITE,
+    _has_madv_populate_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +68,33 @@ def memfd_create(name: str, flags: int) -> int:
         raise OSError(err, os.strerror(err), "memfd_create")
     return fd
 
-# Fallback when the env is unset. Launch scripts should set
-# SGLANG_DSV41_ENGRAM_NUMA_NODE to the GPU-local node.
-DEFAULT_GPU_NUMA_NODE = 1
+# GPU-local node of the measured 8x V100 box; default for the offline dry-run
+# planner only. Runtime placement uses gpu_numa_node().
+DOCUMENTED_GPU_NUMA_NODE = 1
+
+
+@functools.cache
+def gpu_numa_node() -> int:
+    """NUMA node of CUDA device 0 per sysfs, 0 when the host reports none.
+
+    Every TP rank sees the same visible-device list, so all ranks agree.
+    """
+    props = torch.cuda.get_device_properties(0)
+    bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            node = int(f.read().strip())
+    except (OSError, ValueError):
+        logger.warning("DSV4.1 host placement: no NUMA node for GPU %s; using node 0", bdf)
+        return 0
+    # Single-node hosts report -1.
+    return max(node, 0)
+
+
+def engram_numa_node() -> int:
+    """SGLANG_DSV41_ENGRAM_NUMA_NODE when set, else the GPU-local node. <0 disables binding."""
+    node = envs.SGLANG_DSV41_ENGRAM_NUMA_NODE.get()
+    return gpu_numa_node() if node is None else int(node)
 
 # Fixtures for test/registered/unit/mem_cache/test_dsv41_v100_budget.py.
 PRE_H1_NODE_TOTAL_GIB = {0: 177.0, 1: 173.0}
@@ -101,7 +136,7 @@ class HostPlacementPlan:
     mappings: list[HostMapping] = field(default_factory=list)
     huge_pages_total: int = 0
     huge_page_kB: int = 2048
-    preferred_node: int = DEFAULT_GPU_NUMA_NODE
+    preferred_node: int = DOCUMENTED_GPU_NUMA_NODE
     allow_split: bool = False
     warnings: list[str] = field(default_factory=list)
 
@@ -183,7 +218,7 @@ def plan_engram_host_tables(
     table_nbytes: Iterable[tuple[int, int]],
     layout: str,
     tp_size: int,
-    preferred_node: int = DEFAULT_GPU_NUMA_NODE,
+    preferred_node: int = DOCUMENTED_GPU_NUMA_NODE,
     allow_split: bool = False,
     extra_per_rank_bytes: int = 0,
     nodes: Optional[dict[int, NumaNodeMem]] = None,
@@ -356,8 +391,15 @@ def node_for_mapping(plan: HostPlacementPlan, *, layer_id: int, rank: int) -> in
     )
 
 
-def bind_buffer_to_numa_node(ptr: int, nbytes: int, node: int) -> None:
-    """mbind(MPOL_BIND|STRICT|MOVE) the mapping. Fails loud; does not leave pages migrating."""
+def bind_buffer_to_numa_node(
+    ptr: int, nbytes: int, node: int, *, move_existing: bool = True
+) -> None:
+    """mbind(MPOL_BIND) the mapping to ``node``. Fails loud.
+
+    ``move_existing`` adds STRICT|MOVE for ranges that already hold pages; the
+    call then fails with EIO when any page cannot be moved. Bind a range before
+    its first touch and pass False.
+    """
     if nbytes <= 0:
         return
     page = mmap.PAGESIZE
@@ -376,14 +418,30 @@ def bind_buffer_to_numa_node(ptr: int, nbytes: int, node: int) -> None:
         ctypes.c_int(_MPOL_BIND),
         ctypes.byref(nodemask),
         maxnode,
-        ctypes.c_uint(_MPOL_MF_STRICT | _MPOL_MF_MOVE),
+        ctypes.c_uint((_MPOL_MF_STRICT | _MPOL_MF_MOVE) if move_existing else 0),
     )
     if rc != 0:
         err = ctypes.get_errno()
         raise EngramNumaError(
-            f"mbind(MPOL_BIND, node={node}, {nbytes} bytes) failed errno={err}. "
-            f"Refusing to let the kernel place Engram pages across UPI."
+            f"mbind(MPOL_BIND, node={node}, {nbytes} bytes) failed: "
+            f"errno={err} ({os.strerror(err)})"
         )
+
+
+def node_available_bytes(node: int) -> int:
+    """MemFree plus file-backed LRU pages of ``node``: what an allocation bound
+    there can get without swapping. 0 when the node is unknown."""
+    keys = ("MemFree:", "Active(file):", "Inactive(file):")
+    total = 0
+    try:
+        with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] in keys:
+                    total += int(parts[3]) * 1024
+    except OSError:
+        return 0
+    return total
 
 
 def read_node_hugepages(node: int, pagesize_kb: int = 1048576) -> tuple[int, int]:
@@ -587,22 +645,46 @@ def mmap_numa_thp(
     node: int,
     populate: bool = True,
 ) -> mmap.mmap:
-    """Anonymous node-local mapping. Uses THP (2 MiB), never the 1G hugetlb pool."""
+    """Anonymous node-local mapping. Uses THP (2 MiB), never the 1G hugetlb pool.
+
+    The range is bound to ``node`` before its first touch, so its pages are
+    allocated there and never migrated. A failed bind or populate raises
+    ``EngramNumaError`` and unmaps the range, so the caller can try another node.
+    """
     if nbytes <= 0:
         raise ValueError("mmap_numa_thp nbytes must be > 0")
     page = mmap.PAGESIZE
     map_bytes = ((nbytes + page - 1) // page) * page
-    flags = mmap.MAP_PRIVATE | MAP_ANONYMOUS
-    if populate:
-        flags |= MAP_POPULATE
-    with numa_alloc_scope(node):
-        mm = mmap.mmap(
-            -1, map_bytes, flags=flags, prot=mmap.PROT_READ | mmap.PROT_WRITE
-        )
-    ptr = ctypes.addressof((ctypes.c_char * 1).from_buffer(mm))
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
-    libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(map_bytes), MADV_HUGEPAGE)
-    bind_buffer_to_numa_node(ptr, map_bytes, node)
+    mm = mmap.mmap(
+        -1,
+        map_bytes,
+        flags=mmap.MAP_PRIVATE | MAP_ANONYMOUS,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    try:
+        ptr = ctypes.addressof((ctypes.c_char * 1).from_buffer(mm))
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(map_bytes), MADV_HUGEPAGE)
+        bind_buffer_to_numa_node(ptr, map_bytes, node, move_existing=False)
+        if populate:
+            # The range already has its policy; the scope makes the node's own CPUs zero it.
+            with numa_alloc_scope(node):
+                _populate_bound_mapping(mm, node=node)
+    except BaseException:
+        mm.close()
+        raise
     return mm
 
+
+def _populate_bound_mapping(mm: mmap.mmap, *, node: int) -> None:
+    if not _has_madv_populate_write():
+        # Kernels before 5.14: touching the pages cannot report a full node.
+        np.frombuffer(mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+        return
+    try:
+        mm.madvise(_MADV_POPULATE_WRITE)
+    except OSError as e:
+        raise EngramNumaError(
+            f"populating {len(mm)} bytes on NUMA node {node} failed: {e}"
+        ) from e

@@ -1,0 +1,95 @@
+{
+  "requests": 4,
+  "images_per_request": 3,
+  "filler_repeats": 500,
+  "elapsed_s": 114.96,
+  "peak_gpu_memory": [
+    {
+      "gpu": 0,
+      "peak_used_mib": 31162,
+      "minimum_free_mib": 1333
+    },
+    {
+      "gpu": 1,
+      "peak_used_mib": 30330,
+      "minimum_free_mib": 2165
+    },
+    {
+      "gpu": 2,
+      "peak_used_mib": 30298,
+      "minimum_free_mib": 2197
+    },
+    {
+      "gpu": 3,
+      "peak_used_mib": 30234,
+      "minimum_free_mib": 2261
+    }
+  ],
+  "results": [
+    {
+      "request": 0,
+      "status": 200,
+      "elapsed_s": 86.53,
+      "answer": "Red",
+      "expected_color": "red",
+      "usage": {
+        "prompt_tokens": 7644,
+        "total_tokens": 7646,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+      },
+      "finish_reason": "stop",
+      "passed": true
+    },
+    {
+      "request": 1,
+      "status": 200,
+      "elapsed_s": 114.71,
+      "answer": " Blue",
+      "expected_color": "blue",
+      "usage": {
+        "prompt_tokens": 7644,
+        "total_tokens": 7646,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+      },
+      "finish_reason": "stop",
+      "passed": true
+    },
+    {
+      "request": 2,
+      "status": 200,
+      "elapsed_s": 86.64,
+      "answer": " Green",
+      "expected_color": "green",
+      "usage": {
+        "prompt_tokens": 7644,
+        "total_tokens": 7646,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+      },
+      "finish_reason": "stop",
+      "passed": true
+    },
+    {
+      "request": 3,
+      "status": 200,
+      "elapsed_s": 86.52,
+      "answer": " Yellow",
+      "expected_color": "yellow",
+      "usage": {
+        "prompt_tokens": 7644,
+        "total_tokens": 7646,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+      },
+      "finish_reason": "stop",
+      "passed": true
+    }
+  ],
+  "passed": true
+}

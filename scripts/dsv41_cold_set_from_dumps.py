@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""WO-13 D2: build the per-(layer, ep-rank) cold-expert table from
+"""Build the per-(layer, ep-rank) cold-expert table from
 expert-distribution recorder dumps (``--expert-distribution-recorder-mode stat``).
 
 Output: ``{"cold_ids": int64 [layers, ep, S]}`` with *local* routed expert ids
-in coldness order (coldest first). The server takes the first ``n_spilled``
-per (layer, rank) via ``SGLANG_DSV41_EXPERT_SPILL_COLD_SET=<out.pt>``.
+in coldness order (coldest first), as JSON when ``--out`` ends in ``.json``
+(the form shipped in the repo), else as a torch file. The server takes the first
+``n_spilled`` per (layer, rank) via ``SGLANG_DSV41_EXPERT_SPILL_COLD_SET=<out>``.
 
 If more than one dump is given, the last one is held out and the table built
 from the rest is scored on it (out-of-sample spilled hits per token), so the
 number printed is what the server will see on traffic like the held-out dump.
 
-    python scripts/dsv41_cold_set_from_dumps.py \
-        /path/expert-dist/expert_distribution_recorder_*.pt \
-        --out /path/dsv41_cold_set.pt --ep 8 --local 48 --spill 14 24
+    python scripts/dsv41_cold_set_from_dumps.py review.pt code.pt agent.pt heldout.pt \
+        --out scripts/dsv41_flash_cold_set_ep8.json --ep 8 --local 48 --spill 18
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import json
+import os
 import sys
 import time
 from typing import List
@@ -88,17 +90,21 @@ def main(argv: List[str] | None = None) -> int:
     if train is not counts:
         # ship the table fitted on everything; the held-out score above is the honest estimate
         order = cold_order(torch.stack(counts).sum(0), args.ep, args.local)
-    torch.save(
-        {
-            "cold_ids": order,
-            "source": files,
-            "routed_hits": tot,
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "ep": args.ep,
-            "local": args.local,
-        },
-        args.out,
-    )
+    meta = {
+        # File names only: a shipped table must not carry local paths.
+        "source": [os.path.basename(f) for f in files],
+        "routed_hits": tot,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "ep": args.ep,
+        "local": args.local,
+    }
+    if args.out.endswith(".json"):
+        # Plain data for the repo copy; one line per layer keeps diffs readable.
+        layers_json = ",\n".join("  " + json.dumps(layer, separators=(",", ":")) for layer in order.tolist())
+        with open(args.out, "w") as f:
+            f.write(json.dumps(meta)[:-1] + ',\n"cold_ids": [\n' + layers_json + "\n]}\n")
+    else:
+        torch.save({"cold_ids": order, **meta}, args.out)
     print(f"wrote {args.out}: cold_ids {tuple(order.shape)} (coldest first)")
     return 0
 

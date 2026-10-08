@@ -1,4 +1,4 @@
-"""Two-step collectives for the 8×V100 hybrid NVLink mesh (WO-12 / WO-13).
+"""Two-step collectives for the 8×V100 hybrid NVLink mesh.
 
 TP8 custom-AR is disabled: the eight cards are not a 1-hop clique. They *are*
 two full NVLink quads {0–3} and {4–7} with four NVLink bridges 0–4, 1–5, 2–6,
@@ -9,12 +9,13 @@ on the 8-rank NCCL communicator.
 Default backend is PyNCCL (CUDA-graph capturable). Custom-AR uses the
 pre-registered IPC staging buffer (never graph-pool pointer IPC —
 ``custom_all_reduce.cuh:614`` on V100). Pair CA is on whenever hier AR is
-on. Quad CA is behind ``SGLANG_DSV41_HIER_AR_CA`` (WO-14: in-graph 1-stage
+on. Quad CA is behind ``SGLANG_DSV41_HIER_AR_CA`` (in-graph 1-stage
 on the NVLink clique; relaunch57 lost that kernel only in eager).
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
 from typing import List, Optional, Sequence, Tuple
 
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 # Decode ARs on this model are 10–200 KiB. 20 MiB prefill chunks stay 8-rank.
 _MAX_HIER_BYTES = 2 * 1024 * 1024
+# Below the quad custom-AR's 512 KiB 1stage limit, so the chain the push kernel
+# replaces is 1stage in both steps; larger tensors keep the chain.
+_PUSH_SLOT_BYTES = 256 * 1024
 _WORLD = 8
 _QUAD = 4
 _PAIR = 2
@@ -81,6 +85,25 @@ def simulate_two_step_a2a(send_by_rank: Sequence[torch.Tensor]) -> List[torch.Te
     return out
 
 
+class _DeviceBuffer:
+    """Exposes a raw cudaMalloc range to torch.as_tensor without copying."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 2,
+        }
+
+
+def _staging_view(ca, device: torch.device) -> torch.Tensor:
+    """uint8 view of this rank's registered custom-AR staging buffer."""
+    return torch.as_tensor(
+        _DeviceBuffer(ca.buffer_ptrs[ca.rank], ca.max_size), device=device
+    )
+
+
 class Dsv41HierAllReduce:
     def __init__(self, ranks: Sequence[int], rank: int, device: torch.device):
         quads, pairs = partition_quads_and_pairs(ranks)
@@ -119,17 +142,62 @@ class Dsv41HierAllReduce:
             self.quad_ca = self._try_ca(self.quad_cpu, device)
             dist.barrier()
 
+        # The quad reduce writes straight into the pair's staging buffer and the
+        # pair reduce straight into the caller's tensor: one copy per AR, not four.
+        self._ca_chain = None
+        if self.quad_ca is not None and self.pair_ca is not None:
+            self._ca_chain = (
+                _staging_view(self.quad_ca, device),
+                _staging_view(self.pair_ca, device),
+            )
+
+        self._push = None
+        if self._ca_chain is not None and envs.SGLANG_DSV41_HIER_AR_PUSH.get():
+            self._push = self._init_push(device)
+
         self._a2a_a = torch.empty(_MAX_HIER_BYTES, dtype=torch.uint8, device=device)
         self._a2a_b = torch.empty(_MAX_HIER_BYTES, dtype=torch.uint8, device=device)
 
         logger.info(
             "DSV4.1 2-step hier: quad_nccl=%s pair_nccl=%s quad_ca=%s pair_ca=%s "
-            "max_bytes=%d",
+            "push=%s max_bytes=%d",
             "on" if self.quad_nccl.available else "off",
             "on" if self.pair_nccl.available else "off",
             "on" if self.quad_ca is not None else "off",
             "on" if self.pair_ca is not None else "off",
+            "on" if self._push is not None else "off",
             _MAX_HIER_BYTES,
+        )
+
+    def _init_push(self, device: torch.device):
+        from sglang.kernels.ops.communication import sm70_hier_push_ar as push
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+            CudaRTLibrary,
+        )
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        lib = CudaRTLibrary()
+        ptrs = []
+        for group, nbytes in (
+            (self.quad_cpu, push.quad_workspace_bytes(_PUSH_SLOT_BYTES)),
+            (self.pair_cpu, push.pair_workspace_bytes(_PUSH_SLOT_BYTES)),
+        ):
+            group_ptrs = CustomAllreduce.create_shared_buffer(nbytes, group=group)
+            own = group_ptrs[dist.get_rank(group=group)]
+            lib.cudaMemset(ctypes.c_void_p(own), push.EMPTY_BYTE, nbytes)
+            ptrs.append(group_ptrs)
+        lib.cudaDeviceSynchronize()
+        # No rank may push before every receive buffer holds the empty marker.
+        dist.barrier()
+        return push.Sm70HierPushAllReduce(
+            ptrs[0],
+            ptrs[1],
+            _PUSH_SLOT_BYTES,
+            dist.get_rank(group=self.quad_cpu),
+            dist.get_rank(group=self.pair_cpu),
+            device,
         )
 
     @staticmethod
@@ -205,9 +273,40 @@ class Dsv41HierAllReduce:
             self.pair_nccl.group_end()
         tensor.add_(tmp)
 
+    def _reduce_ca_chain(self, tensor: torch.Tensor) -> bool:
+        from sglang.srt.distributed.device_communicators import (
+            custom_all_reduce_ops as ops,
+        )
+
+        quad, pair = self.quad_ca, self.pair_ca
+        if quad.disabled or pair.disabled:
+            return False
+        if not (quad.should_custom_ar(tensor) and pair.should_custom_ar(tensor)):
+            return False
+        nbytes = tensor.numel() * tensor.element_size()
+        quad_buf, pair_buf = (
+            buf[:nbytes].view(tensor.dtype).view(tensor.shape)
+            for buf in self._ca_chain
+        )
+        quad_buf.copy_(tensor)
+        # A zero reg_buffer makes the op reduce from `inp` itself; the staging
+        # buffers are registered at init (and recorded for IPC under capture).
+        ops.all_reduce(quad._ptr, quad_buf, pair_buf, 0, 0)
+        ops.all_reduce(pair._ptr, pair_buf, tensor, 0, 0)
+        return True
+
     def reduce_inplace(self, tensor: torch.Tensor) -> bool:
         if not self.should(tensor):
             return False
+        if self._push is not None and self._push.covers(tensor):
+            self._push.all_reduce(tensor, tensor)
+            return True
+        if (
+            self._ca_chain is not None
+            and tensor.is_contiguous()
+            and self._reduce_ca_chain(tensor)
+        ):
+            return True
         if self.quad_ca is not None:
             self._stage_ca(tensor, self.quad_ca, self.quad_dev)
         elif self.quad_nccl.available:

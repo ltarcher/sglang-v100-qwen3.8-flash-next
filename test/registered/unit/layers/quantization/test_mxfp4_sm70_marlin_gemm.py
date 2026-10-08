@@ -1,7 +1,7 @@
 """SM70 GPU numerical tests: MXFP4 Marlin W4A16 vs torch dequant-GEMM.
 
 Tiny fixtures only. Do not load the 476 GiB DSV4.1-Flash checkpoint.
-WO-4: do not register this for GPU CI.
+Do not register this for GPU CI.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ register_cuda_ci(
     est_time=30,
     stage="base-b",
     runner_config="1-gpu-large",
-    disabled="V100 bring-up; WO-4: do not register GPU CI",
+    disabled="V100 bring-up; do not register GPU CI",
 )
 
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]

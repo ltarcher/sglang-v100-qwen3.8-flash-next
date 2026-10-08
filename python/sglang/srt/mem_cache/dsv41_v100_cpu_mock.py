@@ -1,4 +1,4 @@
-"""WO-3 CPU-mock: v1 launch shape without constructing the 189 GiB Engram graph.
+"""CPU mock: v1 launch shape without constructing the 189 GiB Engram graph.
 
 DoD: imports and config/quant selection succeed on CPU; the dry-run allocator
 dies with a **budget** error (exit 1) or NUMA error (exit 2), never an SM90
@@ -21,10 +21,10 @@ EXIT_NUMA = 2
 EXIT_SM90 = 3
 EXIT_CONFIG = 4
 
-OFFICIAL_CONFIG = "$HOME/models/DeepSeek-V4.1-Flash/config.json"
+OFFICIAL_CONFIG = os.path.expanduser("~/models/DeepSeek-V4.1-Flash/config.json")
 INDEX_CANDIDATES = (
     "/tmp/dsv41-flash-index/model.safetensors.index.json",
-    "$HOME/models/DeepSeek-V4.1-Flash/model.safetensors.index.json",
+    os.path.expanduser("~/models/DeepSeek-V4.1-Flash/model.safetensors.index.json"),
 )
 SERVE_SCRIPT = "scripts/serve_dsv41_v100.sh"
 
@@ -247,11 +247,15 @@ def check_index_if_present(lines: List[str]) -> Optional[int]:
 
 
 def check_sm70_fail_closed(lines: List[str]) -> Optional[int]:
-    import inspect
+    import torch
 
     from sglang.srt.layers.attention import dsa_backend
-    from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    from sglang.srt.layers.attention.dsv4.v41_indexer import (
+        is_sm100_or_newer,
         make_candidate_indexer,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+        DenseBlocksBackend,
     )
     from sglang.srt.runtime_context import get_platform, override_platform
 
@@ -264,18 +268,35 @@ def check_sm70_fail_closed(lines: List[str]) -> Optional[int]:
         is_sm120=False,
         device_sm=70,
     )
-    src = inspect.getsource(make_candidate_indexer)
-    if "is_sm90" not in src or "TorchCandidateIndexer" not in src:
-        _log(lines, "SM90_GATE_FAIL make_candidate_indexer is not SM90-gated")
-        return EXIT_SM90
+    # DeepGEMM candidate indexing is SM100+. Below that the factory keeps the
+    # dense block backend for both prefill and decode.
     with override_platform(**sm70):
         platform = get_platform()
-        if platform.is_sm90 or platform.is_sm100:
+        if platform.is_sm90 or platform.is_sm100 or platform.device_sm >= 100:
             _log(lines, "SM90_GATE_FAIL override_platform still reports SM90")
+            return EXIT_SM90
+        if is_sm100_or_newer():
+            _log(lines, "SM90_GATE_FAIL device capability is SM100+")
+            return EXIT_SM90
+        prefill, decode = make_candidate_indexer(
+            token_to_kv_pool=object(),
+            req_to_token=torch.empty(0, dtype=torch.int32),
+            page_size=64,
+            candidate_topk_blocks=1,
+            candidate_block_size=64,
+        )
+        if not isinstance(prefill, DenseBlocksBackend) or not isinstance(
+            decode, DenseBlocksBackend
+        ):
+            _log(
+                lines,
+                "SM90_GATE_FAIL make_candidate_indexer built a DeepGEMM "
+                "indexer on SM70",
+            )
             return EXIT_SM90
     _log(
         lines,
-        f"SM90_GATE_OK candidate indexer SM90-gated; "
+        f"SM90_GATE_OK candidate indexer closed below SM100; "
         f"dsa_backend.deep_gemm={dsa_backend.deep_gemm is not None}",
     )
     return None
@@ -319,9 +340,9 @@ def check_serve_script(lines: List[str], repo_root: Optional[str] = None) -> Opt
         "--dtype float16",
         "--moe-runner-backend marlin",
         "--attention-backend dsv4",
-        "--mem-fraction-static 0.88",
+        "--mem-fraction-static",
+        "SGLANG_DSV41_MEM_FRACTION:-0.99",
         "--chunked-prefill-size 2048",
-        "--language-model-only",
         "--disable-custom-all-reduce",
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
         "SGLANG_DSV41_EXPERT_SPILL_GB",
@@ -336,7 +357,7 @@ def check_serve_script(lines: List[str], repo_root: Optional[str] = None) -> Opt
         if re.search(r"EXPERT_SPILL_APPLY:-1", text) is None:
             _log(lines, "SERVE_FAIL APPLY default is not 1")
             return EXIT_CONFIG
-    _log(lines, f"SERVE_OK {script} mem-fraction-static=0.88 APPLY default on")
+    _log(lines, f"SERVE_OK {script} mem-fraction-static default 0.99 APPLY default on")
     return None
 
 

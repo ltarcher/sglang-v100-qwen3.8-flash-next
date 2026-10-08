@@ -1,4 +1,4 @@
-"""WO-13 D6: SM70 MXFP4 decode GEMV vs Marlin at DSV4.1 Flash shapes.
+"""SM70 MXFP4 decode GEMV vs Marlin at DSV4.1 Flash shapes.
 
 Not registered for GPU CI (V100 worktree only).
 """

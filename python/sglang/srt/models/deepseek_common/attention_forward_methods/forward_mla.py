@@ -16,13 +16,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -103,7 +103,7 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
 
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8, sm70_rows_gemv
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -602,6 +602,12 @@ class DeepseekMLAForwardMixin:
                         self.w_scale,
                         torch.bfloat16,
                     )
+            elif _is_cuda and sm70_rows_gemv.supported(
+                q_nope.transpose(0, 1), self.w_kc.transpose(1, 2)
+            ):
+                q_nope_out = sm70_rows_gemv.bmm(
+                    q_nope.transpose(0, 1), self.w_kc.transpose(1, 2)
+                )
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -935,13 +941,17 @@ class DeepseekMLAForwardMixin:
                     dtype=attn_output.dtype,
                     device=attn_output.device,
                 )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
+                out = attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1)
+                if _is_cuda and sm70_rows_gemv.supported(
+                    attn_output.transpose(0, 1), self.w_vc.transpose(1, 2)
+                ):
+                    sm70_rows_gemv.bmm(
+                        attn_output.transpose(0, 1), self.w_vc.transpose(1, 2), out=out
+                    )
+                else:
+                    torch.bmm(attn_output.transpose(0, 1), self.w_vc, out=out)
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,

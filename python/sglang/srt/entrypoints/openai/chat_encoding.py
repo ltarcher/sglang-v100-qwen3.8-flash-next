@@ -210,6 +210,15 @@ def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, in
     return effort
 
 
+def spec_supports_inline_system(spec: Optional[str]) -> bool:
+    """Native encoders verified to render mid-conversation system messages in place."""
+    # K3's tokenizer renders in Python, so there is no Jinja source to probe.
+    # The V4.1 encoder renders a mid-conversation system turn at its own
+    # position; folding it into the leading system block would rewrite the
+    # token prefix on the next turn and drop the sticky-cache pin.
+    return spec in ("kimi_k3", "dsv41")
+
+
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
     """Whether the encoder for ``spec`` renders assistant reasoning history itself.
 

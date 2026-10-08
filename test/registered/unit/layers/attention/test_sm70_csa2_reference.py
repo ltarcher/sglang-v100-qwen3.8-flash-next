@@ -255,7 +255,7 @@ class TestFp4Fp8Primitives(CustomTestCase):
             self.assertEqual(R.FP4_E4M3_AMAX_FLOOR / 6.0, R.E4M3_MIN_NORMAL_SCALE)
 
     def test_matches_ported_upstream_torch_quant_module(self):
-        # The WO-1 port of sgl/dsv41 torch_quant.py, when present in the tree.
+        # The port of sgl/dsv41 torch_quant.py, when present in the tree.
         try:
             from sglang.srt.layers.attention.dsv4 import torch_quant as up
         except ImportError:  # pragma: no cover - port not landed

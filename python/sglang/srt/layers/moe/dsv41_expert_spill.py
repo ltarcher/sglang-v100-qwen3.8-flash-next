@@ -7,18 +7,19 @@ rows.
 
 ``maybe_spill_model_routed_experts`` attaches the plan. Shrink + host copies
 happen only when ``SGLANG_DSV41_EXPERT_SPILL_APPLY`` is on. Prefill still
-``ensure()`` + ``map_ids`` (LRU; not CUDA-graph safe). Decode uses WO-13 D4-H
-(host MXFP4 GEMV via a mapped mailbox) when ``SGLANG_DSV41_HOST_GEMV`` is on,
-else D4-G UVA page-in into a shared landing pool. Both remap with a
+``ensure()`` + ``map_ids`` (LRU; not CUDA-graph safe). Decode uses a host
+MXFP4 GEMV via a mapped mailbox when ``SGLANG_DSV41_HOST_GEMV`` is on,
+else UVA page-in into a shared landing pool. Both remap with a
 capturable kernel so Marlin/GEMV can stay in the decode graph.
 """
 
 from __future__ import annotations
 
 import gc
+import json
 import logging
+import math
 import os
-
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,9 +30,12 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.dsv41_host_placement import (
-    DEFAULT_GPU_NUMA_NODE,
     EngramNumaError,
+    engram_numa_node,
+    gpu_numa_node,
     mmap_numa_thp,
+    node_available_bytes,
+    read_numa_nodes,
 )
 from sglang.srt.mem_cache.dsv41_v100_budget import (
     DEFAULT_SPILL_GIB,
@@ -315,118 +319,135 @@ def spill_host_is_marlin_packed(
     return True
 
 
-def _alloc_ctor_row(
-    n_host: int, row_shape: tuple, dtype: torch.dtype
-) -> torch.Tensor:
-    """Allocate a checkpoint-layout ctor row (pageable).
-
-    Measured on the 4xV100 host: every *fresh* pinned allocation costs 2x its
-    size in process RSS there (standalone it is 1x), so a fully pinned
-    19 GiB/rank mirror bills 38 GiB/rank and the kernel OOM-killer wins at
-    create time. The mirror therefore stays pageable end to end; with the
-    landing pool disabled the LRU swaps through pageable staging, and the
-    pinned+landing path waits on pinning the mirror without fresh
-    cudaHostAlloc growth.
-    """
-    return torch.empty(n_host, *row_shape, dtype=dtype, device="cpu")
-
-
 def alloc_spill_host_buffers(moe: nn.Module, plan: RoutedExpertSpillPlan) -> None:
     """Pinned host rows for spilled experts, matching each GPU expert-dim param."""
     if plan.n_spilled <= 0:
         return
-    hosts: Dict[str, torch.Tensor] = {}
-    # Checkpoint-layout rows, filled by the weight loader; repacked after the
-    # Marlin pack (pin_spill_host_numa / the SM70 pack's packed outputs).
-    # These stay pageable end to end on RAM-tight hosts (see _alloc_ctor_row);
-    # WO-13 D1: place them on the *same* NUMA node the pinned mirror of this
+    # Checkpoint-layout rows, filled by the weight loader; repacked and pinned
+    # after Marlin pack (pin_spill_host_numa). Not registered here: pinning
+    # 80 GiB before the load would only add to the loader's peak.
+    #
+    # Place them on the *same* NUMA node the pinned mirror of this
     # layer will use. With the default (preferred node 1) policy and node 1
     # full of Engram hugetlb, these 10 GiB/rank overflowed onto node 0 and
     # coexisted with the growing pinned node-0 half -> node-0 OOM
     # (CONSTRAINT_MEMORY_POLICY) during repack. Same node keeps the per-node
     # footprint flat through the transition.
     node: Optional[int] = None
+    layer_id = int(getattr(moe, "layer_id", 0))
     use_numa = bool(envs.SGLANG_ENABLE_DSV41_EXPERT_SPILL_NUMA.get()) and torch.cuda.is_available()
     if use_numa:
         nodes = _spill_numa_nodes()
-        node = nodes[int(getattr(moe, "layer_id", 0)) % len(nodes)]
+        node = nodes[layer_id % len(nodes)]
         if node < 0:
             node = None
-    mms: List = []
-    for attr in _EXPERT_PARAM_ATTRS:
-        p = getattr(moe, attr, None)
-        if p is None or not isinstance(p, torch.nn.Parameter) or p.ndim < 1:
-            continue
-        row_shape = tuple(p.shape[1:])
-        if int(p.shape[0]) == 0:
-            continue
-        n_host = plan.n_spilled
-        numel = n_host * int(p[0].numel())
-        if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
-            import sys as _sys
-
-            before = int(
-                next(
-                    ln.split()[1]
-                    for ln in open("/proc/self/status")
-                    if ln.startswith("VmRSS")
-                )
-            )
-            _sys.stdout.flush()
-        if node is not None and numel > 0:
-            try:
-                mm = mmap_numa_thp(numel * p.element_size(), node=node)
-            except EngramNumaError:
-                # No CAP_SYS_NICE (containers): fall back to the plain
-                # allocator; pin_spill_host_numa degrades the same way.
-                node = None
-                logger.warning(
-                    "DSV4.1 spill host NUMA bind failed (%s); using pageable "
-                    "ctor rows",
-                    "set_mempolicy/mbind EPERM",
-                )
-                mm = None
-            if mm is not None:
-                mms.append(mm)
-                host = torch.frombuffer(mm, dtype=p.dtype, count=numel).view(
-                    n_host, *row_shape
-                )
-            else:
-                host = _alloc_ctor_row(n_host, row_shape, p.dtype)
-        else:
-            host = _alloc_ctor_row(n_host, row_shape, p.dtype)
-        hosts[attr] = host
-        if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
-            after = int(
-                next(
-                    ln.split()[1]
-                    for ln in open("/proc/self/status")
-                    if ln.startswith("VmRSS")
-                )
-            )
-            logger.info(
-                "DSV4.1 ctor attr %s: %d MiB pinned=%s RSS %+d kB",
-                attr,
-                numel * p.element_size() // (1024**2),
-                host.is_pinned(),
-                after - before,
-            )
-    if envs.SGLANG_DSV41_EXPERT_SPILL_RSS_LOG.get():
-        with open("/proc/self/status") as _f:
-            _rss = next(
-                ln.split(":")[1].strip() for ln in _f if ln.startswith("VmRSS")
-            )
-        logger.info(
-            "DSV4.1 spill ctor alloc %s: %d attrs %.0f MiB, VmRSS=%s",
-            type(moe).__name__,
-            len(hosts),
-            sum(t.numel() * t.element_size() for t in hosts.values()) / (1024**2),
-            _rss,
+    specs = _spill_row_specs(moe)
+    if node is None:
+        hosts, mms = _alloc_spill_rows(specs, n_rows=plan.n_spilled, node=None)
+    else:
+        hosts, mms, node = _alloc_spill_rows_with_failover(
+            specs, n_rows=plan.n_spilled, preferred=node, layer_id=layer_id
         )
     moe._dsv41_spill_host = hosts  # type: ignore[attr-defined]
     moe._dsv41_spill_host_ctor_mms = mms  # type: ignore[attr-defined]
     moe._dsv41_spill_numa_node = node  # type: ignore[attr-defined]
     moe._dsv41_expert_spill_plan = plan  # type: ignore[attr-defined]
+
+
+# (param attr, dtype, row shape) of one expert-dim param's host rows.
+_SpillRowSpec = tuple[str, torch.dtype, tuple[int, ...]]
+
+
+def _spill_row_specs(moe: nn.Module) -> List[_SpillRowSpec]:
+    specs = []
+    for attr in _EXPERT_PARAM_ATTRS:
+        p = getattr(moe, attr, None)
+        if p is None or not isinstance(p, torch.nn.Parameter) or p.ndim < 1:
+            continue
+        if int(p.shape[0]) == 0:
+            continue
+        specs.append((attr, p.dtype, tuple(p.shape[1:])))
+    return specs
+
+
+def _alloc_spill_rows(
+    specs: List[_SpillRowSpec],
+    *,
+    n_rows: int,
+    node: Optional[int],
+) -> tuple[Dict[str, torch.Tensor], List]:
+    hosts: Dict[str, torch.Tensor] = {}
+    mms: List = []
+    try:
+        for attr, dtype, row_shape in specs:
+            numel = n_rows * math.prod(row_shape)
+            if node is not None and numel > 0:
+                mms.append(mmap_numa_thp(numel * dtype.itemsize, node=node))
+                hosts[attr] = torch.frombuffer(mms[-1], dtype=dtype, count=numel).view(
+                    n_rows, *row_shape
+                )
+            else:
+                # Pageable on purpose: fresh pinned allocations cost 2x their
+                # size in RSS on the 4xV100 host; the OOM-killer wins at create.
+                hosts[attr] = torch.empty(n_rows, *row_shape, dtype=dtype, device="cpu")
+    except BaseException:
+        # The traceback keeps this frame alive; unmap the rows placed so far now.
+        hosts.clear()
+        mms.clear()
+        raise
+    return hosts, mms
+
+
+def _alloc_spill_rows_with_failover(
+    specs: List[_SpillRowSpec],
+    *,
+    n_rows: int,
+    preferred: int,
+    layer_id: int,
+) -> tuple[Dict[str, torch.Tensor], List, int]:
+    """Rows of one layer, all on one node: the stripe node if it has room."""
+    nbytes = sum(
+        n_rows * math.prod(shape) * dtype.itemsize for _, dtype, shape in specs
+    )
+    last_err: Optional[EngramNumaError] = None
+    for node in _spill_numa_failover_order(preferred, nbytes=nbytes):
+        try:
+            hosts, mms = _alloc_spill_rows(specs, n_rows=n_rows, node=node)
+        except EngramNumaError as e:
+            last_err = e
+            logger.warning(
+                "DSV4.1 spill rows L%s: placing on node %d failed (%s); trying the next node",
+                layer_id,
+                node,
+                e,
+            )
+            continue
+        if node != preferred:
+            logger.warning(
+                "DSV4.1 spill rows L%s: on node %d instead of stripe node %d",
+                layer_id,
+                node,
+                preferred,
+            )
+        return hosts, mms, node
+    raise EngramNumaError(
+        f"spill rows L{layer_id}: no NUMA node took {nbytes} bytes"
+    ) from last_err
+
+
+@contextmanager
+def _gc_scans_only_new_objects():
+    """Limit gc.collect() to objects created inside the block.
+
+    Repack and pin call gc.collect() several times per layer; with the loaded
+    model on the heap each full pass cost ~0.4 s (about half of the per-layer
+    time, py-spy). Tensors are still freed by refcount.
+    """
+    gc.freeze()
+    try:
+        yield
+    finally:
+        gc.unfreeze()
 
 
 def repack_spill_host_for_sm70_marlin(moe: nn.Module) -> None:
@@ -564,7 +585,7 @@ def repack_spill_host_for_sm70_marlin(moe: nn.Module) -> None:
 
 
 # cudaHostRegisterMapped: pins for DMA *and* maps into the CUDA address space
-# so a later in-graph UVA page-in (WO-13 D4-G) can read the mirror directly.
+# so a later in-graph UVA page-in can read the mirror directly.
 _CUDA_HOST_REGISTER_MAPPED = 0x02
 
 
@@ -575,17 +596,35 @@ def _spill_numa_nodes() -> List[int]:
             nodes.append(int(s))
         except ValueError:
             logger.warning("SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES: ignoring %r", s)
-    return nodes or [DEFAULT_GPU_NUMA_NODE]
+    if nodes:
+        return nodes
+    # Unset: the GPU-local node first, then the other memory nodes.
+    gpu = gpu_numa_node()
+    return [gpu, *sorted(n for n in read_numa_nodes() if n != gpu)]
 
 
-def _spill_numa_failover_order(preferred: int) -> List[int]:
-    """Try the stripe node first, then the other configured sockets."""
-    nodes = _spill_numa_nodes()
+# Arbitrary margin: covers the reclaim watermarks and the other ranks
+# placing the same layer at the same time.
+_SPILL_NODE_HEADROOM_BYTES = 2 * GIB
+
+
+def _spill_numa_failover_order(preferred: int, *, nbytes: int) -> List[int]:
+    """The stripe node first, then the other configured nodes.
+
+    Nodes without ``nbytes`` of free or page-cache memory go last: a bound
+    allocation there reclaims and swaps on that node, and can end in an OOM
+    kill, instead of failing.
+    """
     ordered: List[int] = []
-    for n in [preferred, *nodes]:
+    for n in [preferred, *_spill_numa_nodes()]:
         if n not in ordered:
             ordered.append(n)
-    return ordered
+
+    def lacks_room(n: int) -> bool:
+        node = n if n >= 0 else gpu_numa_node()
+        return node_available_bytes(node) < nbytes + _SPILL_NODE_HEADROOM_BYTES
+
+    return sorted(ordered, key=lacks_room)
 
 
 def _pin_spill_hosts_on_node(
@@ -603,7 +642,7 @@ def _pin_spill_hosts_on_node(
     total = 0
     registered = 0
     cudart = torch.cuda.cudart()
-    bind_node = node if node >= 0 else DEFAULT_GPU_NUMA_NODE
+    bind_node = node if node >= 0 else gpu_numa_node()
     try:
         for attr, t in hosts.items():
             t = t.contiguous()
@@ -938,13 +977,12 @@ def _plain_pin_spill_hosts(moe: nn.Module, layer_ordinal: int) -> bool:
 
 
 def pin_spill_host_numa(moe: nn.Module, layer_ordinal: int) -> Optional[int]:
-    """WO-13 D1: move the packed host mirror into node-local THP mappings and
+    """Move the packed host mirror into node-local THP mappings and
     ``cudaHostRegister`` them (mapped).
 
     ``repack_spill_host_for_sm70_marlin`` leaves the rows as pageable tensors
     from the default allocator; under memory pressure those were paged out
-    and every LRU miss became a swap-in through the RAID (A.6 / B.4b of the
-    WO-13 plan). Layers are striped over the configured nodes so the mirror
+    and every LRU miss became a swap-in through the RAID. Layers are striped over the configured nodes so the mirror
     spreads across sockets. Spill=12 can exhaust the GPU-local node's THP
     remainder (1G hugepages already hold Engram); retry the other stripe
     node instead of aborting (explicit overflow, not silent UPI). Returns
@@ -992,22 +1030,23 @@ def pin_spill_host_numa(moe: nn.Module, layer_ordinal: int) -> Optional[int]:
     total = 0
     registered = 0
     node = preferred
-    for i, node in enumerate(_spill_numa_failover_order(int(preferred))):
+    nbytes = sum(t.numel() * t.element_size() for t in hosts.values())
+    for node in _spill_numa_failover_order(int(preferred), nbytes=nbytes):
         try:
             pinned, mms, total, registered = _pin_spill_hosts_on_node(hosts, node)
-            if i > 0:
+            if node != preferred:
                 logger.warning(
-                    "DSV4.1 spill mirror L%s: node %d full, pinned on node %d (UPI)",
+                    "DSV4.1 spill mirror L%s: pinned on node %d instead of node %d",
                     layer_ordinal,
-                    preferred,
                     node,
+                    preferred,
                 )
             last_err = None
             break
         except EngramNumaError as e:
             last_err = e
             logger.warning(
-                "DSV4.1 spill mirror L%s: mbind node %d failed (%s); trying next stripe node",
+                "DSV4.1 spill mirror L%s: placing on node %d failed (%s); trying the next node",
                 layer_ordinal,
                 node,
                 e,
@@ -1042,12 +1081,17 @@ _COLD_SET_CACHE: Dict[str, Optional[torch.Tensor]] = {}
 
 
 def _load_cold_set_table(path: str) -> Optional[torch.Tensor]:
-    """``cold_ids`` int64 [layers, ep, S], coldest first. Cached per path."""
+    """``cold_ids`` int64 [layers, ep, S], coldest first, from JSON or a torch file. Cached per path."""
     if path in _COLD_SET_CACHE:
         return _COLD_SET_CACHE[path]
     table: Optional[torch.Tensor] = None
     try:
-        obj = torch.load(path, map_location="cpu", weights_only=False)
+        if path.endswith(".json"):
+            # The shipped table is JSON: plain data, nothing to unpickle.
+            with open(path) as f:
+                obj = json.load(f)
+        else:
+            obj = torch.load(path, map_location="cpu", weights_only=False)
         t = obj["cold_ids"] if isinstance(obj, dict) else obj
         table = torch.as_tensor(t, dtype=torch.int64)
         if table.ndim != 3:
@@ -1066,7 +1110,7 @@ def _load_cold_set_table(path: str) -> Optional[torch.Tensor]:
 
 
 def spill_placement(moe: nn.Module) -> tuple[List[int], List[int]]:
-    """WO-13 D2: (kept_ids, cold_ids) local routed ids for this (layer, ep rank).
+    """(kept_ids, cold_ids) local routed ids for this (layer, ep rank).
 
     Host row of a cold expert = its index in ``cold_ids``; GPU slot of a kept
     expert = its index in ``kept_ids``; shared experts follow the kept rows.
@@ -1218,7 +1262,7 @@ class RoutedExpertLru:
         self.n_spilled = n_spilled
         self.n_kept_routed = self.n_routed - n_spilled
         self._pin_memory = pin_memory
-        # WO-13 D2: which local routed ids start on host. Default = tail.
+        # Which local routed ids start on host. Default = tail.
         if cold_ids is None:
             cold_list = list(range(self.n_kept_routed, self.n_routed))
         else:
@@ -1281,9 +1325,9 @@ class RoutedExpertLru:
             and host_bytes > 0
         )
         if use_numa:
-            node = int(envs.SGLANG_DSV41_ENGRAM_NUMA_NODE.get())
+            node = engram_numa_node()
             if node < 0:
-                node = DEFAULT_GPU_NUMA_NODE
+                node = gpu_numa_node()
             try:
                 host_mm = mmap_numa_thp(host_bytes, node=node)
             except EngramNumaError:
@@ -1472,16 +1516,16 @@ class RoutedExpertLru:
     _MRU_PROTECT = 8
 
     def _pick_victim(self, needed: set, current: Optional[int] = None) -> int:
-        """Slot to evict. WO-13 D2: among residents outside the MRU window,
+        """Slot to evict. Among residents outside the MRU window,
         prefer one whose home is the host mirror (a cold expert brought in
         earlier) over a kept expert, so the frequency-hot set stays on the
         GPU; otherwise the oldest resident. Never a slot needed by a
         currently-resident batch id while a non-needed occupant exists.
 
         Last resort (unique(batch) > n_slots): evict the oldest LRU occupant
-        that is not ``current``. Same slot may swap several times in one
-        prefill chunk; Marlin still sees a resident expert per id at compute
-        time, just not all unique ids at once.
+        that is not ``current``. The evicted id maps to -1 afterwards, so the
+        MoE path splits such batches into slot-sized passes first
+        (``run_moe_with_expert_spill``).
         """
         n = len(self._lru)
         protect = min(self._MRU_PROTECT, n // 2)
@@ -2502,128 +2546,191 @@ def remap_dispatch_for_expert_spill(moe: nn.Module, dispatch_output):
         moe._dsv41_land_ids = None  # type: ignore[attr-defined]
         ensure_spill_experts(moe, ids)
     return dispatch_output
+def _prefill_pass_groups(
+    lru: RoutedExpertLru, topk_ids: torch.Tensor
+) -> Optional[List[List[int]]]:
+    """Routed-id groups that each fit the GPU slots, or None for one pass.
 
-
-def spill_chunk_slices(moe: nn.Module, dispatch_output):
-    """Greedy token chunks whose resident working set fits the GPU expert slots.
-
-    A batch whose unique expert set exceeds ``n_kept_routed`` makes the
-    host-LRU path thrash: experts evicted mid-batch remap to -1 and Marlin
-    skips them, silently dropping their contribution. Running token chunks
-    one at a time (ensure -> remap -> run per chunk) keeps every requested
-    expert resident when the runner sees it, so results stay exact.
-
-    Returns ``None`` when the whole batch fits (or decode-shaped / landing
-    paths own it) and the caller should keep the single-run path; otherwise
-    ``[(start, end), ...]`` covering ``[0, T)``.
+    A single ``ensure`` over more unique ids than slots evicts ids of the same
+    batch, and ``map_ids`` then sends their tokens to -1 (expert skipped).
+    Residents go in the first group so it needs the fewest swaps.
     """
-    lru: Optional[RoutedExpertLru] = getattr(moe, "_dsv41_expert_lru", None)
-    if lru is None or not lru.applied:
+    if _decode_shaped_topk(topk_ids):
         return None
-    try:
-        from sglang.srt.layers.moe.token_dispatcher.standard import (
-            StandardDispatchOutput,
+    valid = topk_ids[topk_ids >= 0]
+    if not valid.numel():
+        return None
+    routed = [i for i in torch.unique(valid).tolist() if i < lru.n_routed]
+    slots = lru.n_kept_routed
+    if len(routed) <= slots:
+        return None
+    resident = [i for i in routed if i in lru._id_to_slot]
+    missing = [i for i in routed if i not in lru._id_to_slot]
+    room = slots - len(resident)
+    groups = [resident + missing[:room]]
+    rest = missing[room:]
+    groups += [rest[i : i + slots] for i in range(0, len(rest), slots)]
+    return groups
+
+
+def _map_pass(
+    lru: RoutedExpertLru,
+    logical: torch.Tensor,
+    group: List[int],
+    *,
+    include_shared: bool,
+) -> torch.Tensor:
+    """Physical ids for ``group`` (plus shared once); every other choice -1."""
+    before, before_thrash = lru.n_swaps, lru.n_thrash
+    lru.ensure(group)
+    _note_swaps(
+        lru.n_swaps - before, int(logical.shape[0]), lru.n_thrash - before_thrash
+    )
+    physical = lru.map_ids(logical)
+    member = torch.zeros(lru.n_experts, dtype=torch.bool, device=logical.device)
+    member[torch.tensor(group, dtype=torch.int64, device=logical.device)] = True
+    if include_shared:
+        member[lru.n_routed :] = True
+    keep = (logical >= 0) & member[logical.clamp(min=0).to(torch.int64)]
+    return torch.where(keep, physical, torch.full_like(physical, -1))
+
+
+def _prefill_reads_landing(moe: nn.Module, topk_ids: torch.Tensor) -> bool:
+    return (
+        bool(envs.SGLANG_DSV41_PREFILL_LANDING.get())
+        and getattr(moe, "_dsv41_landing_pool", None) is not None
+        and spill_landing_slots() > 0
+        and bool(topk_ids.numel())
+        and not _decode_shaped_topk(topk_ids)
+    )
+
+
+# Per-rank prefill landing telemetry: (layer-calls, host rows copied, tokens).
+_LANDING_STATS = [0, 0, 0]
+_LANDING_LOG_EVERY = 40 * 50  # ~50 prefill forwards of 40 MoE layers
+
+
+def _note_landing_rows(rows: int, n_tokens: int) -> None:
+    s = _LANDING_STATS
+    s[0] += 1
+    s[1] += rows
+    s[2] += n_tokens
+    if s[0] >= _LANDING_LOG_EVERY:
+        logger.info(
+            "DSV4.1 prefill landing: %.1f host rows copied per layer-call "
+            "(%.0f tokens per call, %d calls)",
+            s[1] / s[0], s[2] / s[0], s[0],
         )
-
-        if not isinstance(dispatch_output, StandardDispatchOutput):
-            return None
-    except ImportError:
-        return None
-    topk_output = getattr(dispatch_output, "topk_output", None)
-    if topk_output is None or not hasattr(topk_output, "topk_ids"):
-        return None
-    ids = topk_output.topk_ids
-    if ids.dtype != torch.int32 or ids.dim() != 2:
-        return None
-    if getattr(dispatch_output, "hidden_states_pre_quant", None) is not None:
-        # Pre-quantized activation pairs with the full token axis; slicing it
-        # is not implemented here, so keep the single-run path.
-        return None
-    n_slots = int(getattr(moe, "_dsv41_gpu_expert_slots", 0))
-    if n_slots <= 0:
-        return None
-    n_tok = int(ids.shape[0])
-    if n_tok <= _decode_shaped_max_tokens():
-        return None
-    if bool(envs.SGLANG_DSV41_EXPERT_SPILL_NO_CHUNK.get()):
-        return None
-    if _cuda_graph_capturing():
-        # Every decision below is a host readback (illegal while capturing).
-        # Captured decode replays take the landing page-in path instead.
-        return None
-    if _prefill_landing_ready(moe):
-        # The landing pool covers every logical expert (see
-        # _prefill_landing_ready), so the batch needs no chunking: one
-        # device-side page-in owns it and the host-LRU slice loop below
-        # would only add its syncs and swap churn.
-        return None
-
-    # One single sync: pull the whole topk table to the host and do the
-    # expert-set math there (a per-token unique()+tolist() loop would sync
-    # once per token).
-    per_tok = [[v for v in row if v >= 0] for row in ids.tolist()]
-    unique_all = {v for row in per_tok for v in row}
-    if len(unique_all) <= n_slots:
-        return None
-
-    slices = []
-    start = 0
-    resident: set = set()
-    for t in range(n_tok):
-        need = set(per_tok[t])
-        if resident and len(resident | need) > n_slots:
-            slices.append((start, t))
-            start = t
-            resident = set()
-        resident |= need
-        if len(resident) > n_slots:
-            # Single token whose top-k alone exceeds the slots: isolate it and
-            # accept the bounded (-1 = skipped) behavior for the overflow.
-            slices.append((start, t + 1))
-            start = t + 1
-            resident = set()
-    if start < n_tok:
-        slices.append((start, n_tok))
-    if len(slices) <= 1:
-        return None
-    logger.info(
-        "DSV4.1 spill chunked prefill: %d tokens -> %d chunks (slots=%d, unique=%d)",
-        n_tok,
-        len(slices),
-        n_slots,
-        len(unique_all),
-    )
-    return slices
+        s[0] = s[1] = s[2] = 0
 
 
-def slice_dispatch_for_spill_chunk(dispatch_output, start: int, end: int):
-    """Row slice a StandardDispatchOutput for one spill chunk."""
+def _host_row_runs(rows: List[int]) -> List[tuple[int, int, int]]:
+    """(first host row, first landing slot, length) for each run of
+    consecutive host rows, so each run is one copy per tensor."""
+    runs: List[tuple[int, int, int]] = []
+    for slot, row in enumerate(rows):
+        if runs and runs[-1][0] + runs[-1][2] == row:
+            first, first_slot, length = runs[-1]
+            runs[-1] = (first, first_slot, length + 1)
+        else:
+            runs.append((row, slot, 1))
+    return runs
+
+
+def _run_prefill_through_landing(
+    moe: nn.Module, lru: RoutedExpertLru, dispatch_output, apply
+):
+    """Prefill without GPU-slot swaps: copy the host rows this batch routes to
+    into the landing pool and run them as landing ids.
+
+    No write-back and no LRU change, so decode keeps the placed GPU set.
+    One host sync per layer picks the rows; kept ids run in pass 0 only.
+    """
+    pool: SpillLandingPool = moe._dsv41_landing_pool  # type: ignore[attr-defined]
+    hosts: Dict[str, torch.Tensor] = moe._dsv41_spill_host  # type: ignore[attr-defined]
     topk_output = dispatch_output.topk_output
-    sliced_topk = topk_output._replace(
-        topk_ids=topk_output.topk_ids[start:end],
-        topk_weights=(
-            None
-            if getattr(topk_output, "topk_weights", None) is None
-            else topk_output.topk_weights[start:end]
-        ),
-        router_logits=(
-            None
-            if getattr(topk_output, "router_logits", None) is None
-            else topk_output.router_logits[start:end]
-        ),
-    )
-    pre_quant = getattr(dispatch_output, "hidden_states_pre_quant", None)
-    if pre_quant is not None:
-        sliced_pre_quant = tuple(x[start:end] for x in pre_quant)
-    else:
-        sliced_pre_quant = None
-    scale = getattr(dispatch_output, "hidden_states_scale", None)
-    return dispatch_output._replace(
-        hidden_states=dispatch_output.hidden_states[start:end],
-        hidden_states_scale=None if scale is None else scale[start:end],
-        topk_output=sliced_topk,
-        hidden_states_pre_quant=sliced_pre_quant,
-    )
+    logical = topk_output.topk_ids
+    lru._ensure_device_tables(logical)
+    index = logical.clamp(min=0).to(torch.int64)
+    valid = logical >= 0
+    kept = torch.where(valid, lru._map_table[index], -1).to(logical.dtype)
+    host_row = torch.where(valid, lru._host_map_table[index], -1).to(logical.dtype)
+    rows = torch.unique(host_row[host_row >= 0]).tolist()
+    _note_landing_rows(len(rows), int(logical.shape[0]))
+    n_host = int(hosts[pool.attrs[0]].shape[0])
+    moe._dsv41_host_gemv_pending = False  # type: ignore[attr-defined]
+    combined = None
+    for start in range(0, max(len(rows), 1), pool.n_landing):
+        chunk = rows[start : start + pool.n_landing]
+        land_ids = None
+        if chunk:
+            for first, slot, length in _host_row_runs(chunk):
+                for attr in pool.attrs:
+                    pool.tensors[attr][slot : slot + length].copy_(
+                        hosts[attr][first : first + length], non_blocking=True
+                    )
+            slot_of_row = torch.full(
+                (n_host,), -1, dtype=logical.dtype, device=logical.device
+            )
+            slot_of_row[torch.tensor(chunk, device=logical.device)] = torch.arange(
+                len(chunk), dtype=logical.dtype, device=logical.device
+            )
+            land_ids = torch.where(
+                host_row >= 0, slot_of_row[host_row.clamp(min=0).to(torch.int64)], -1
+            )
+        moe._dsv41_land_ids = land_ids  # type: ignore[attr-defined]
+        ids = kept if start == 0 else torch.full_like(kept, -1)
+        out = apply(
+            layer=moe,
+            dispatch_output=dispatch_output._replace(
+                topk_output=topk_output._replace(topk_ids=ids)
+            ),
+        )
+        if combined is None:
+            combined = out
+        else:
+            combined = combined._replace(
+                hidden_states=combined.hidden_states + out.hidden_states
+            )
+    moe._dsv41_land_ids = None  # type: ignore[attr-defined]
+    return combined
+
+
+def run_moe_with_expert_spill(moe: nn.Module, dispatch_output, apply):
+    """``apply`` once, or once per slot-sized expert group with summed outputs.
+
+    The passes are exact: each (token, expert) choice runs in exactly one
+    pass, and the MoE output is a sum over choices.
+    """
+    lru = getattr(moe, "_dsv41_expert_lru", None)
+    topk_output = getattr(dispatch_output, "topk_output", None)
+    groups = None
+    if lru is not None and lru.applied and topk_output is not None:
+        if _prefill_reads_landing(moe, topk_output.topk_ids):
+            return _run_prefill_through_landing(moe, lru, dispatch_output, apply)
+        groups = _prefill_pass_groups(lru, topk_output.topk_ids)
+    if groups is None:
+        dispatch_output = remap_dispatch_for_expert_spill(moe, dispatch_output)
+        return apply(layer=moe, dispatch_output=dispatch_output)
+    moe._dsv41_host_gemv_pending = False  # type: ignore[attr-defined]
+    moe._dsv41_land_ids = None  # type: ignore[attr-defined]
+    logical = topk_output.topk_ids.clone()
+    combined = None
+    for index, group in enumerate(groups):
+        ids = _map_pass(lru, logical, group, include_shared=index == 0)
+        out = apply(
+            layer=moe,
+            dispatch_output=dispatch_output._replace(
+                topk_output=topk_output._replace(topk_ids=ids)
+            ),
+        )
+        if combined is None:
+            combined = out
+        else:
+            combined = combined._replace(
+                hidden_states=combined.hidden_states + out.hidden_states
+            )
+    return combined
 
 
 def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertSpillPlan]:
@@ -2704,12 +2811,13 @@ def maybe_spill_model_routed_experts(model: nn.Module) -> Optional[RoutedExpertS
                 _st.get("VmSwap"),
             )
         if getattr(moe, "_dsv41_spill_host", None) is not None:
-            repack_spill_host_for_sm70_marlin(moe)
-            # Always pin: the D4-G landing page-in kernel reads the mirror
-            # through UVA, which requires device-accessible (pinned) memory.
-            # pin_spill_host_numa degrades to plain pinning without the NUMA
-            # env and to plain pinning again if mbind/set_mempolicy fails.
-            pin_spill_host_numa(moe, layer_ordinal)
+            with _gc_scans_only_new_objects():
+                repack_spill_host_for_sm70_marlin(moe)
+                # Always pin: the D4-G landing page-in kernel reads the mirror
+                # through UVA, which requires device-accessible (pinned) memory.
+                # pin_spill_host_numa degrades to plain pinning without the NUMA
+                # env and to plain pinning again if mbind/set_mempolicy fails.
+                pin_spill_host_numa(moe, layer_ordinal)
         else:
             logger.warning(
                 "DSV4.1 spill APPLY: no _dsv41_spill_host on %s; "

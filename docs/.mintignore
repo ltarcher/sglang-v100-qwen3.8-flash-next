@@ -6,5 +6,5 @@
 drafts/
 *.draft.mdx
 
-# Local V100 planning notes (not part of the public docs site)
+# V100 guides are plain Markdown linked from the README, not docs-site pages
 v100/

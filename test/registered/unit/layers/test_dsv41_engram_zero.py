@@ -1,4 +1,4 @@
-"""WO-11 ablation: SGLANG_DSV41_ENGRAM_ZERO returns the residual unchanged."""
+"""Ablation: SGLANG_DSV41_ENGRAM_ZERO returns the residual unchanged."""
 
 from __future__ import annotations
 

@@ -43,7 +43,7 @@ def _fused_unpack_packed_topk(packed: torch.Tensor):
 
     Returns (topk_ids int32, topk_weights float32). Collapses the ~5 elementwise
     ops (shift / mask / int16 / bitcast / cast) the torch reference emits per call
-    into one Triton launch. Mirrors _pack_topk_kernel (trtllm_lora_temp/topk_pack).
+    into one Triton launch. Mirrors _pack_topk_kernel (ops/lora/moe/trtllm_lora_temp/topk_pack).
     """
     packed = packed.contiguous()
     ids = torch.empty_like(packed, dtype=torch.int32)
@@ -172,6 +172,13 @@ def fused_experts_none_to_marlin(
         and quant_info.expert_map is None
         and runner_config.num_experts == runner_config.num_local_experts == 512
         and runner_config.swiglu_limit is None
+        and runner_config.activation == "silu"
+        and runner_config.is_gated
+        and not runner_config.apply_router_weight_on_input
+        and not runner_config.no_combine
+        and runner_config.gemm1_alpha is None
+        and runner_config.gemm1_beta is None
+        and runner_config.gemm1_clamp_limit is None
         and runner_config.gate_up_input_scale == 1.0
         and runner_config.wide_output_scale == 1.0
         and (routed_scale is None or routed_scale == 1.0)
@@ -195,6 +202,72 @@ def fused_experts_none_to_marlin(
                 topk_output.topk_weights.view(-1),
             )
             return StandardCombineInput(hidden_states=output)
+
+    # GLM-5.3-Flash: hidden 4096, top-8; EP or TP-sliced experts. Load replaced
+    # the Marlin expert pack with the lane-major HMMA pack (same bytes). Decode
+    # reads that pack. Prefill unpacks it back into the shared scratch so
+    # Marlin still sees its own layout.
+    from sglang.kernels.ops.moe.sm70_glm_nvfp4_moe_decode import (
+        glm_hmma_experts_packed,
+    )
+
+    w13_qweight = quant_info.w13_qweight
+    w2_qweight = quant_info.w2_qweight
+    glm_hmma_packed = (
+        hidden_states.dtype == torch.float16
+        and hidden_states.ndim == 2
+        and hidden_states.shape[1] == 4096
+        and tuple(topk_output.topk_ids.shape) == (hidden_states.shape[0], 8)
+        and glm_hmma_experts_packed(w13_qweight, w2_qweight)
+        and quant_info.weight_bits == 4
+        and quant_info.w13_qzeros is None
+        and quant_info.w2_qzeros is None
+        and quant_info.w13_bias is None
+        and quant_info.w2_bias is None
+        and quant_info.w13_scales.dtype == torch.float8_e4m3fn
+        and quant_info.w2_scales.dtype == torch.float8_e4m3fn
+        and quant_info.w13_global_scale is not None
+        and quant_info.w2_global_scale is not None
+        and runner_config.activation == "silu"
+        and runner_config.is_gated
+        and not runner_config.apply_router_weight_on_input
+        and not runner_config.no_combine
+        and runner_config.gemm1_alpha is None
+        and runner_config.gemm1_beta is None
+        and runner_config.gemm1_clamp_limit is None
+        and runner_config.gate_up_input_scale == 1.0
+        and runner_config.wide_output_scale == 1.0
+    )
+    if glm_hmma_packed:
+        from sglang.kernels.ops.moe.sm70_glm_nvfp4_moe_decode import (
+            materialize_glm_marlin,
+            sm70_glm_nvfp4_moe_decode,
+            sm70_glm_nvfp4_moe_decode_available,
+        )
+
+        if sm70_glm_nvfp4_moe_decode_available() and 1 <= hidden_states.shape[0] <= 4:
+            from sglang.srt.layers.moe.sm70_shared_expert_fold import (
+                take_shared_expert,
+            )
+
+            output = sm70_glm_nvfp4_moe_decode(
+                hidden_states,
+                w13_qweight,
+                w2_qweight,
+                quant_info.w13_scales,
+                quant_info.w2_scales,
+                quant_info.w13_global_scale,
+                quant_info.w2_global_scale,
+                topk_output.topk_ids.reshape(-1),
+                topk_output.topk_weights.reshape(-1),
+                0.0
+                if runner_config.swiglu_limit is None
+                else float(runner_config.swiglu_limit),
+                1.0 if routed_scale is None else float(routed_scale),
+                shared=take_shared_expert(),
+            )
+            return StandardCombineInput(hidden_states=output)
+        w13_qweight, w2_qweight = materialize_glm_marlin(w13_qweight, w2_qweight)
 
     # DeepSeek-V4.1-Flash decode: Marlin's M=1 grouped GEMM is still ~5x
     # above a bandwidth-bound GEMV. Stream the already-repacked MXFP4
@@ -225,6 +298,8 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         gemm1_clamp_limit=runner_config.gemm1_clamp_limit,
         swiglu_limit=runner_config.swiglu_limit,
+        apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
+        no_combine=runner_config.no_combine,
     ):
         output = sm70_dsv41_mxfp4_moe_decode(
             hidden_states,
@@ -237,6 +312,27 @@ def fused_experts_none_to_marlin(
             swiglu_limit=runner_config.swiglu_limit,
         )
         return StandardCombineInput(hidden_states=output)
+
+    if runner_config.apply_router_weight_on_input or runner_config.no_combine:
+        raise NotImplementedError(
+            "Marlin MoE runner does not implement apply_router_weight_on_input "
+            "or no_combine; fused_marlin_moe would need to scale the input rows by the "
+            "router weight / return uncombined per-expert outputs."
+        )
+    # The alpha activation computes (up + 1), as Triton does, so beta 1.0 is exact.
+    if runner_config.gemm1_beta not in (None, 1.0):
+        raise NotImplementedError(
+            "Marlin MoE runner only implements gemm1_beta=1.0, "
+            f"got {runner_config.gemm1_beta}."
+        )
+    if (
+        runner_config.gemm1_clamp_limit is not None
+        and runner_config.gemm1_alpha is None
+    ):
+        raise NotImplementedError(
+            "Marlin MoE runner does not implement a limit-only gemm1_clamp_limit; "
+            "fused_marlin_moe clamps gate before silu, Triton clamps silu(gate) after it."
+        )
 
     if runner_config.is_gated:
         assert runner_config.activation in {
@@ -274,8 +370,8 @@ def fused_experts_none_to_marlin(
 
     output = fused_marlin_moe(
         hidden_states=marlin_hidden_states,
-        w1=quant_info.w13_qweight,
-        w2=quant_info.w2_qweight,
+        w1=w13_qweight,
+        w2=w2_qweight,
         w1_scale=quant_info.w13_scales,
         w2_scale=quant_info.w2_scales,
         gating_output=topk_output.router_logits,

@@ -12,7 +12,7 @@ Occupies np=1 for ``--seconds`` (default 1800).
 
 Example::
 
-  PYTHONPATH=python $HOME/sglang-v100-venv/bin/python \\
+  PYTHONPATH=python python \\
     test/manual/dsv41_v100/test_tg_soak_cohesion.py \\
     --base http://127.0.0.1:11435 --seconds 1800
 """
@@ -33,7 +33,7 @@ from typing import Any
 DEFAULT_BASE = "http://127.0.0.1:11435"
 DEFAULT_SECONDS = 1800
 DEFAULT_MAX_TOKENS = 768
-DEFAULT_OUT = "$HOME/dsv41-v100-logs/2026-09-21/tg-soak-cohesion.jsonl"
+DEFAULT_OUT = "tg-soak-cohesion.jsonl"
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_`'.]+|[.!?]")
 

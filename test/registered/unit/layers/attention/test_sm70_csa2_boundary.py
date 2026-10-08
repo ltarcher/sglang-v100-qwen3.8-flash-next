@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
     cap_verify_commit,
     csa2_finish_forward,
+    csa2_image_len,
     csa2_prepare_decode,
     csa2_prepare_extend,
     evict_recent,
@@ -22,6 +23,42 @@ class _State:
         self.swa_ring = {0: torch.zeros(4, dtype=torch.uint8)}
         self.pending_kv = {1: torch.zeros(2, dtype=torch.float32)}
         self.pending_score = {1: torch.zeros(2, dtype=torch.float32)}
+
+
+class _RingState:
+    """Ring slot ``p % W`` holds position ``p``; pending holds the last token."""
+
+    W = 8
+
+    def __init__(self, pending: bool = True) -> None:
+        self.swa_ring = {0: torch.full((self.W, 1), 255, dtype=torch.uint8)}
+        self.pending_kv = {1: torch.zeros(2)} if pending else {}
+        self.pending_score = {1: torch.zeros(2)} if pending else {}
+        self.verify_pending_kv_traj = {}
+        self.verify_pending_score_traj = {}
+
+    def extend(self, start: int, end: int) -> None:
+        for pos in range(start, end):
+            self.swa_ring[0][pos % self.W] = pos
+        for table in (self.pending_kv, self.pending_score):
+            for vec in table.values():
+                vec.fill_(end - 1)
+
+    def verify(self, start: int, commit: int, block: int = 4) -> None:
+        """A verify block whose first ``commit`` inputs are published."""
+        if self.pending_kv:
+            traj = torch.arange(start, start + block, dtype=torch.float32)
+            traj = traj[:, None].repeat(1, 2)
+            self.verify_pending_kv_traj = {1: traj.clone()}
+            self.verify_pending_score_traj = {1: traj.clone()}
+        self.extend(start, start + commit)
+
+    def window(self, length: int) -> list:
+        """Positions the ring should hold at ``length``, by slot."""
+        slots = [255] * self.W
+        for pos in range(max(0, length - self.W), length):
+            slots[pos % self.W] = pos
+        return slots
 
 
 class _Backend:
@@ -224,6 +261,46 @@ class TestCsa2Boundary(CustomTestCase):
             envs.SGLANG_DSV41_CSA2_SESSION_KEEP.clear()
             reset_handoff()
 
+    def test_spill_frees_its_host_copy(self):
+        """A spilled image's host copy must not outlive the spill.
+
+        Left to the automatic GC, it can stay resident for hours behind the
+        engine's frozen startup objects.
+        """
+        import gc
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            request_spill,
+            reset_handoff,
+            session_key,
+        )
+
+        state = _State()
+        state.kv_rows = {2: torch.arange(8, dtype=torch.uint8)}
+        target = _Backend(state)
+        backends = [target]
+        csa2_finish_forward(backends, 4, from_extend=True)
+        csa2_prepare_decode(backends)
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(tempfile.mkdtemp())
+        gc.collect()
+        gc.disable()
+        try:
+            reset_handoff()
+            request_spill(session_key([1, 2, 3, 4], None, None))
+            csa2_prepare_extend(backends, 0)
+            gc.set_debug(gc.DEBUG_SAVEALL)
+            gc.collect()
+            leaked = [o for o in gc.garbage if isinstance(o, torch.UntypedStorage)]
+            self.assertEqual(leaked, [])
+        finally:
+            gc.set_debug(0)
+            gc.garbage.clear()
+            gc.enable()
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            reset_handoff()
+
     def test_spill_files_verify_tip_under_the_pin(self):
         import tempfile
 
@@ -260,3 +337,110 @@ class TestCsa2Boundary(CustomTestCase):
         finally:
             envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
             reset_handoff()
+
+    def _ring(self, backend) -> list:
+        return [int(v) for v in backend._sm70_csa2.swa_ring[0].reshape(-1)]
+
+    def _pending(self, backend) -> int:
+        return int(backend._sm70_csa2.pending_kv[1][0])
+
+    def test_stop_on_a_draft_cuts_the_verify_image_to_the_pin(self):
+        # Prompt 10; one verify publishes positions 10..13; the request
+        # stopped at position 11, so the pin is 12.
+        target = _Backend(_RingState())
+        draft = _Backend(_RingState(pending=False))
+        backends = [target, draft]
+        target._sm70_csa2.extend(0, 10)
+        draft._sm70_csa2.extend(0, 10)
+        csa2_finish_forward(backends, 10, from_extend=True)
+        csa2_prepare_decode(backends)
+        target._sm70_csa2.verify(10, 4)
+        draft._sm70_csa2.verify(10, 4)
+        csa2_finish_forward(backends, 14, from_extend=False, start=10)
+        csa2_prepare_extend(backends, 12)
+        want = _RingState().window(12)
+        self.assertEqual(self._ring(target), want)
+        self.assertEqual(self._ring(draft), want)
+        self.assertEqual(self._pending(target), 11)
+        store = target._csa2_boundary
+        self.assertEqual(store.resident_end, 12)
+        self.assertIn(12, store.history)
+        self.assertNotIn(14, store.history)
+
+    def test_overlap_step_after_the_stop_is_cut_too(self):
+        # The stop step publishes 10..12 (stop at 11, pin 12); the overlap
+        # loop's extra step publishes 13..14 before the pin lands.
+        target = _Backend(_RingState())
+        backends = [target]
+        target._sm70_csa2.extend(0, 10)
+        csa2_finish_forward(backends, 10, from_extend=True)
+        csa2_prepare_decode(backends)
+        target._sm70_csa2.verify(10, 3)
+        csa2_finish_forward(backends, 13, from_extend=False, start=10)
+        target._sm70_csa2.verify(13, 2)
+        csa2_finish_forward(backends, 15, from_extend=False, start=13)
+        csa2_prepare_extend(backends, 12)
+        self.assertEqual(self._ring(target), _RingState().window(12))
+        self.assertEqual(self._pending(target), 11)
+        self.assertEqual(target._csa2_boundary.resident_end, 12)
+
+    def test_pin_at_an_earlier_verify_image_restores_it(self):
+        target = _Backend(_RingState())
+        backends = [target]
+        target._sm70_csa2.extend(0, 10)
+        csa2_finish_forward(backends, 10, from_extend=True)
+        csa2_prepare_decode(backends)
+        target._sm70_csa2.verify(10, 3)
+        csa2_finish_forward(backends, 13, from_extend=False, start=10)
+        target._sm70_csa2.verify(13, 1)
+        csa2_finish_forward(backends, 14, from_extend=False, start=13)
+        csa2_prepare_extend(backends, 13)
+        self.assertEqual(self._ring(target), _RingState().window(13))
+        self.assertEqual(self._pending(target), 12)
+
+    def test_cut_then_spill_writes_the_pin_image(self):
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            remember,
+            request_load,
+            request_spill,
+            reset_handoff,
+            session_key,
+        )
+
+        target = _Backend(_RingState())
+        backends = [target]
+        target._sm70_csa2.extend(0, 10)
+        csa2_finish_forward(backends, 10, from_extend=True)
+        csa2_prepare_decode(backends)
+        target._sm70_csa2.verify(10, 4)
+        csa2_finish_forward(backends, 14, from_extend=False, start=10)
+        ids = list(range(12))
+        key = session_key(ids, None, None)
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(tempfile.mkdtemp())
+        try:
+            remember(key, ids, [10, 12], None, None)
+            reset_handoff()
+            request_spill(key)
+            csa2_prepare_extend(backends, 0)
+            target._sm70_csa2.swa_ring[0].fill_(7)
+            target._sm70_csa2.pending_kv[1].fill_(7)
+            request_load(key)
+            csa2_prepare_extend(backends, 12)
+            self.assertEqual(self._ring(target), _RingState().window(12))
+            self.assertEqual(self._pending(target), 11)
+            self.assertEqual(target._csa2_boundary.resident_end, 12)
+        finally:
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            reset_handoff()
+
+    def test_image_len_reports_the_newest_tip(self):
+        target = _Backend(_RingState())
+        backends = [target]
+        target._sm70_csa2.extend(0, 10)
+        csa2_finish_forward(backends, 10, from_extend=True)
+        self.assertEqual(csa2_image_len(), 10)
+        csa2_prepare_extend(backends, 0)
+        self.assertIsNone(csa2_image_len())

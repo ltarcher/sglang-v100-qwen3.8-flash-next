@@ -12,8 +12,7 @@ Two schemas are recognized today:
   ``indexer_budget``/``indexer_compress_ratio``.
 - ``tokenwise`` (qsa_0511 / Qwen3.5-DSA): per-token indexing, carrying
   ``index_topk``/``index_n_heads``/``index_kv_heads``/``index_head_dim``.
-  Only the profile is recognized here; the tokenwise indexer/pool land in a
-  later stage.
+  The indexer is ``QwenDSAIndexer`` and the pool is ``QwenDSATokenToKVPool``.
 
 DeepSeek NSA configs also expose ``index_topk``, so the tokenwise schema is
 additionally gated on a Qwen ``model_type`` to keep DeepSeek draft creation

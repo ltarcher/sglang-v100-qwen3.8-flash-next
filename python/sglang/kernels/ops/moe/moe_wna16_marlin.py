@@ -50,7 +50,7 @@ _sm70_marlin_user_tuning = any(
 )
 _sm70_marlin_tuning_stage = None
 
-# WO-13 D6 sweep (scripts/dsv41_sm70_marlin_decode_sweep.py, 2026-09-16):
+# Decode sweep (scripts/dsv41_sm70_marlin_decode_sweep.py, 2026-09-16):
 # auto (packed_macro_n=256 default 32x256x32x4x32x64x32 sk=1) was 588/274 us
 # for w13/w2. Exact-match winner for both GEMMs is 32x128x32x4x32x32x32 sk=1
 # (~390/184 us eager, 1.29x as a captured pair). split_k=4 is ~9 us faster

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// WO-13 D6-d: fuse mHC mix_stats + Sinkhorn, and optionally combine, on SM70.
+// Fuse mHC mix_stats + Sinkhorn, and optionally combine, on SM70.
 // Same numerics as the three unfused kernels (mix CTA tree, sequential Sinkhorn,
 // sequential k=0..3 combine). Reads x once when combine is fused in.
 #include <sgl_kernel/tensor.h>

@@ -112,7 +112,7 @@ Overriding them is the most common cause of a disappointing measurement: it leav
 
 Volta has no FlashMLA / MXFP4-on-SM90 path, so this shape is a source build (`scripts/serve_dsv41_v100.sh`) rather than the preview Docker cells above. The Deploy panel does not emit it.
 
-Best measured single-user setup on 8×V100-SXM2-32GB: **DSpark on**, **sticky last-sequence prompt cache** (radix stays off), **256k context**, chunked prefill 2048, `np=1`. Coding-trace wall is about **8 tok/s** at temperature 0 (accept length ~4.5–6, α ~5.9). Open-ended chat at the server default temperature 1 is closer to **3 tok/s** (accept length ~2). Prefill is about **1.0–1.2k tok/s** at 8k. Do not tune `--speculative-dspark-block-size`; the checkpoint is γ=5.
+Best measured single-user setup on 8×V100-SXM2-32GB: **DSpark on**, **sticky last-sequence prompt cache** (radix stays off), **256k context**, chunked prefill 2048, `np=1`. Coding decodes at about **11 tok/s** at temperature 0 and **10 tok/s** at temperature 1 / top_p 0.95 (4.5–6 tokens accepted per step). Free prose accepts 2.5–3.5 per step and runs at roughly two thirds of that. A suffix that was never computed prefills at about **300 tok/s**; a 300–700-token follow-up turn reaches its first token in 2.3–3.3 s. Do not tune `--speculative-dspark-block-size`; the checkpoint is γ=5.
 
 <Accordion title="8×V100 launch (source)">
 
@@ -126,7 +126,7 @@ bash scripts/serve_dsv41_v100.sh
 
 </Accordion>
 
-The script pins the rest: `--speculative-algorithm DSPARK` against the same checkpoint, `--attention-backend dsv4`, `--moe-runner-backend marlin`, `--mem-fraction-static 0.88`, spill 13 GiB / landing 36, `--disable-radix-cache`, `--disable-prefill-cuda-graph`, `--max-running-requests 1`, `--language-model-only`, Tree NCCL, `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`.
+The script pins the rest: `--speculative-algorithm DSPARK` against the same checkpoint, `--attention-backend dsv4`, `--moe-runner-backend marlin`, `--mem-fraction-static 0.87`, spill 13 GiB / landing 36, `--disable-radix-cache`, `--disable-prefill-cuda-graph`, `--disable-overlap-schedule`, `--max-running-requests 1`, Tree NCCL, `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -145,7 +145,7 @@ The script pins the rest: `--speculative-algorithm DSPARK` against the same chec
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Prompt cache</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>sticky last-seq</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Exact full-history continuation only. Partial prefix misses. Do not call `/health` (it drops the pin). Do not enable `--enable-streaming-session`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Exact continuation, or a shorter prefix saved at a chunk or request stop. Anything else prefills from 0. `/health` is a liveness probe and keeps the pin. Do not enable `--enable-streaming-session`.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
@@ -156,6 +156,11 @@ The script pins the rest: `--speculative-algorithm DSPARK` against the same chec
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Sampling</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>temp=0 for code</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Highest DSpark accept. Reasoning evals on other cards used temp=1.0 / top_p=0.95 — expect the slower chat band here.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Overlap scheduler</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>off</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Each DSpark step waits on the host for its accepted length, so overlap hides nothing and adds one verify step (~0.55 s) before the first token and after the last.</td>
     </tr>
   </tbody>
 </table>
@@ -190,7 +195,7 @@ print("Answer:", msg.content)
 
 </Accordion>
 
-On the request, `reasoning_effort` accepts the tiers `low`, `high`, `xhigh` and `max`, or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
+On the request, `reasoning_effort` accepts the tiers `low` (50), `high` (75), `xhigh` (75), and `max` (100), or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high` (75), and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
 
 ### 3.2 Tool Calling
 
@@ -257,6 +262,6 @@ To enable HiCache, open the **HiCache** card in the [Playground above](#playgrou
 
 The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
 
-The card is not offered on MI350X: the ROCm recipes run `--disable-radix-cache`, and the server rejects that alongside `--enable-hierarchical-cache`.
+The card is not offered on MI350X: hierarchical cache has not been validated on ROCm for this model yet.
 
 Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).

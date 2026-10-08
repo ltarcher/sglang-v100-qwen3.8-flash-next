@@ -1,4 +1,4 @@
-"""FP16 projections for measured two/four-token Qwen verification shapes."""
+"""FP16 projections for two- to four-token verification rows."""
 
 import torch
 
@@ -69,6 +69,11 @@ def _module(rows, threads, lanes):
 
 def linear(x, weight):
     threads, lanes = _CONFIGS[(x.shape[0], *weight.shape)]
+    return linear_with(x, weight, threads, lanes)
+
+
+def linear_with(x, weight, threads, lanes):
+    """x has 2-4 rows; threads per block and lanes per output are explicit."""
     out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     _module(x.shape[0], threads, lanes).run(x, weight, out)
     return out

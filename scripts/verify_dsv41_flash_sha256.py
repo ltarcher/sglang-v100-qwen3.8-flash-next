@@ -13,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 
-MODEL = Path(os.environ.get("MODEL_PATH", "$HOME/models/DeepSeek-V4.1-Flash"))
+MODEL = Path(os.environ.get("MODEL_PATH", os.path.expanduser("~/models/DeepSeek-V4.1-Flash")))
 TREE = MODEL / ".cache/huggingface/trees/dba1be0a40aa45a94ad051997016db3960a90277.json"
 SUMS = MODEL / "SHA256SUMS"
 GOT = MODEL / "SHA256SUMS.got"

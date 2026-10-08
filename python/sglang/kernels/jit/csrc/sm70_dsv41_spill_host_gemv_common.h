@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Shared mailbox for WO-13 D4-H host GEMV.
+// Shared mailbox for the spilled-expert host GEMV.
 #pragma once
 
 #include <cstdint>

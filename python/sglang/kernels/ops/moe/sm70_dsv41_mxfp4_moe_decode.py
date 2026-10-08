@@ -1,4 +1,4 @@
-"""WO-13 D6: SM70 MXFP4 MoE decode GEMV (DeepSeek-V4.1-Flash, M<=4).
+"""SM70 MXFP4 MoE decode GEMV (DeepSeek-V4.1-Flash, M<=4).
 
 Consumes marlin_v100 packed MXFP4 + logical UE8M0. Not NVFP4 decode.
 """
@@ -92,6 +92,8 @@ def sm70_dsv41_mxfp4_moe_decode_eligible(
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    apply_router_weight_on_input: bool = False,
+    no_combine: bool = False,
 ) -> bool:
     """True iff the DSV4.1 Flash decode GEMV can replace Marlin for this call."""
     if not sm70_dsv41_mxfp4_moe_decode_available():
@@ -127,6 +129,8 @@ def sm70_dsv41_mxfp4_moe_decode_eligible(
     if w13_bias is not None or w2_bias is not None:
         return False
     if not is_gated or activation != "silu":
+        return False
+    if apply_router_weight_on_input or no_combine:
         return False
     if gate_up_input_scale != 1.0 or wide_output_scale != 1.0:
         return False

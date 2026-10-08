@@ -1,4 +1,4 @@
-"""WO-12/13: 8×V100 hierarchical 2-step AR/A2A rank partition and A2A packing."""
+"""8×V100 hierarchical 2-step AR/A2A rank partition and A2A packing."""
 
 from __future__ import annotations
 

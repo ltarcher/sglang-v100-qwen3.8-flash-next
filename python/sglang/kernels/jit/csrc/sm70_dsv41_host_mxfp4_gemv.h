@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// WO-13 D4-H: CPU MXFP4 GEMV (marlin_v100 packed) + worker pool.
+// CPU MXFP4 GEMV (marlin_v100 packed) + worker pool.
 // Compiled as host C++ (-O3 -march=native), not nvcc.
 #pragma once
 

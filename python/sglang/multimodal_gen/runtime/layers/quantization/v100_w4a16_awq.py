@@ -13,11 +13,11 @@ can use the same runtime layout, but producing one is a separate offline step.
 from __future__ import annotations
 
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+from sglang.kernels.sm70_paths import sm70_prebuilt
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -36,9 +36,7 @@ _AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 
 @lru_cache(maxsize=1)
 def _load_sm70_awq_ops():
-    extension = (
-        Path(__file__).resolve().parents[4] / "jit_kernel" / "_sm70_turbomind_v100.so"
-    )
+    extension = sm70_prebuilt("_sm70_turbomind_v100.so")
     if not extension.is_file():
         return None
     try:
@@ -210,6 +208,15 @@ class V100W4A16AWQLinearMethod(LinearMethodBase):
         layer._v100_awq_prepared = False
         layer._v100_awq_prepared_in_place = False
 
+        # The text projection's output exceeds fp16 on real prompts. Keep a
+        # dense fp32 copy so that one GEMM is not saturated to the fp16 max.
+        if str(getattr(layer, "prefix", "")).endswith("condition_proj"):
+            layer.register_buffer(
+                "_v100_fp32_weight",
+                self._dequantize_checkpoint_weight(layer).float().contiguous(),
+                persistent=False,
+            )
+
         # With a resident DiT the source tensor is already CUDA-resident, so
         # convert immediately and discard the checkpoint layout.  Offloaded
         # components retain it and lazily cache the converted tensors as
@@ -279,7 +286,18 @@ class V100W4A16AWQLinearMethod(LinearMethodBase):
             raise RuntimeError(
                 "v100_w4a16_awq weights were used before post-load quantization"
             )
-        x = x.to(torch.float16)
+        fp32_weight = getattr(layer, "_v100_fp32_weight", None)
+        if fp32_weight is not None:
+            return F.linear(
+                x.float(),
+                fp32_weight,
+                None if bias is None else bias.float(),
+            )
+        if x.dtype != torch.float16:
+            # Values past the fp16 range become inf under a raw cast, and an
+            # inf activation turns the packed GEMM into NaNs.
+            limit = torch.finfo(torch.float16).max
+            x = x.clamp(min=-limit, max=limit).to(dtype=torch.float16)
         if bias is not None and bias.dtype != torch.float16:
             bias = bias.to(torch.float16)
 

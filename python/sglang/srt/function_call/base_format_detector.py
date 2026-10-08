@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -13,10 +14,9 @@ try:
     try:
         from xgrammar import get_model_structural_tag
     except ImportError:
-        # XGrammar 0.1.32 (the version pinned by this repository) renamed the
-        # model-tag helper and its Qwen Coder model key, and removed the
-        # tool_choice argument. Keep SGLang's stable detector API while
-        # preserving required/named tool-choice semantics.
+        # XGrammar 0.1.x names the model-tag helper get_builtin_structural_tag,
+        # uses other model keys and has no tool_choice argument. Keep SGLang's
+        # stable detector API while preserving required/named tool-choice semantics.
         from xgrammar import get_builtin_structural_tag
 
         def get_model_structural_tag(
@@ -99,6 +99,52 @@ try:
 except ImportError:
     StructuralTag = Any
     get_model_structural_tag = None
+
+# XGrammar >= 0.2.7 caps these tool-call formats at one call when
+# parallel_tool_calls=False.
+_TOOL_DISPATCH_FORMATS = (
+    "triggered_tags",
+    "token_triggered_tags",
+    "tags_with_separator",
+)
+
+
+def _stop_after_first_call(value: Any) -> None:
+    if isinstance(value, dict):
+        if value.get("type") in _TOOL_DISPATCH_FORMATS:
+            value["stop_after_first"] = True
+        for child in value.values():
+            _stop_after_first_call(child)
+    elif isinstance(value, list):
+        for child in value:
+            _stop_after_first_call(child)
+
+
+def _with_parallel_tool_calls(get_tag):
+    # Workaround for XGrammar < 0.2.7, which rejects parallel_tool_calls;
+    # drop once requirements.txt pins >= 0.2.7. Harmony keeps the parallel tag,
+    # because there the cap would also forbid ordinary messages.
+    def get_tag_with_parallel_tool_calls(*, parallel_tool_calls: bool = True, **kwargs):
+        structural_tag = get_tag(**kwargs)
+        if (
+            parallel_tool_calls
+            or structural_tag is None
+            or kwargs.get("model") == "harmony"
+        ):
+            return structural_tag
+        payload = structural_tag.model_dump()
+        _stop_after_first_call(payload)
+        return StructuralTag.model_validate(payload)
+
+    return get_tag_with_parallel_tool_calls
+
+
+if (
+    get_model_structural_tag is not None
+    and "parallel_tool_calls"
+    not in inspect.signature(get_model_structural_tag).parameters
+):
+    get_model_structural_tag = _with_parallel_tool_calls(get_model_structural_tag)
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
@@ -454,6 +500,9 @@ class BaseFormatDetector(ABC):
         constraints and parse the model's native output format instead."""
         return False
 
+    def get_required_tool_parser(self, tool_choice):
+        return None
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """
@@ -491,10 +540,8 @@ class BaseFormatDetector(ABC):
                 (the typical case when --reasoning-parser is configured) so
                 only one layer constrains the reasoning section.
             parallel_tool_calls: Whether multiple tool calls may appear in one
-                assistant response. xgrammar's get_model_structural_tag does
-                not expose this knob, so this base implementation ignores it;
-                only detectors that build their own tags (e.g. Kimi K3)
-                honor it.
+                assistant response. Forwarded to XGrammar to constrain the
+                number of tool calls in the generated structural tag.
 
         Returns:
             StructuralTag if this detector supports model-native tags, otherwise None
@@ -514,6 +561,7 @@ class BaseFormatDetector(ABC):
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
     def get_auto_tool_call_structural_tag(

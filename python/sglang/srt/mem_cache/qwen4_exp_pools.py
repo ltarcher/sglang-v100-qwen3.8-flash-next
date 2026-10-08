@@ -160,8 +160,10 @@ class Qwen4ExpReqToTokenPool(HybridReqToTokenPool):
     ) -> None:
         self.ngram_pool.set_context(ngram_indices, context)
 
-    def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
-        self.ngram_pool.set_intermediate_context(context)
+    def set_ngram_intermediate_context(
+        self, context: torch.Tensor, indices: Optional[torch.Tensor] = None
+    ) -> None:
+        self.ngram_pool.set_intermediate_context(context, indices)
 
     def clear(self):
         super().clear()

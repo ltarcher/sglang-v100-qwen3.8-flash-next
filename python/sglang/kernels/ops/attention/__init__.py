@@ -184,7 +184,6 @@ for _mod, _fn in [
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
-    ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
 ]:
     register_kernel(
         KernelSpec(
@@ -235,3 +234,191 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+for _mod, _fn, _backend, _device in [
+    ("attn_res", "attn_res_fused_tma", KernelBackend.JIT, CapabilityRequirement.CUDA),
+    (
+        "attn_res",
+        "attn_res_fused_pull_rs",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "attn_res",
+        "attn_res_fused_direct_ag",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
+    (
+        "mla_output_gate",
+        "kimi_k3_mla_output_gate",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "kda_decode_mtp",
+        "fused_kda_decode_mtp_dspark",
+        KernelBackend.CUTE_DSL,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "kda_flydsl.kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "kda_flydsl.kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=_backend,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({_device}),
+        )
+    )
+del _mod, _fn, _backend, _device
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="attention.get_block_table",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_kpool_topk_transform_fused",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.fast_topk:fast_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.deep_select_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.deep_select:topk",
+        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((9, 0), (10, 0), (10, 3))
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope_store",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope_store",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_rope_wo_a_bf16",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp4_index_logits_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.fp4_indexer:fp4_index_logits_decode",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.kda_sm70_recurrent",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.kda_sm70:kda_sm70_recurrent",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16",),
+            description="K=V=128 fp16 KDA recurrence, fp32 state",
+        ),
+        description="SM70 KDA decode and extend. Safe gate and softplus gate.",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp8_mqa_logits_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.mqa_logits_sm70:fp8_mqa_logits_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        description="SM70 ragged indexer score. Software E4M3FN, fp32 accumulation.",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp8_paged_mqa_logits_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.mqa_logits_sm70:fp8_paged_mqa_logits_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        description="SM70 paged indexer score. Fused 64-token fp8 pages.",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.sparse_mla_sm70",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.sparse_mla_sm70:sparse_mla_sm70",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(7, 0), max_sm=(7, 0))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16",),
+            description="NoPE latent 512 fp16 sparse MLA",
+        ),
+        description="SM70 sparse MLA. Indexer-selected rows, fp32 softmax.",
+    )
+)
+
+for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.fp4_indexer:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn

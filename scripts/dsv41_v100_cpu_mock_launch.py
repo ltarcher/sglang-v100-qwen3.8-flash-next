@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""WO-3 CPU-mock launch for DeepSeek-V4.1-Flash on 8×V100.
+"""CPU-mock launch for DeepSeek-V4.1-Flash on 8×V100.
 
 Does not allocate Engram tables or load shards. Exit 1 = budget, 2 = NUMA,
 3 = SM90 import, 4 = config/remap. 0 = v1 shape is selected.
 
-    PYTHONPATH=python $HOME/sglang-v100-venv/bin/python \\
+    PYTHONPATH=python python \\
       scripts/dsv41_v100_cpu_mock_launch.py
 """
 
