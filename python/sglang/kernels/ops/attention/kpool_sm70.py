@@ -278,6 +278,10 @@ def kpool_decode_update_and_maybe_write_cache_sm70(
     _require_sm70(key, "kpool_decode_update_and_maybe_write_cache")
     if key.shape[0] == 0:
         return
+    # Same shared-dtype matcher contract as verify_write: key is bf16, the
+    # gate score is computed in the model dtype.
+    if slot_score.dtype != key.dtype:
+        slot_score = slot_score.to(key.dtype)
     _module().decode_update(
         buf,
         tail_k,
@@ -316,6 +320,11 @@ def kpool_write_tail_and_maybe_compress_sm70(
     _require_sm70(key, "kpool_write_tail_and_maybe_compress")
     if key.shape[0] == 0:
         return
+    # The verify_write matcher binds one shared dtype across key and score;
+    # key arrives bf16 (compress-kernel contract) while the gate score is
+    # computed in the model dtype, so align it before the call.
+    if score.dtype != key.dtype:
+        score = score.to(key.dtype)
     if effective_n_per_batch is None:
         effective_n_per_batch = torch.empty(0, dtype=torch.int32, device=key.device)
     _module().verify_write(
