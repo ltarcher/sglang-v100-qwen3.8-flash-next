@@ -584,13 +584,11 @@ def _u2_cache_open() -> _U2LayerCache | None:
     if _U2_CACHE_HANDLE is not None:
         return None if _U2_CACHE_HANDLE.dead else _U2_CACHE_HANDLE
     try:
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
+        from sglang.srt.runtime_context import get_parallel
 
-        rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        parallel = get_parallel()
+        rank = parallel.tp_rank
+        tp_size = parallel.tp_size
         model_path = _u2_cache_model_path()
         stage_dir = envs.SGLANG_SM70_U2_STAGE_DIR.get() or tempfile.gettempdir()
         root = os.path.join(stage_dir, "u2_cache")
