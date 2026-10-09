@@ -2260,7 +2260,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if self.device_capability == (7, 0):
+        # SGLANG_SM70_PREFILL_TRITON routes genuine prefill extends back to the
+        # tilelang sparse kernel: the CUDA sparse_mla_sm70 kernel loses ~3.9x
+        # to tilelang main_kernel at chunked-prefill batch sizes (8k wall
+        # 1745 -> 1130 tok/s measured on 4x V100), while it wins decode-shaped
+        # target-verify, which stays on this branch unconditionally.
+        if self.device_capability == (7, 0) and not (
+            envs.SGLANG_SM70_PREFILL_TRITON.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             if attn_sink is not None:
                 raise RuntimeError("SM70 sparse MLA does not support attention sinks")
             return self._forward_sm70_sparse_mla(
@@ -2268,12 +2276,11 @@ class DeepseekSparseAttnBackend(
             )
 
         if dsa_impl == "tilelang":
-            if q_rope is not None:
-                # Cat-skip, as in forward_decode: q_rope=None means the caller
-                # already handed us the concatenated form and q_all is a
-                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
-                if q_all is None or not _is_hip:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            # Cat-skip, as in forward_decode: q_rope=None means the caller
+            # already handed us the concatenated form and q_all is a
+            # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
+            if q_all is None or not _is_hip:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             out = self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,

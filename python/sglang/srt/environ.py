@@ -1472,12 +1472,14 @@ class Envs:
     # debugging the kernel's numerics.
     SGLANG_SM70_DISABLE_MARLIN_MOE = EnvBool(False)
 
-    # Run the linear-attention (KDA extend + indexer kpool) prefill on the
-    # Triton kernels while decode/target-verify stay on the CUDA sm70 family.
-    # The CUDA extend regressed 8k prefill ~35% on V100 (decode +35% retained);
-    # the Triton chunk kernels compute fp32 and store in the ssm pool dtype, so
-    # the fp32 ssm_states the CUDA decode/verify ops require is untouched.
-    # 0 restores the all-CUDA prefill for A/B.
+    # Run the sm70 prefill on the Triton/TileLang kernels (KDA extend, indexer
+    # kpool write, and the DSA sparse-attention extend) while decode and
+    # target-verify stay on the CUDA sm70 family. The merged CUDA extends
+    # regressed 8k prefill ~35% on V100 (sparse_mla_sm70 loses ~3.9x to
+    # tilelang main_kernel at chunked-prefill batch sizes; decode +35%
+    # retained). The Triton chunk kernels compute fp32 and store in the ssm
+    # pool dtype, so the fp32 ssm_states the CUDA decode/verify ops require is
+    # untouched. 0 restores the all-CUDA prefill for A/B.
     SGLANG_SM70_PREFILL_TRITON = EnvBool(True)
 
     SGLANG_SM70_QWEN_FUSIONS = EnvBool(False)
