@@ -2342,6 +2342,14 @@ vs 1213 tok/s(+10.3%)**;decode 两形态同带(76±8)。质量门:needle 5/5
 跨口径数字不可混比;nvidia checkpoint 的 native 贪心 needle 是回声环
 (checkpoint 属性),质量门用 chat 默认采样。
 
-**残留**:vs pre-merge 1745 仍 -23%,不在内核选择(候选:fp32 SSM 写回×2
-字节、跨日机器漂移;同日硬对照只有 1337/1213),待 fp32 池下可用的 profiler
-再追(torch profiler 现状:任何 activities 组合拖慢 ~20 倍)。
+**残留已闭合(2026-10-09 晚,commit 585a95f0e9)**:-23% 的主体就是内核选择,
+上一段的"不在内核选择"归因作废。torch profiler 独占机 + 单请求下可用(6.59s
+vs 5.00s,非在役 ~20 倍膨胀),trace 对比抓到真凶:合并的 SM70 分支在
+forward_extend 无条件劫持 DSA 稀疏注意力 prefill(绕过 `--dsa-prefill-backend
+tilelang`),`sparse_mla_sm70_kernel` 1597ms/请求 vs tilelang `main_kernel`
+414ms(+1183ms = 全部差距);次因 kpool_topk_transform<512> 翻倍(60.5 vs
+27.8ms)。修复 = SM70 劫持分支挂 `SGLANG_SM70_PREFILL_TRITON` 门 + 
+`is_extend_without_speculative()`(prefill 落回 tilelang dispatch;verify/
+draft-extend 恒 CUDA 保 +35% decode)。复测:prefill 8k 中位 **1722 tok/s**
+(pre-merge 探针同协议 1734,恢复)、decode 同带、needle 5/5、tools PASS。
+u2 指纹未变,池缓存零成本。
