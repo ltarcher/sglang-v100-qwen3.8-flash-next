@@ -637,6 +637,7 @@ class DefaultModelLoader(BaseModelLoader):
         resolved_source: Optional[ResolvedSource] = None,
         startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
+        model: Optional[nn.Module] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -688,9 +689,13 @@ class DefaultModelLoader(BaseModelLoader):
             # load_weights will consume lets the iterator skip every other
             # tensor before it is read from the shard. The predicate must be
             # a superset of what load_weights consumes, or boot fails loudly
-            # on a missing weight.
-            keep_checkpoint_name = getattr(
-                get_model(), "keep_checkpoint_weight_name", None
+            # on a missing weight. Consulted on the model instance under
+            # load -- get_model() is the ServerArgs projection bag and never
+            # carries model methods.
+            keep_checkpoint_name = (
+                getattr(model, "keep_checkpoint_weight_name", None)
+                if model is not None
+                else None
             )
             skip_key = (
                 None
@@ -806,13 +811,13 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, model=model)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, model=model)
 
     def resolve_model_weights(
         self,
@@ -942,6 +947,7 @@ class DefaultModelLoader(BaseModelLoader):
                     resolved_source=resolved_source,
                     startup_prefetch_started=True,
                     startup_prefetch_active=startup_prefetch_active,
+                    model=model,
                 )
 
         with set_default_torch_dtype(model_config.dtype):
