@@ -1140,8 +1140,13 @@ def safetensors_weights_iterator(
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
     read_tensor=None,
+    skip_key: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    `skip_key`, when given, drops keys before their tensors are materialized:
+    skipped keys are never read from the shard nor yielded.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1163,10 +1168,14 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
+                    if skip_key is not None and skip_key(name):
+                        continue
                     yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if skip_key is not None and skip_key(name):
+                        continue
                     tensor = _tensor_from_safetensors_handle(f, name, read_tensor)
                     if tensor is None:
                         continue
@@ -1242,12 +1251,16 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
     read_tensor=None,
+    skip_key: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
-    Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    Peak CPU RAM ~= (max_workers + 2) x shard_file_size.
+
+    `skip_key` drops keys inside `_load_file`, so skipped tensors are never
+    materialized on any worker thread.
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
@@ -1266,6 +1279,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 result = {}
                 for key in f.keys():
+                    if skip_key is not None and skip_key(key):
+                        continue
                     tensor = _tensor_from_safetensors_handle(f, key, read_tensor)
                     if tensor is None:
                         continue

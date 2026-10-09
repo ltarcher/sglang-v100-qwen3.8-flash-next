@@ -275,6 +275,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    # Cross-boundary contract: DefaultModelLoader consults this predicate
+    # before materializing any checkpoint tensor, so it must stay a superset
+    # of what load_weights consumes below (the two embed names plus every
+    # name containing "mtp"); anything filtered here never reaches the loop.
+    _LOADER_KEEP_WEIGHT_NAMES = (
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+    )
+
+    def keep_checkpoint_weight_name(self, name: str) -> bool:
+        return "mtp" in name or name in self._LOADER_KEEP_WEIGHT_NAMES
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):

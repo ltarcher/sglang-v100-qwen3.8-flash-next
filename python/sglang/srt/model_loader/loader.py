@@ -684,6 +684,20 @@ class DefaultModelLoader(BaseModelLoader):
                 get_model().weight_loader_drop_cache_after_load
             )
 
+            # Optional per-model hook: declaring the checkpoint keys that
+            # load_weights will consume lets the iterator skip every other
+            # tensor before it is read from the shard. The predicate must be
+            # a superset of what load_weights consumes, or boot fails loudly
+            # on a missing weight.
+            keep_checkpoint_name = getattr(
+                get_model(), "keep_checkpoint_weight_name", None
+            )
+            skip_key = (
+                None
+                if not callable(keep_checkpoint_name)
+                else lambda name: not keep_checkpoint_name(name)
+            )
+
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
             # active (mmap path, not FASTSAFETENSORS) and the user didn't
@@ -731,6 +745,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     read_tensor=read_tensor,
+                    skip_key=skip_key,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -740,6 +755,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     read_tensor=read_tensor,
+                    skip_key=skip_key,
                 )
 
         else:
