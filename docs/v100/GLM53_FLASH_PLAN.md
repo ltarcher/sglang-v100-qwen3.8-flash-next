@@ -2308,3 +2308,40 @@ CHAT_SYSTEM_SUFFIX 四护栏;chat 不传采样参数走 generation_config 默认
   实清 69.3G ×272,`u2_cache/<活指纹>/` 绝不可删(缓存不可在位重建,L.3)。
 - boot 后 Triton 内核新鲜加载(assign_draft_cache_locs_contiguous 等
   0.76GiB),生产形态可能预载,暂无碍。
+
+## 附录 M:SXM2 sync 合并回归与混合 prefill 形态(2026-10-09)
+
+合并 main(SXM2 sync,1fe071631d)→ 重建镜像 2af81401281b → nvidia GLM
+验证出 8 个回归,6 修 1 非回归 1 Qwen 侧:#1 u2 cache TP getter ImportError;
+#2 replayssm-spec arg hook 压 env;#3 sm70 KDA 换 CUDA 内核家族(kda_sm70 等,
+硬性要求 ssm_states fp32、verify 仅 per-step 快照)→ 摘 replayssm flag +
+`--mamba-ssm-dtype float32` env/CLI 双显式;#5 fused mHC post+pre tilelang
+硬编码 bf16 → sm70 强制回落 unfused;#6 kpool_sm70 key/score dtype 绑死 →
+wrapper 内对齐;#7 bench 口径伪影(max-tokens 钳制、runs>1 cache-hit);#8
+Qwen prefill CUDA graph 需 driver >12.4 → compose 补
+`--cuda-graph-backend-prefill disabled`。
+
+**形态交换代价(勿再当回归查)**:decode greedy +35%(bench 口径 74-82 →
+103-104 tok/s,CUDA verify 兑现)vs prefill 8k -35%(1745 → ~1130)。归因
+结构账:fp32 SSM 态带宽 <0.01%(34MB/卡)排除;锁定 KDA extend 与 kpool
+prefill 写的内核交换。
+
+### M.1 混合形态:SGLANG_SM70_PREFILL_TRITON(commit a1f8dd1597)
+
+decode/target-verify 保持 CUDA(保住 +35%),KDA extend 换回 TritonKDAKernel
++ indexer kpool prefill 三入口(softmax_rotate_write_cache / assemble /
+scatter_kpool_tail_updates,全在 `_compress_write_extend` 分支)回落 triton。
+数值:triton chunk_kda 全程 fp32 计算按池 dtype 写回(vs fp64 逐步裁判
+RMSE 0.05%/0.04%);kpool triton 写 vs torch 链**逐位一致**。
+
+同机同测法 A/B(7936 随机 ids ×9 取中位,urllib 单流 wall):**prefill 1337
+vs 1213 tok/s(+10.3%)**;decode 两形态同带(76±8)。质量门:needle 5/5
+逐案、RS tools 2/2。两个 GLM compose 均声明 `=1`,0 = 回全 CUDA(A/B 口)。
+
+**口径纪律**:decode 103-104 是 bench padding 口径,urllib 口径是 76±8——
+跨口径数字不可混比;nvidia checkpoint 的 native 贪心 needle 是回声环
+(checkpoint 属性),质量门用 chat 默认采样。
+
+**残留**:vs pre-merge 1745 仍 -23%,不在内核选择(候选:fp32 SSM 写回×2
+字节、跨日机器漂移;同日硬对照只有 1337/1213),待 fp32 池下可用的 profiler
+再追(torch profiler 现状:任何 activities 组合拖慢 ~20 倍)。
