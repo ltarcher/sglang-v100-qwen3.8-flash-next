@@ -68,8 +68,13 @@ def _load_sm70_cuda_decode_ops():
         return None
     from torch.utils.cpp_extension import load_inline
 
-    build_directory = os.environ.get(
-        "SGLANG_V100_DECODE_CUDA_BUILD_DIR", "/tmp/sglang_sm70_longctx_decode"
+    # Default lives under the home cache dir, not /tmp: a recreated container
+    # (or a tmpfiles clean) wipes /tmp and forces a ~2 min nvcc recompile on
+    # every boot. Same convention as SGLANG_SM70_GLM_NVFP4_BUILD_DIR.
+    build_directory = os.path.expanduser(
+        os.environ.get(
+            "SGLANG_V100_DECODE_CUDA_BUILD_DIR", "~/.cache/sglang/sm70_longctx_decode"
+        )
     )
     os.makedirs(build_directory, exist_ok=True)
     try:

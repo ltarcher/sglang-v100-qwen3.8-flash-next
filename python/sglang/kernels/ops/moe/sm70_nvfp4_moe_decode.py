@@ -46,8 +46,13 @@ def _load_sm70_nvfp4_moe_decode_ops():
 
     from torch.utils.cpp_extension import load_inline
 
-    build_directory = os.environ.get(
-        "SGLANG_V100_NVFP4_MOE_BUILD_DIR", "/tmp/sglang_sm70_nvfp4_moe"
+    # Default lives under the home cache dir, not /tmp: a recreated container
+    # (or a tmpfiles clean) wipes /tmp and forces a ~3 min nvcc recompile on
+    # every boot. Same convention as SGLANG_SM70_GLM_NVFP4_BUILD_DIR.
+    build_directory = os.path.expanduser(
+        os.environ.get(
+            "SGLANG_V100_NVFP4_MOE_BUILD_DIR", "~/.cache/sglang/sm70_nvfp4_moe"
+        )
     )
     os.makedirs(build_directory, exist_ok=True)
     try:
