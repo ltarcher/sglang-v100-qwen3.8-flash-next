@@ -209,12 +209,19 @@ class KDAKernelDispatcher:
                 Sm70KDAKernel,
             )
 
-            # Triton KDA is bf16. Volta runs the fp16 recurrence for decode,
-            # extend, and chain verify, including the safe gate.
+            # Volta runs the fp16 recurrence for decode and chain verify,
+            # including the safe gate. Extend follows
+            # SGLANG_SM70_PREFILL_TRITON (default): the Triton chunk_kda wins
+            # prefill by a wide margin at prefill batch sizes, and it computes
+            # fp32 internally and stores in the pool dtype, so the fp32
+            # ssm_states the CUDA decode/verify ops require is preserved.
             sm70_kernel = Sm70KDAKernel()
             self.decode_kernel = sm70_kernel
-            self.extend_kernel = sm70_kernel
             self.verify_kernel = sm70_kernel
+            if envs.SGLANG_SM70_PREFILL_TRITON.get():
+                self.extend_kernel = triton_kernel
+            else:
+                self.extend_kernel = sm70_kernel
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False

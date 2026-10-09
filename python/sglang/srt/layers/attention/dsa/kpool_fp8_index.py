@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -740,7 +741,16 @@ def kpool_softmax_rotate_write_cache(
     return_compressed: bool = False,
     write_cache: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    if slot_k.is_cuda and torch.cuda.get_device_capability(slot_k.device) == (7, 0):
+    # Extend-path pool write. The sm70 dispatch behind the kill-switch is the
+    # eager torch softmax/rotate/quantize chain; the Triton kernels below were
+    # the production path on Volta (they encode e4m3 as raw bytes) and win
+    # prefill by a wide margin, so SGLANG_SM70_PREFILL_TRITON=1 (default)
+    # falls through to them. Decode keeps its CUDA op either way.
+    if (
+        slot_k.is_cuda
+        and not envs.SGLANG_SM70_PREFILL_TRITON.get()
+        and torch.cuda.get_device_capability(slot_k.device) == (7, 0)
+    ):
         from sglang.kernels.ops.attention.kpool_sm70 import (
             kpool_softmax_rotate_write_cache_sm70,
         )
@@ -1392,7 +1402,11 @@ def kpool_assemble_softmax_rotate_write_cache(
     write_mask: torch.Tensor | None = None,
     round_scale: bool = False,
 ) -> None:
-    if chunk_k.is_cuda and torch.cuda.get_device_capability(chunk_k.device) == (7, 0):
+    if (
+        chunk_k.is_cuda
+        and not envs.SGLANG_SM70_PREFILL_TRITON.get()
+        and torch.cuda.get_device_capability(chunk_k.device) == (7, 0)
+    ):
         from sglang.kernels.ops.attention.kpool_sm70 import (
             kpool_assemble_softmax_rotate_write_cache_sm70,
         )
@@ -1477,7 +1491,11 @@ def scatter_kpool_tail_updates(
     chunk_src_start: torch.Tensor,
     n_write: torch.Tensor,
 ) -> None:
-    if chunk_k.is_cuda and torch.cuda.get_device_capability(chunk_k.device) == (7, 0):
+    if (
+        chunk_k.is_cuda
+        and not envs.SGLANG_SM70_PREFILL_TRITON.get()
+        and torch.cuda.get_device_capability(chunk_k.device) == (7, 0)
+    ):
         from sglang.kernels.ops.attention.kpool_sm70 import scatter_kpool_tail_updates_sm70
 
         scatter_kpool_tail_updates_sm70(

@@ -1471,6 +1471,15 @@ class Envs:
     # instead of the marlin_v100 tensor-core kernel. Reference path for
     # debugging the kernel's numerics.
     SGLANG_SM70_DISABLE_MARLIN_MOE = EnvBool(False)
+
+    # Run the linear-attention (KDA extend + indexer kpool) prefill on the
+    # Triton kernels while decode/target-verify stay on the CUDA sm70 family.
+    # The CUDA extend regressed 8k prefill ~35% on V100 (decode +35% retained);
+    # the Triton chunk kernels compute fp32 and store in the ssm pool dtype, so
+    # the fp32 ssm_states the CUDA decode/verify ops require is untouched.
+    # 0 restores the all-CUDA prefill for A/B.
+    SGLANG_SM70_PREFILL_TRITON = EnvBool(True)
+
     SGLANG_SM70_QWEN_FUSIONS = EnvBool(False)
     SGLANG_SM70_HC_NATIVE = EnvBool(True)
     SGLANG_SM70_MTP_HC = EnvBool(True)
