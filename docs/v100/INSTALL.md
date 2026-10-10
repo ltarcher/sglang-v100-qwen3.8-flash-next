@@ -350,6 +350,12 @@ docker compose -f docker/v100-compose.yaml run --rm glm53 bash          # a shel
 
 Arguments starting with `--` go to `python -m sglang.launch_server` directly.
 
+`docker/v100-compose-qwen38-mtp.yaml` is a standalone alternative for the
+Qwen3.8 MTP shape validated in production: it bypasses the serve script so
+every launch flag is explicit (KV pool at `--mem-fraction-static 0.92`, two
+running requests, port 8110, JIT caches pinned to the `sglang-v100-jit`
+volume), with the same image and per-argument rationale in comments.
+
 ---
 
 ## Troubleshooting

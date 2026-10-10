@@ -1,0 +1,179 @@
+# Standalone recommended deployment: Qwen3.8-Flash-Next NVFP4 on 4x V100-32G
+# (TP4) with MTP (EAGLE 3 steps / 4 draft tokens). Mirrors the flags validated
+# in production on the reference box (2026-10-10); rationale inline per
+# argument. Unlike docker/v100-compose.yaml this file bypasses the serve
+# scripts so that every launch flag is explicit; the bare-metal equivalent is
+# scripts/serve_qwen38_flash_next_nvfp4_v100.sh.
+#
+#   MODELS_DIR=/data/models docker compose -f docker/v100-compose-qwen38-mtp.yaml up -d
+#
+# Machine facts this file encodes:
+#  - One engine per box: the four GPUs have a single tenant. The server port
+#    defaults to 8110 (production pairs the number with its vLLM compose);
+#    override with QWEN38_PORT, GPUs with QWEN38_GPUS.
+#  - Reference box is PCIe-only (PXB/PIX topology, no NVLink) and runs driver
+#    550.54.15 (CUDA 12.4): NCCL must drop to PXB, custom all-reduce needs
+#    SGLANG_CUSTOM_AR_ALLOW_PCIE=1, and the prefill CUDA-graph backend must
+#    stay disabled (its capture uses driver APIs newer than 12.4 and dies with
+#    CUDA error 35). NVLink / newer-driver boxes may re-enable prefill graphs.
+#  - ~125G host RAM, no swap: the hierarchical cache (--hicache-*) needs
+#    ~134G and is omitted; the radix cache stays in the GPU pool, and the PLE
+#    n-gram tables (47.7 GiB) live on host pinned RAM via
+#    --ple-offload-embedding, never in VRAM.
+#
+# Boot time: the first boot pays JIT compilation (~10 min extra); later boots
+# restart in ~4.6 min with warm caches on the sglang-v100-jit volume
+# (2026-10-10, 4x V100 measured).
+
+services:
+  qwen38-mtp:
+    image: sglang-sxm2:latest
+    build:
+      context: ..
+      dockerfile: docker/v100.Dockerfile
+      network: host
+      args:
+        MAX_JOBS: ${MAX_JOBS:-}
+    container_name: sglang-sxm2-qwen38-mtp
+    restart: "no"            # read the logs on crash instead of crash-looping
+    cap_add:
+      - SYS_PTRACE           # py-spy boot profiling from inside the container
+    network_mode: bridge
+    ipc: host
+    environment:
+      # ---- interconnect (defaults fit NVLink; PCIe-only boxes set PXB/1) ----
+      NCCL_P2P_LEVEL: ${NCCL_P2P_LEVEL:-NVL}
+      SGLANG_CUSTOM_AR_ALLOW_PCIE: ${SGLANG_CUSTOM_AR_ALLOW_PCIE:-0}
+      SGLANG_CUSTOM_ALLREDUCE_ALGO: ${SGLANG_CUSTOM_ALLREDUCE_ALGO:-1stage}
+      # ---- SM70 runtime (same values as the serve script) ----
+      SGLANG_SM70_FORCE_FP16: "1"
+      SGLANG_SM70_DENSE_GEMV: "1"
+      SGLANG_SM70_QWEN_FUSIONS: "1"
+      SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS: "8192"
+      SGLANG_MAMBA_CONV_DTYPE: float16
+      SGLANG_MAMBA_SSM_DTYPE: float16
+      SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: "0"
+      SGLANG_NUMA_BIND_V2: "0"
+      SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      HF_HUB_OFFLINE: "1"    # local checkpoint, no hub probing
+      # ---- JIT caches must outlive container recreation ----
+      # The two legacy SM70 CUDA extensions and the sglang/kernels/jit kernel
+      # framework otherwise build into the container layer, so every recreate
+      # re-pays ~280s of cold compiles serialized across the 4 TP ranks by a
+      # build flock. Pointing all three at the volume makes every boot after
+      # the first warm (measured: CUDA-graph capture 164+122s -> 6.2+1.9s).
+      SGLANG_V100_DECODE_CUDA_BUILD_DIR: /root/sglang-v100-jit/ext/sm70_longctx_decode
+      SGLANG_V100_NVFP4_MOE_BUILD_DIR: /root/sglang-v100-jit/ext/sm70_nvfp4_moe
+      SGLANG_JIT_CACHE_DIR: /root/sglang-v100-jit/jit
+      CUDA_VISIBLE_DEVICES: ${QWEN38_GPUS:-0,1,2,3}
+    volumes:
+      - ${MODELS_DIR:-${HOME}/models}:/models:ro
+      - sglang-v100-jit:/root/sglang-v100-jit
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ports:
+      - "${QWEN38_PORT:-8110}:${QWEN38_PORT:-8110}"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:${QWEN38_PORT:-8110}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30m      # first boot pays the JIT compiles
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["/opt/venv/bin/python", "-m", "sglang.launch_server"]
+    command:
+      - --trust-remote-code
+      - --model-path
+      - /models/Qwen3.8-Flash-Next-NVFP4
+      - --served-model-name
+      - qwen38-flash-next-nvfp4
+      - --dtype
+      - float16
+      - --quantization
+      - modelopt_fp4
+      - --reasoning-parser
+      - auto
+      - --tool-call-parser
+      - auto
+      - --attention-backend
+      - tilelang_fa_v100
+      - --linear-attn-prefill-backend
+      - tilelang
+      - --linear-attn-decode-backend
+      - triton
+      - --kv-cache-dtype
+      - auto
+      - --tensor-parallel-size
+      - "4"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${QWEN38_PORT:-8110}"
+      # 0.92 sizes the KV pool at ~495K tokens (0.86 gave 327,360: one 262K
+      # request plus change, so two concurrent long requests did not fit).
+      # Sizing rule: +0.01 ~= +28K tokens (12.3 KB/token/rank, fp16, 12
+      # full-attention layers); 0.92 leaves ~2.8G runtime headroom, while 0.94
+      # would fit 2x262K but drops headroom to ~2.1G (mid-prefill OOM risk).
+      - --mem-fraction-static
+      - "0.92"
+      - --context-length
+      - "262144"
+      # Two running requests match the 0.92 pool (~247K tokens each); a third
+      # admitted request only queues behind a pool the scheduler cannot feed.
+      - --max-running-requests
+      - "2"
+      - --max-mamba-cache-size
+      - "20"
+      # 4096, not smaller: this engine is prefill-first with no mixed chunk,
+      # so running decoders stall for the whole chunk stream. 1024 measured
+      # prefill ~2049 tok/s vs ~3000 at 4096 while decode gained nothing —
+      # smaller chunks just lengthen the stall.
+      - --chunked-prefill-size
+      - "4096"
+      - --max-prefill-tokens
+      - "4096"
+      # See the driver note in the header: capture dies with CUDA error 35 on
+      # driver 550.54.15. Qwen never ran prefill graphs on this fork anyway.
+      - --cuda-graph-backend-prefill
+      - disabled
+      - --sleep-on-idle
+      # Decode graphs cover exactly the admitted batch sizes.
+      - --cuda-graph-max-bs-decode
+      - "2"
+      - --cuda-graph-bs-decode
+      - "1"
+      - "2"
+      - --mamba-radix-cache-strategy
+      - extra_buffer
+      - --mamba-full-memory-ratio
+      - "0.2"
+      - --enable-cache-report
+      - --enable-metrics
+      - --ple-offload-embedding
+      # ---- MTP: EAGLE 3 steps / topk 1 / 4 draft tokens ----
+      # The draft layer's fp8-block experts dequantize to fp16 at load time
+      # (SM70FP8BlockMoEDequantMethod), so TP4's 160-column split works
+      # despite the 128-block scale layout.
+      - --speculative-algorithm
+      - EAGLE
+      - --speculative-draft-model-path
+      - /models/Qwen3.8-Flash-Next-NVFP4
+      - --speculative-num-steps
+      - "3"
+      - --speculative-eagle-topk
+      - "1"
+      - --speculative-num-draft-tokens
+      - "4"
+
+volumes:
+  # Fixed name so ad-hoc `docker run` smokes reuse the same caches.
+  sglang-v100-jit:
+    name: sglang-v100-jit
