@@ -76,6 +76,36 @@ Cold prefill runs at 3,500 tok/s at 32k and 3,080 tok/s at 190k.
 | subagent 2, cold / turns 2–3 | 5.89 s / 403, 650 ms |
 | main | 550 ms |
 
+**Concurrency ladder (2026-10-12).** Docker deployment `docker-compose-sglang-v100-mtp-8110.yaml` (port 8110): 4× V100-SXM2-32GB, TP=4, MTP 3 steps / 4 draft tokens, `--mem-fraction-static 0.92`, FP16 KV, chunked prefill 4096, temperature 0, `ignore_eos`, 256 output tokens per request. Distinct-prompt N-way ladder: every tier flushes the radix cache, runs all N requests cold (full serial chunked prefill + decode), then a second round warm (radix fully hit, near-pure decode). Per-stream = completion tokens / wall of the whole round. Measured on image `sglang-v100-unified:latest` (PR #6, 7664d7df18); the pre-PR6 twin `regress-pre-pr6` (a8214f4998) reproduced the 2-way ladder exactly (cold curves identical, warm equal-or-better). The 4-way ladder was measured on PR #6 only.
+
+**2-way, `--max-running-requests 2`, decode graphs bs 1–2, KV pool 473,792 tokens:**
+
+| context | cold per-stream (aggregate) | warm per-stream (aggregate) |
+|---|---|---|
+| 8k | 24.8 (49.6) | 33.8 (67.7) |
+| 16k | 16.7 (33.3) | 66.7 (133.4) |
+| 32k | 8.9 (17.8) | 52.5 (105.0) |
+| 64k | 4.7 (9.5) | 60.1 (120.2) |
+| 128k | 2.4 (4.8) | 53.4 (106.8) |
+
+**4-way, `--max-running-requests 4`, decode graphs bs 1–4, KV pool 465,472 tokens:**
+
+| context | cold per-stream (aggregate) | warm per-stream (aggregate) |
+|---|---|---|
+| 8k | 14.8 (59.0) | 32.6 (130.3) |
+| 16k | 8.8 (35.1) | 42.0 (168.1) |
+| 32k | 4.5 (17.9) | 40.5 (162.0) |
+| 64k | 2.4 (9.7) | 48.7 (194.6) |
+| 96k | 1.6 (6.5) | 43.1 (172.3) |
+| 131k, 3 streams | 1.6 (4.7) | 29.2 (87.6) |
+
+Readings:
+
+- Cold columns measure admission, not decode. With mixed chunking off the engine is prefill-first: each arriving request's serial chunked prefill (~2,500 tok/s) holds the running decodes at zero steps, so cold wall ≈ N × context / 2,500 s and cold tok/s falls linearly with context. Warm decode is context-flat from 8k to 96k and scales near-linearly with concurrency (aggregate 68–133 at 2 streams, 130–195 at 4), accept length 2.1–2.9, zero retractions, decode CUDA graph active at bs 2 and 4.
+- `--enable-mixed-chunk` is not usable on this model: the first mixed batch trips a device-side assert in the fork's QSA sparse-attention metadata builder and poisons the CUDA context on all four ranks (tested and reverted).
+- PR #6 (req_to_token pool +4 rows, eager bs axis) is off the decode path: the pre-PR6 A/B showed identical cold curves and equal-or-better warm curves. What the +4 rows buys is 3×131k admission — all three requests in flight instead of queue-then-bunch (the author's fp8_e5m2 numbers are a different KV dtype and not comparable; see the `--kv-cache-dtype` row in the recipe table).
+- Measurement traps: a freshly booted container lazy-loads Triton kernels on first sight of a new shape (9–12 s stalls per kernel across all four ranks), which contaminates the first warm rounds — warm the engine up before measuring. Greedy output is not hash-stable across boots; compare throughput and task-level quality, never hashes.
+
 ## Reference recipe
 
 The wrapper is the supported entry. `mtp` is the recipe the numbers above were measured on.
