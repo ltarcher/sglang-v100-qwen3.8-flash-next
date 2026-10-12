@@ -1514,6 +1514,14 @@ class Envs:
     # Model or TP change auto-misses: the fingerprint covers config.json,
     # every weight file's size+mtime, the requant algorithm version and TP.
     SGLANG_SM70_U2_CACHE = EnvBool(False)
+    # Build-only companion to SGLANG_SM70_U2_CACHE: the cold boot releases
+    # each converted pool right after the persistent store instead of keeping
+    # it resident -- 43 layers x ~0.5 GiB/rank accumulates ~19 GiB on the
+    # build GPU and overflows a 32 GB V100 at the tail layers. The build boot
+    # must serve nothing: pair with --disable-cuda-graph and
+    # --skip-server-warmup, shut it down once the cache completes, and boot
+    # normally (cache hit) to serve.
+    SGLANG_SM70_U2_CACHE_BUILD_ONLY = EnvBool(False)
     # Route the u2 expert-pool GEMMs through sm70_u2_gemm_v2 (transposed-word
     # register-direct kernel, ~1.5x the CUTLASS-path u2 kernel on prefill
     # shapes) instead of moe_wna16_marlin_gemm. Boot-time contract: when set,

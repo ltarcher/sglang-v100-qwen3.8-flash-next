@@ -687,6 +687,25 @@ def _layer_pool_layout(layer: torch.nn.Module) -> dict:
     }
 
 
+def _u2_cache_build_only_release(layer: torch.nn.Module, device) -> None:
+    """Drop this layer's pool bindings to placeholders after a build store.
+
+    SGLANG_SM70_U2_CACHE_BUILD_ONLY boots exist only to populate the
+    persistent cache; keeping every converted pool resident overflows the
+    GPU at the tail layers. Placeholder bindings keep parameter identities
+    stable, and the boot never runs the expert kernels (no CUDA graph
+    capture, no warmup, no requests).
+    """
+    dummy_w = torch.empty(1, dtype=torch.int32, device=device)
+    dummy_s = torch.empty(1, dtype=torch.float16, device=device)
+    copy_or_rebind_param(layer, "w13_weight", dummy_w)
+    copy_or_rebind_param(layer, "w2_weight", dummy_w)
+    copy_or_rebind_param(layer, "w13_weight_scale", dummy_s)
+    copy_or_rebind_param(layer, "w2_weight_scale", dummy_s)
+    layer._u2_v2_words = False
+    _free_u2_staging(layer)
+
+
 def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
     """Requantize one FusedMoE layer's staged NVFP4 experts into the u2 pool.
 
@@ -728,6 +747,9 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
             device=device,
         )
         if pools is not None and _u2_pool_layout_ok(pools, pool_shapes):
+            if envs.SGLANG_SM70_U2_CACHE_BUILD_ONLY.get():
+                _u2_cache_build_only_release(layer, device)
+                return
             if use_v2:
                 w13_t, w2_t = _repack_pools_to_v2(layout, pools["w13"], pools["w2"])
                 if not _V2_SELFTEST_DONE:
@@ -842,6 +864,10 @@ def convert_moe_layer_to_u2(layer: torch.nn.Module) -> None:
             macro2=layout["macro2"],
             pools={"w13": pool_w13, "w2": pool_w2, "s13": pool_s13, "s2": pool_s2},
         )
+
+    if envs.SGLANG_SM70_U2_CACHE_BUILD_ONLY.get():
+        _u2_cache_build_only_release(layer, device)
+        return
 
     if use_v2:
         w13_t, w2_t = _repack_pools_to_v2(layout, pool_w13, pool_w2)
