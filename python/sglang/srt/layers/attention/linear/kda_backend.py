@@ -1053,12 +1053,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
+        # Verify consumers (conv, fused-chain, sm70 dispatcher) index one row per
+        # request and match the length against bs exactly; the persistent table is
+        # pool-sized (req_to_token headroom rows included), so hand out in-pool rows.
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
             cache_indices[: query_start_loc.shape[0] - 1] >= 0,
             self.req_to_token_pool.size,
-        )
+        )[: query_start_loc.shape[0] - 1]
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
