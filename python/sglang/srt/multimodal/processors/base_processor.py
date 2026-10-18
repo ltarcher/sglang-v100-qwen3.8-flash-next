@@ -771,6 +771,11 @@ class BaseMultimodalProcessor(ABC):
         Resolved from this processor's own ``server_args``: engines sharing a
         tokenizer process each carry their own ``base_gpu_id``.
         """
+        if envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get():
+            # Preprocessing runs in the launcher next to a static pool sized to
+            # the serving device; its resize/stack temporaries must not land
+            # there (same switch as the Kimi-K2.5 GPU decode path).
+            return "cpu"
         server_args = self.server_args
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"

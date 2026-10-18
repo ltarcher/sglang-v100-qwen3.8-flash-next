@@ -127,6 +127,9 @@ export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_SM70_QWEN_FUSIONS=1
 export SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192
 export SGLANG_NUMA_BIND_V2=0
+# Multimodal image preprocessing on CPU: the launcher otherwise runs it on
+# cuda:0 next to the static pool, where its resize/stack temporaries OOM.
+export SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$HOME/hicache_storage
 export SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE=1

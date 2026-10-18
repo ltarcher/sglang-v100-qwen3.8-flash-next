@@ -1624,7 +1624,10 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # Currently supported by the Kimi-K2.5 image processor only.
+    # Force image preprocessing onto CPU. Two hooks: the shared image-processor
+    # device selection (else cuda:{base_gpu_id} in the launcher process, where
+    # resize/stack temporaries can OOM against a full static KV pool) and the
+    # Kimi-K2.5 GPU decode path.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.

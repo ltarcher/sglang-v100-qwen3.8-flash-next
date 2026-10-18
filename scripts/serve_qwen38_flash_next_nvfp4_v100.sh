@@ -87,6 +87,10 @@ export SGLANG_SM70_QWEN_FUSIONS=1
 export SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_NUMA_BIND_V2=0
+# Image preprocessing runs in the launcher on cuda:0 next to the static pool;
+# its resize/stack temporaries OOM'd against the full pool (48-214 MiB
+# allocations with 16-164 MiB free, 2026-10-18). Keep it on CPU.
+export SGLANG_FORCE_CPU_IMAGE_PREPROCESSING="${SGLANG_FORCE_CPU_IMAGE_PREPROCESSING:-1}"
 # V100 runtime pin is sglang-kernel 0.4.6.post1, not upstream 0.4.7.
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 export PYTHONPATH="$REPO/python"
