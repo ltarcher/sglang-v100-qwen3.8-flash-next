@@ -16,6 +16,9 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
+from sglang.srt.layers.attention.qsa.metadata import (
+    get_qsa_max_pos_hint,
+)
 from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
@@ -188,9 +191,13 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+                hint = get_qsa_max_pos_hint()
+                if hint is None:
+                    self.rotary_emb._ensure_cos_sin_cache_length(
+                        int(positions.max().item())
+                    )
+                else:
+                    self.rotary_emb._ensure_cos_sin_cache_length(hint)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -431,7 +438,13 @@ class QSAIndexer(MultiPlatformOp):
         if not get_is_capture_mode() and hasattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length"
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            hint = get_qsa_max_pos_hint()
+            if hint is None:
+                self.rotary_emb._ensure_cos_sin_cache_length(
+                    int(positions.max().item())
+                )
+            else:
+                self.rotary_emb._ensure_cos_sin_cache_length(hint)
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
