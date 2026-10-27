@@ -219,7 +219,7 @@ class BaseMultimodalProcessor(ABC):
     # capping impossible without touching the GPU. SGLANG_MM_GPU_IMAGE_DECODE=0
     # decodes on CPU instead: a few ms more per image, no device memory, and
     # PIL inputs let mm_pre_resize bound the preprocessing cost.
-    gpu_image_decode = os.environ.get("SGLANG_MM_GPU_IMAGE_DECODE", "1") != "0"
+    gpu_image_decode = envs.SGLANG_MM_GPU_IMAGE_DECODE.get()
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False

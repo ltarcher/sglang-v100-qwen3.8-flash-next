@@ -18,11 +18,10 @@ Controlled by SGLANG_MM_PRE_RESIZE_MAX_SIDE (default 2048 px on the long side;
 """
 
 import logging
-import os
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MAX_SIDE = int(os.environ.get("SGLANG_MM_PRE_RESIZE_MAX_SIDE", "2048"))
 
 _logged_once = False
 
@@ -37,7 +36,9 @@ def pre_resize_images(images, max_side=None):
 
     if not images:
         return images
-    side = DEFAULT_MAX_SIDE if max_side is None else int(max_side)
+    side = (
+        envs.SGLANG_MM_PRE_RESIZE_MAX_SIDE.get() if max_side is None else int(max_side)
+    )
     if side <= 0:
         return images
     try:

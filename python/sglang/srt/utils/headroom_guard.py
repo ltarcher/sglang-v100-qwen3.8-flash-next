@@ -15,15 +15,11 @@ The CUDA calls are injected so this module can be unit tested without a GPU.
 """
 
 import logging
-import os
 import time
 
-logger = logging.getLogger(__name__)
+from sglang.srt.environ import envs
 
-# Throttle: the driver query is cheap but the decode loop runs every few ms.
-CHECK_INTERVAL_S = float(os.environ.get("SGLANG_HEADROOM_GUARD_CHECK_S", "2.0"))
-# Act once free memory on this rank drops below this.
-FREE_THRESHOLD_MB = int(os.environ.get("SGLANG_HEADROOM_GUARD_FREE_MB", "768"))
+logger = logging.getLogger(__name__)
 
 _last_check_s = 0.0
 
@@ -43,7 +39,8 @@ def guard_device_headroom(cuda, *, now=None) -> str:
     """
     global _last_check_s
     now = time.monotonic() if now is None else now
-    if now - _last_check_s < CHECK_INTERVAL_S:
+    # Throttle: the driver query is cheap but the decode loop runs every few ms.
+    if now - _last_check_s < envs.SGLANG_HEADROOM_GUARD_CHECK_S.get():
         return "throttled"
     _last_check_s = now
     try:
@@ -51,7 +48,9 @@ def guard_device_headroom(cuda, *, now=None) -> str:
     except Exception:
         return "no-cuda"
     free_mb = free >> 20
-    if free_mb >= FREE_THRESHOLD_MB:
+    # Act once free memory on this rank drops below the threshold.
+    threshold_mb = envs.SGLANG_HEADROOM_GUARD_FREE_MB.get()
+    if free_mb >= threshold_mb:
         return "ok"
     try:
         cuda.empty_cache()
@@ -66,7 +65,7 @@ def guard_device_headroom(cuda, *, now=None) -> str:
         "allocated %d MiB, reserved %d MiB).",
         free_mb,
         total >> 20,
-        FREE_THRESHOLD_MB,
+        threshold_mb,
         max(0, free_after - free_mb),
         free_after,
         allocated_mb,

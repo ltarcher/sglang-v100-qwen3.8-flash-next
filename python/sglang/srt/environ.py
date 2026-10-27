@@ -606,6 +606,12 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Device-memory headroom guard at the top of Scheduler.run_batch: when a
+    # rank's free memory falls under the threshold, empty PyTorch's cache
+    # before the forward. It is the only OOM action that is local to one rank
+    # and therefore safe under tensor parallelism.
+    SGLANG_HEADROOM_GUARD_CHECK_S = EnvFloat(2.0)
+    SGLANG_HEADROOM_GUARD_FREE_MB = EnvInt(768)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -1629,6 +1635,21 @@ class Envs:
     # resize/stack temporaries can OOM against a full static KV pool) and the
     # Kimi-K2.5 GPU decode path.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    # Explicit image-processor device, overriding every automatic choice above.
+    # "cpu" keeps the tokenizer process off the GPUs entirely (it otherwise
+    # pins ~1 GiB on rank 0's card, leaving that rank with less OOM headroom
+    # than its TP peers).
+    SGLANG_MM_IMAGE_PROCESSOR_DEVICE = EnvStr(None)
+    # Longest edge (px) allowed into the HF image processor; oversized decoded
+    # images are thumbnailed first. The processor converts the full-resolution
+    # input to float32 before resizing, so an unclamped upload spends tens of
+    # seconds there even when max_pixels caps the output far below it. 0
+    # disables the pre-resize.
+    SGLANG_MM_PRE_RESIZE_MAX_SIDE = EnvInt(2048)
+    # nvJPEG decoding returns a CUDA tensor, which pins a CUDA context on rank
+    # 0's GPU inside the tokenizer process. 0 decodes on CPU instead: a few ms
+    # more per image, no device memory.
+    SGLANG_MM_GPU_IMAGE_DECODE = EnvBool(True)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
