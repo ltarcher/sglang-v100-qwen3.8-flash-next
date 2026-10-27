@@ -1296,9 +1296,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.max_position_embeddings,
             self.rope_theta,
             self.partial_rotary_factor,
-            repr(sorted(rope_scaling.items()))
-            if rope_scaling is not None
-            else None,
+            repr(sorted(rope_scaling.items())) if rope_scaling is not None else None,
         )
         shared = _SHARED_ROTARY_INSTANCES.get(rope_key)
         if shared is None:

@@ -1571,9 +1571,7 @@ class PrefillAdder:
         # request under the ceiling still admits whole.
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
-            chunk_tokens_limit = min(
-                chunk_tokens_limit, self.effective_prefill_ceiling
-            )
+            chunk_tokens_limit = min(chunk_tokens_limit, self.effective_prefill_ceiling)
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
@@ -1903,9 +1901,7 @@ class PrefillAdder:
             # so a request whose whole remaining prompt fits under the
             # threshold still admits whole rather than being chunked by
             # the ceiling.
-            chunk_tokens_limit = min(
-                chunk_tokens_limit, self.effective_prefill_ceiling
-            )
+            chunk_tokens_limit = min(chunk_tokens_limit, self.effective_prefill_ceiling)
 
         # Without chunking, allow the first request even above the input cap.
         if (

@@ -367,7 +367,7 @@ __all__ = [
 # layer (~80% of scheduler wall time on a 3x131k prefill, py-spy). The backend
 # sets this hint once per forward from seq_lens_cpu (it bounds every position
 # in that forward), and the indexer's ensure checks skip the sync.
-_MAX_POS_HINT: "int | None" = None
+_MAX_POS_HINT: int | None = None
 
 
 def set_qsa_max_pos_hint(value) -> None:

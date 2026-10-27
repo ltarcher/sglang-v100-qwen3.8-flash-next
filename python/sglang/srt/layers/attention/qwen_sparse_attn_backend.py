@@ -223,9 +223,7 @@ def _kvstats_probe(layer_id, k, v):
         key = (int(layer_id), tag)
         if val > _kvstats_peak.get(key, 0.0):
             _kvstats_peak[key] = val
-            logger.info(
-                "QSA_KVSTATS layer=%d %s_max=%.4f", int(layer_id), tag, val
-            )
+            logger.info("QSA_KVSTATS layer=%d %s_max=%.4f", int(layer_id), tag, val)
     for tag, t in (("k", k), ("v", v)):
         key = (int(layer_id), tag)
         n = _kvstats_calls.get(key, 0) + 1
@@ -239,9 +237,15 @@ def _kvstats_probe(layer_id, k, v):
         logger.info(
             "QSA_KVSTATS_PCT layer=%d %s n=%d numel=%d "
             "p1=%.6f p10=%.6f p50=%.6f p90=%.6f p99=%.4f max=%.4f",
-            int(layer_id), tag, n, int(t.numel()),
-            float(qs[0]), float(qs[1]), float(qs[2]),
-            float(qs[3]), float(qs[4]),
+            int(layer_id),
+            tag,
+            n,
+            int(t.numel()),
+            float(qs[0]),
+            float(qs[1]),
+            float(qs[2]),
+            float(qs[3]),
+            float(qs[4]),
             float(a.max().item()),
         )
 
@@ -964,7 +968,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
-        if forward_batch.seq_lens_cpu is not None and forward_batch.seq_lens_cpu.numel() > 0:
+        if (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.seq_lens_cpu.numel() > 0
+        ):
             # CPU-known max position for this forward: the indexer's rope
             # ensure consumes it instead of syncing on positions.max().item()
             # every layer. Same bound the token_slot_table slice below uses.
@@ -2512,11 +2519,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             and topk_indices.ndim == 2
             and topk_indices.shape[0] == q.shape[0]
             and topk_indices.shape[1] > 0
-            and k_buffer.dtype in (
-                torch.float8_e5m2,
-                torch.float8_e4m3fn,
-                torch.float16,
-            )
+            and k_buffer.dtype
+            in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float16)
             and v_buffer.dtype == k_buffer.dtype
             and k_buffer.ndim == 3
             and v_buffer.shape == k_buffer.shape
