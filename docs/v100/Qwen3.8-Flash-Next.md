@@ -130,6 +130,10 @@ export SGLANG_NUMA_BIND_V2=0
 # Multimodal image preprocessing on CPU: the launcher otherwise runs it on
 # cuda:0 next to the static pool, where its resize/stack temporaries OOM.
 export SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1
+# This checkpoint's preprocessor allows 16.7M px, so a 4096^2 upload passes
+# smart_resize untouched (~150k vision tokens) after spending ~31 s in the
+# processor's full-resolution float32 conversion. Cap the input at 2048 px.
+export SGLANG_MM_PRE_RESIZE_MAX_SIDE=2048
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$HOME/hicache_storage
 export SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE=1

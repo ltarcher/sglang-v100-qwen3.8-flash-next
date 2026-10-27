@@ -91,6 +91,12 @@ export SGLANG_NUMA_BIND_V2=0
 # its resize/stack temporaries OOM'd against the full pool (48-214 MiB
 # allocations with 16-164 MiB free, 2026-10-18). Keep it on CPU.
 export SGLANG_FORCE_CPU_IMAGE_PREPROCESSING="${SGLANG_FORCE_CPU_IMAGE_PREPROCESSING:-1}"
+# This checkpoint's preprocessor allows 16.7M px (4096^2 passes smart_resize
+# untouched, ~150k vision tokens), so one upload can spend ~31 s in the
+# processor's full-resolution float32 conversion and OOM the launcher. Cap the
+# input at 2048 px on the long side: that is above the ~1664^2 this model is
+# served at, and keeps the worst case near 1024 vision tokens.
+export SGLANG_MM_PRE_RESIZE_MAX_SIDE="${SGLANG_MM_PRE_RESIZE_MAX_SIDE:-2048}"
 # V100 runtime pin is sglang-kernel 0.4.6.post1, not upstream 0.4.7.
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 export PYTHONPATH="$REPO/python"
