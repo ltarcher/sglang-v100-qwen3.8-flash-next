@@ -929,14 +929,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             out_cache_loc=forward_batch.out_cache_loc,
-            sequence_lengths_list=(
-                [
-                    int(v)
-                    for v in forward_batch.seq_lens_cpu[: sequence_lengths.shape[0]]
-                ]
-                if forward_batch.seq_lens_cpu is not None
-                else None
-            ),
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
