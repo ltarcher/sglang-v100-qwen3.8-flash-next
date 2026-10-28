@@ -161,6 +161,7 @@ def sm70_cuda_qsa_prefill(
         indices.to(dtype=torch.int32).contiguous(),
         seq_lens.to(dtype=torch.int32).contiguous(),
         float(softmax_scale),
+        None,
         output,
     )
     return output
@@ -213,6 +214,7 @@ def sm70_cuda_qsa_decode(
         max_splits,
         QSA_DECODE_TOKENS_PER_SPLIT,
         float(softmax_scale),
+        None,
         partial_o,
         partial_lse,
     )
