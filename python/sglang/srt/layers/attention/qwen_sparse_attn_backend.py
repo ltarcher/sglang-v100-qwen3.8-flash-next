@@ -358,6 +358,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
+        # KV host tier (docs/v100/KV_HOST_TIER_DESIGN.md): mirror-only in
+        # Phase 1, attached on the QSA pool when the env switch is on.
+        _tier_pool = self.token_to_kv_pool
+        self._kv_host_tier = (
+            _tier_pool.kv_host_tier
+            if isinstance(_tier_pool, QSATokenToKVPool)
+            else None
+        )
+        self._kv_tier_noted_step = -1
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -415,6 +424,44 @@ class QwenSparseAttnBackend(AttentionBackend):
         if forward_mode is None:
             return False
         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+
+    def _tier_on_build_hook(self, req_to_token, rows, seq_lens, forward_mode, spec_info):
+        """Dispatch the Phase 2 kv_host_tier build hook by forward mode.
+
+        Shared by the eager build path and the graph-replay build path, which
+        have identical contracts. TARGET_VERIFY writes ``draft_token_num``
+        fresh tokens per row at [seq_len, seq_len + draft_token_num) of the
+        target pool (decode-like: degrade may fire, then protect the write
+        pages). DRAFT_EXTEND_V2 rows rewrite their per-row accepted tokens at
+        [seq_len - accept, seq_len) of the draft pool -- restore-then-write,
+        the same contract as extend: the closed-set restore runs at build
+        time, before this forward's set_kv_buffer, so no protect scatter is
+        needed and spec_info needs no draft_token_num attribute (it is an
+        EagleDraftExtendInput on this path).
+        """
+        _tier = self._kv_host_tier
+        if _tier is None or not _tier.pagein or req_to_token is None:
+            return
+        if forward_mode.is_target_verify():
+            _tier.on_build_decode_like(
+                req_to_token,
+                rows,
+                seq_lens,
+                seq_lens.to(torch.long),
+                int(spec_info.draft_token_num),
+            )
+        elif forward_mode.is_decode():
+            _tier.on_build_decode_like(
+                req_to_token,
+                rows,
+                seq_lens,
+                seq_lens.to(torch.long) - 1,
+                1,
+            )
+        else:
+            # EXTEND and DRAFT_EXTEND_V2 alike: restore the closed set, then
+            # this forward writes into it.
+            _tier.on_build_extend(req_to_token, rows, seq_lens)
 
     def _require_chain_speculation(self, forward_mode, spec_info) -> None:
         if forward_mode is None or not forward_mode.is_target_verify():
@@ -948,6 +995,28 @@ class QwenSparseAttnBackend(AttentionBackend):
                 and decode_logical_positions is not None
             ),
         )
+        if self._kv_host_tier is not None:
+            # Mirror this forward's KV writes into the host tier (Phase 1
+            # pipeline; async on the tier's copy stream, read path unchanged).
+            self._kv_host_tier.flush(forward_batch.out_cache_loc)
+            if (
+                self._kv_host_tier.pagein
+                and self.req_to_token is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                # Phase 2 build hooks: arm/execute the manual degrade and
+                # restore closed pages (extend-like) or protect this
+                # forward's write pages (decode-like). Graph capture never
+                # reaches here -- the capture path builds metadata directly,
+                # so the hooks cannot pollute a capturing stream.
+                _bs = forward_batch.batch_size
+                self._tier_on_build_hook(
+                    self.req_to_token,
+                    forward_batch.req_pool_indices[:_bs],
+                    forward_batch.seq_lens[:_bs],
+                    forward_batch.forward_mode,
+                    forward_batch.spec_info,
+                )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -1229,6 +1298,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         num_padding: int = 0,
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
+        _tier = self._kv_host_tier
+        if _tier is not None and _tier.pagein and self.req_to_token is not None:
+            # Phase 2 build hook for graph replay -- same contract as the
+            # eager build hook, shared by both replay branches below. Runs
+            # before the graph launch, so a pending degrade mirrors +
+            # garbages the closed pages first and the graph's captured
+            # page-in restores whatever this step actually reads.
+            self._tier_on_build_hook(
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                forward_mode,
+                spec_info,
+            )
         metadata = self._cuda_graph_metadata[(forward_mode, bs)]
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
@@ -1243,6 +1326,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 num_padding=num_padding,
             )
             self.forward_metadata = metadata
+            if self._kv_host_tier is not None:
+                # Captured writes are baked into the graph; Phase 1 only
+                # advances the tier step here (no out_cache_loc available).
+                self._kv_host_tier.flush(None)
             return
         if seq_lens_cpu is None:
             # Host-fallback staging only (non-CUDA pools): an explicit
@@ -1275,6 +1362,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata.indexer_metadata, metadata.row_req_pool_indices
         )
         self.forward_metadata = metadata
+        if self._kv_host_tier is not None:
+            self._kv_host_tier.flush(None)
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
         if self.req_to_token is None:
@@ -2346,6 +2435,51 @@ class QwenSparseAttnBackend(AttentionBackend):
             return output.reshape(q.shape[0], -1)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        _tier = self._kv_host_tier
+        if (
+            _tier is not None
+            and self.req_to_token is not None
+            and _tier.step_seq != self._kv_tier_noted_step
+            and (
+                forward_batch.forward_mode.is_decode()
+                or QwenSparseAttnBackend._is_speculative_paged_mode(
+                    forward_batch.forward_mode
+                )
+            )
+        ):
+            # Advisory residency stats for this forward's selected pages
+            # (once per forward; the attention read path is untouched).
+            self._kv_tier_noted_step = _tier.step_seq
+            _tier_rows = metadata.row_req_pool_indices
+            if _tier_rows is None:
+                _tier_rows = forward_batch.req_pool_indices
+            _tier.note_read(self.req_to_token, _tier_rows, topk_indices)
+        if _tier is not None and _tier.pagein and self.req_to_token is not None:
+            # Phase 2 page-in: restore this layer's selected pages before
+            # the kernel reads them. Every full-attention layer, every
+            # decode-like forward, including at graph capture -- the
+            # compaction writes the tier's fixed device buffers and the
+            # launch is captured with the graph, so replays restore
+            # whatever the captured indexer selects with zero host sync.
+            # Extend reads are covered by the build-time restore of all
+            # closed pages instead.
+            _pi_slot = _tier.layer_slot.get(layer.layer_id)
+            if _pi_slot is not None and (
+                forward_batch.forward_mode.is_decode()
+                or QwenSparseAttnBackend._is_speculative_paged_mode(
+                    forward_batch.forward_mode
+                )
+            ):
+                _pi_rows = metadata.row_req_pool_indices
+                if _pi_rows is None:
+                    _pi_rows = forward_batch.req_pool_indices
+                _tier.page_in_selected(
+                    self.req_to_token,
+                    _pi_rows,
+                    topk_indices,
+                    _pi_slot,
+                    force=metadata.is_cuda_graph,
+                )
         if self._can_use_sm70_dense_decode(
             q, k_buffer, v_buffer, forward_batch, metadata
         ):
@@ -2738,6 +2872,28 @@ class QwenSparseMultiStepDraftBackend:
                     spec_info=step_batch.spec_info,
                 )
             return
+
+        if self.attn_backends:
+            _first = self.attn_backends[0]
+            _tier = _first._kv_host_tier
+            if _tier is not None and _tier.pagein and _first.req_to_token is not None:
+                # Phase 2 build hooks for graphed draft steps: step i writes
+                # one token per row at base + i (decode-like with append_lo
+                # = base + i). Protecting every step's write pages matters
+                # -- freshly allocated pages can be long-degraded ones, and
+                # unlike the eager draft path there is no per-step metadata
+                # build here that would scatter the protect bits.
+                _bs = forward_batch.batch_size
+                _rows = forward_batch.req_pool_indices[:_bs]
+                _base = forward_batch.seq_lens[:_bs].to(torch.long)
+                for _step in range(len(self.attn_backends)):
+                    _tier.on_build_decode_like(
+                        _first.req_to_token,
+                        _rows,
+                        _base + _step + 1,
+                        _base + _step,
+                        1,
+                    )
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0

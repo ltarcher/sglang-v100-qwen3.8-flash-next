@@ -15,6 +15,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.kv_host_tier import attach_kv_host_tier
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+        # KV host tier (docs/v100/KV_HOST_TIER_DESIGN.md). None unless
+        # SGLANG_V100_KV_HOST_TIER is set; consumers check ``is not None``.
+        self.kv_host_tier = attach_kv_host_tier(self, full_attention_layer_ids)
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[
@@ -429,6 +433,9 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+        # KV host tier (docs/v100/KV_HOST_TIER_DESIGN.md). None unless
+        # SGLANG_V100_KV_HOST_TIER is set; consumers check ``is not None``.
+        self.kv_host_tier = attach_kv_host_tier(self, full_attention_layer_ids)
 
     def set_dsa_index_k_buffer(
         self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor

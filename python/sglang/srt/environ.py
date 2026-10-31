@@ -1555,6 +1555,40 @@ class Envs:
     SGLANG_SM70_GLM_NVFP4_GEMV = EnvBool(False)
     SGLANG_SM70_GLM_NVFP4_MOE_DECODE = EnvBool(False)
     SGLANG_SM70_GLM_NVFP4_BUILD_DIR = EnvStr("~/.cache/sglang/glm_nvfp4_gemv")
+
+    # ===================================================================
+    # Active-request KV host tier (streaming KV), docs/v100/KV_HOST_TIER_DESIGN.md
+    # ===================================================================
+    # Phase 1 is mirror-only: a pinned fp16 host mirror of the QSA full-KV
+    # pool plus residency/Clock/representative bookkeeping. The attention
+    # read path never consumes the host copy, so the default-off behavior
+    # is identical to the tier being absent.
+    SGLANG_V100_KV_HOST_TIER = EnvBool(False)
+    # Per-rank host pool size. Phase 1 mirrors into a rolling window of this
+    # budget; stable page->slot mapping arrives with Phase 2 page-in.
+    SGLANG_V100_KV_HOST_TIER_GB = EnvInt(32)
+    # Host page granularity in tokens. Phase 1 requires it to equal the KV
+    # pool page size (64 in production).
+    SGLANG_V100_KV_HOST_PAGE_TOKENS = EnvInt(64)
+    # Reserved for Phase 2/3: guaranteed per-request hot window and the
+    # per-step miss-byte threshold that triggers fallback to fully-resident
+    # semantics.
+    SGLANG_V100_KV_HOT_WINDOW_TOKENS = EnvInt(49152)
+    SGLANG_V100_KV_MISS_BYTE_LIMIT = EnvInt(8 * 1024 * 1024)
+    # Reserved for Phase 4: streaming prefill (plan b) for 1M contexts.
+    SGLANG_V100_KV_STREAM_PREFILL = EnvBool(False)
+    # Phase 2 page-in: adds a direct-mapped full-pool host mirror plus a
+    # device-driven page-in path (decode/verify restore selected pages from
+    # pinned RAM in-place, zero host sync, CUDA-graph safe). Requires
+    # SGLANG_V100_KV_HOST_TIER=1. Off keeps exact Phase 1 behavior.
+    SGLANG_V100_KV_TIER_PAGEIN = EnvBool(False)
+    # Phase 2 manual degradation policy (test affordance): when set to a
+    # filesystem path, the tier checks it at every extend metadata build and
+    # arms a one-shot "degrade all closed pages" at the next decode-like
+    # build: the closed pages' device copies are mirrored to the host pool
+    # and then garbage-filled, so every subsequent decode read of them must
+    # go through page-in. Used by the bit-consistency A/B gate.
+    SGLANG_V100_KV_TIER_DEGRADE_FLAG = EnvStr("")
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
