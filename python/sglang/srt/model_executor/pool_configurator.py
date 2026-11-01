@@ -185,6 +185,11 @@ class MemoryPoolConfigurator:
         """Constraint path: recalculate pool sizes from a constrained max_tokens."""
         raise NotImplementedError
 
+    @property
+    def cell_size(self) -> int:
+        """Bytes per logical token charged to the KV byte budget (0 = unknown)."""
+        return 0
+
     def finalize_with_max_running_requests(
         self, config: MemoryPoolConfig
     ) -> MemoryPoolConfig:
@@ -308,6 +313,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+    @property
+    def cell_size(self) -> int:
+        """Bytes per logical token charged to the KV byte budget."""
+        return self._cell_size
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""

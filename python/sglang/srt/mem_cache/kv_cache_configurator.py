@@ -2402,6 +2402,81 @@ class KVCacheConfigurator:
 
         return token_capacity
 
+    def _tier_extend_logical_capacity(
+        self, config: MemoryPoolConfig, available_bytes: int
+    ) -> MemoryPoolConfig:
+        """Phase 3 host tier: honor --max-total-tokens beyond the GPU profile.
+
+        The profile charges the full logical KV pool to device memory, but with
+        SGLANG_V100_KV_TIER_PHYS_TOKENS the device pool is shrunk to PHYS and
+        the pinned host mirror backs every logical token
+        (docs/v100/KV_HOST_TIER_DESIGN.md §10). Re-derive the pools from an
+        extended byte budget so the requested logical capacity survives
+        _apply_token_constraints; the excess is paid in host RAM, guarded by
+        the per-rank host memory budget. Applies to the draft worker too: its
+        device-resident pool must track the target's logical capacity.
+        """
+        user_limit = get_schedule().max_total_tokens
+        if (
+            not user_limit
+            or user_limit <= config.max_total_num_tokens
+            or not envs.SGLANG_V100_KV_HOST_TIER.get()
+            or not envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get()
+        ):
+            return config
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        cell_size = create_memory_pool_configurator(self).cell_size
+        if cell_size <= 0:
+            return config
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+
+        allowance_tokens = host_memory_budget_bytes() // cell_size
+        if user_limit > allowance_tokens:
+            logger.warning(
+                "Host tier extension clamped: --max-total-tokens=%d needs a "
+                "%.2f GiB/rank pinned mirror but the host budget allows only "
+                "%d tokens; keeping %d.",
+                user_limit,
+                user_limit * cell_size / (1 << 30),
+                allowance_tokens,
+                max(allowance_tokens, config.max_total_num_tokens),
+            )
+            if allowance_tokens <= config.max_total_num_tokens:
+                return config
+            user_limit = allowance_tokens
+        # Pool sizing is affine in the byte budget, but the effective slope
+        # (cell + per-logical aux pools) exceeds ``cell_size``. Probe once with
+        # a cell-sized step, measure the slope, then jump straight to the
+        # requested capacity.
+        budget_bytes = available_bytes
+        extended = config
+        slope = 0.0
+        for _ in range(4):
+            delta_tokens = user_limit - extended.max_total_num_tokens
+            if delta_tokens <= 0:
+                break
+            step_bytes = (
+                int(delta_tokens * slope) if slope else delta_tokens * cell_size
+            )
+            candidate = self.config_from_budget(budget_bytes + step_bytes)
+            gained = candidate.max_total_num_tokens - extended.max_total_num_tokens
+            if gained <= 0:
+                break
+            slope = step_bytes / gained
+            budget_bytes += step_bytes
+            extended = candidate
+        logger.info(
+            "Host tier extends logical KV capacity %d -> %d tokens (profiled "
+            "device capacity %d); the pinned host mirror backs the excess.",
+            config.max_total_num_tokens,
+            extended.max_total_num_tokens,
+            config.max_total_num_tokens,
+        )
+        return extended
+
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
@@ -2474,6 +2549,7 @@ class KVCacheConfigurator:
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
+        config = self._tier_extend_logical_capacity(config, available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
