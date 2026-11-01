@@ -116,6 +116,7 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    drop_checkpoint_cache_at_end,
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
@@ -761,6 +762,16 @@ class DefaultModelLoader(BaseModelLoader):
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     read_tensor=read_tensor,
                     skip_key=skip_key,
+                )
+            if (
+                weight_loader_drop_cache_after_load
+                and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
+            ):
+                # The per-shard drop cannot reclaim pages other ranks still
+                # have mapped, so release the checkpoint cache once more after
+                # the last shard (barriered on the ranks' shared shard list).
+                weights_iterator = drop_checkpoint_cache_at_end(
+                    weights_iterator, hf_weights_files
                 )
 
         else:

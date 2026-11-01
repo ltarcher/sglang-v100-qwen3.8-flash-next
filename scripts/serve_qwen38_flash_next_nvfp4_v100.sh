@@ -17,6 +17,18 @@
 #   SGLANG_V100_PORT=11435            (shared with DSV41; not 30000)
 #   FLASH_NEXT_HOST / FLASH_NEXT_PORT  (legacy aliases for the same pair)
 #   FLASH_NEXT_DP=1            (data-parallel replicas; needs 4 GPUs each)
+#
+# Context extension beyond the native 262k REQUIRES an explicit YaRN override:
+# the checkpoint ships rope_type=default with
+# original_max_position_embeddings=262144, so a larger --context-length alone
+# mis-RoPEs positions past 262k. 512K recipe (needs the Phase 3 KV host tier,
+# see docs/v100/KV_HOST_TIER_DESIGN.md §10):
+#   --context-length 524288 --max-total-tokens 540672
+#   --json-model-override-args '{"rope_parameters": {"rope_type": "yarn",
+#     "factor": 2.0, "original_max_position_embeddings": 262144},
+#     "text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 2.0,
+#     "original_max_position_embeddings": 262144},
+#     "max_position_embeddings": 524288}}'
 set -euo pipefail
 
 MODE="${1:-target}"

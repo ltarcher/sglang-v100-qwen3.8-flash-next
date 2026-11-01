@@ -1,9 +1,12 @@
 # 活跃请求 KV host 分层(流式 KV)设计文档
 
 状态:Phase 1 已实施并验收(2026-10-31);Phase 2 页入+手动降级已实施,
-位级验收通过,文本级 A/B 判据因引擎基线不收敛而作废(见 §8 记录)
+位级验收通过,文本级 A/B 判据因引擎基线不收敛而作废(见 §8 记录);
+Phase 3 最小闭环(512K×1 直映射)已实施,S2 矩阵与 S3 516K 单请求
+验收通过(2026-11-01);S4(MTP+CUDA graph)与 512K×2/×4 调度未做
 日期:2026-10-30(同日两次修订:§4 以 np=1 实测基准校准;补测 262k 锚点
-并重估 §4.2 外推带);2026-10-31 Phase 1 落地,同日 Phase 2 落地
+并重估 §4.2 外推带);2026-10-31 Phase 1 落地,同日 Phase 2 落地;
+2026-11-01 Phase 3 落地
 范围:Qwen3.8-Flash-Next 线(4×V100-32GB SXM2,TP4,fp16 KV, production 配置)
 参考:Strata `/data/develop/Strata` 的 kv_stream 机制(kv_stream.cu / src/core/layer.cpp)
 
@@ -71,6 +74,57 @@ Phase 2 实施记录(2026-10-31):
   位一致性 + 261k 噪声包络。
 - production compose 恢复(§8 收尾):tier 四行恢复注释、`--mem-fraction-static`
   回 0.90。
+
+Phase 3 实施记录(2026-11-01):
+
+- 代码:`kv_host_tier.py` 重写为 §10 直映射语义(per-layer `tags/protect/hvalid`、
+  `_p3_write_restore_kernel` restore-then-claim、`_p3_mirror_kernel` build 开头
+  镜像上一 forward 写页、extend 读 `_p3_gather_kernel`(tag 命中读 device,未命中
+  读 pinned host)、decode 读 `page_in_selected_phase3` + `phys_token_slot_table`);
+  `qsa_kv_pool.py` 供物理槽视图,`qwen_sparse_attn_backend.py` 接三条路径。
+  调试门控 `QSA_P3_FORCE_HOST`(强制镜像页读 host)/`QSA_P3_CHECK` 与计数器
+  mirror_pages/write_restores/pagein_restores/collisions/host_gather_rows/
+  mirror_skips/gather_unvalid/host_dev_mismatch。另修复 `qsa/qsa_indexer.py`
+  未完成迁移:调用方传 `out_dtype` 而 srt shim 旧签名无该参数,4 TP rank 启动即
+  `TypeError`;两个导入改指 `sglang.kernels.ops.attention.qsa_indexer`(kernels/ops
+  版兼容 fp8 e4m3 out_dtype)。
+- 启动配置(512K 必须显式 YaRN:checkpoint `rope_type=default` +
+  `original_max_position_embeddings=262144`,超出即需扩展,见本记录与
+  `scripts/serve_qwen38_flash_next_nvfp4_v100.sh` 头注):`--context-length
+  524288 --max-total-tokens 540672` + `--json-model-override-args '{"rope_parameters":
+  {"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144},
+  "text_config": {"rope_parameters": {...同...}, "max_position_embeddings": 524288}}'
+  (model_override_args 对 PretrainedConfig 内层走 dict.update 合并,见
+  `srt/utils/hf_transformers/config.py`)。
+- S2 正确性矩阵(同 boot 一致代码树,nonce 各异防 radix 复用,FORCE_HOST=1/0
+  双臂):60K@5%、85K@5%、85K@80%(needle 落卷绕区 lp≈1063→pp≈39)、
+  100K@80%、120K@80% 全部逐字命中。两个判据陷阱:/generate 流式返回累计
+  text(取末 chunk 而非拼接);思考模型 `<think>` 吃 max_new_tokens 预算
+  (512 会截断答案,用 1024)。小配置累计计数器证实卷绕全链路活跃:
+  mirror_pages=95112、write_restores=16640、pagein_restores=33941、
+  collisions=2348、host_gather_rows=4769280、mirror_skips/gather_unvalid/
+  host_dev_mismatch=0。
+- S3 516K 实测(2026-11-01,PHYS=327680/logical=540672/YaRN×2,冷启动单请求):
+  needle 探针 501,700 目标 ×41.14 tok/doc → prompt 516K;needle doc 位于
+  ~412.8K token(lp≈6449→pp=1329 卷绕区),greedy `needle_hit` 逐字命中
+  `NEBULA-5X7Q`;末批 full token usage 0.95(≈8064/8448 逻辑页 ≈516K);
+  chunked prefill 4096 tok/批约 3s/批,TTFT ≈5 分钟;计数器(steps=128):
+  host_gather_rows=72.8M(卷绕区未驻留页真实走 host 镜像读)、
+  mirror_pages=179952、write_restores/collisions=0——mirror-keeps-up 设计下
+  claim 时宿主副本恒已最新,恢复路径仅镜像滞后时才触发,S2 小配置矩阵已单独
+  证实其活跃性。
+- 内存实测(修正 §10.1 预估):大配置稳态 MemAvailable 仅 **7.9-8.2 GB**——
+  Shmem 101.3 GB(PLE offload ~51G + 宿主镜像 4×6.19 GiB pinned + torch/NCCL
+  共享池 ~25G)+ AnonPages ~11G;镜像实际 6.19 GiB/rank(预估 6.0)。prefill
+  全程 MemFree 一度 2.9 GB 但 SwapFree 117G 无风暴,4 scheduler RSS 各
+  26.1 GB,GPU 31/32.8 GB。复跑必读:启动前确认无其他引擎(Shmem 须清零,
+  `docker compose down` 后应回到 ~122 GB);516K prefill 期间无新大块 host
+  分配,8 GB 余量可行,但本机已无再容纳第二引擎的空间。
+- 事故记录:权重分片 `model-fp8-mtp-ple.safetensors` 宿主文件损坏(同目录其余
+  10 分片正常;read→EINVAL/lseek→ESPIPE/mmap→ENODEV,filefrag 元数据完好)致
+  权重加载 os error 19、容器崩溃。wget 直连 resolve URL 重下(huggingface_hub
+  1.29 对 >50GB 文件强制 hf_xet,本机 `HF_HUB_DISABLE_XET=1`),sha256 精确
+  匹配。坏文件保留同目录 `.corrupt` 后缀,待有 root 时取证(dmesg/smartctl/fsck)。
 
 ## 1. 背景与目标
 
@@ -288,3 +342,92 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
   warm radix 0.68 s);decode 按 -14%/倍增外推,512K/1M prefill 仍为带估计,
   Phase 2 阶梯补 512K 点收窄并回填 §4 表格。运行时确认 production
   page_size=64、池 426,240 tokens。
+
+## 10. Phase 3 实施设计(最小闭环,512K×1)
+
+目标:在 4×V100-32GB 上让 516K prompt + 128 输出单请求跑通。挤基线实测证明
+(0.945 + 正常配置)池 518,976 tokens 本身足够放下 516,128 tokens,**OOM 来自
+prefill 激活没有余量**(首 4K chunk `F.silu(conv_output)` 80 MiB 申请失败,
+free 12 MiB)。因此 Phase 3 最小闭环不是"扩逻辑容量",而是**缩设备池、把差额
+换成 host 页**,同时让播散的 top-k 读仍能取到数据。
+
+### 10.1 容量切分
+
+| 项 | 值(每 rank) | 说明 |
+| --- | --- | --- |
+| 逻辑 token 预算 | 540,672(实配,≈524K context + 输出/对齐余量;设计预估 518,976) | 调度/allocator/`req_to_token` 全部不变 |
+| 设备 full-KV 池 | `SGLANG_V100_KV_TIER_PHYS_TOKENS`(默认 327,680) | 4.45 GiB 含压缩 K |
+| host 逻辑镜像 | 逻辑页全覆盖 6.19 GiB pinned(实测) | 4 rank ≈ 24.8 GiB(本机 125G 可容) |
+| 释放的显存 | ~2.3 GiB/rank | 留给 prefill 激活(0.86 实测所需) |
+
+**压缩 indexer K 保持逻辑容量**(bf16 786 MB/rank)。这是本版最重要的取舍:
+512K×1 下它只占 0.8 GiB,不值得做"池化代表 + 二段式选择"(组件 5);组件 5
+推迟到 512K×2/×4 或 1M 场景。
+
+### 10.2 页映射:直接映射,无空闲链表
+
+```
+logical_pages L = ceil((logical_size + page) / page)      # 8193 @512K
+physical_pages P = PHYS_TOKENS / page                      # 5120 @320K
+phys_page(lp) = lp % P                                     # 纯函数,静态
+phys_slot(s)  = (s // page % P) * page + s % page
+```
+
+- 映射是**纯 modulo**,不需要 free list、victim 选择或 host-sync;写入
+  `lp` 隐式覆盖 `lp%P` 上原有页,而该页此前每次写后都已镜像到 host
+  (flush 保证),所以覆盖永不丢数据。
+- 设备侧状态:`tags[P]`(int32,phys→当前 lp,初始化 -1)、`protect[P]`
+  (u8,本 forward 写过,page-in 必须跳过)、`host_logical[2, layer, L,
+  page, H, D]` pinned fp16。
+- 直接映射对"前缀 + 最近热窗"访问是友好的:512K 逻辑跨 320K 物理时,
+  只有前 ~200K 与后 ~4K 别名;冷页很少被选中,实测 miss 率是本版核心指标。
+
+### 10.3 三条路径
+
+1. **写**:build 时对 `forward_batch.out_cache_loc`(allocator 给的页对齐
+   逻辑 token id,见 `allocator/paged.py` L160-181)先做
+   `allocate_write_pages`:`tags[lp%P] != lp` 的页先用 host→phys 全页恢复
+   (?**关键**:跨 forward 的半页写入不能丢),再置 tag、置 protect;随后
+   `set_kv_buffer` 用物理表。flush 用 Triton kernel 按 `lp` 写
+   `host_logical`(kernel 直接写 pinned host,UVA;Phase 2 的 page-in 已验证
+   该方向可行)。
+2. **decode 读**:metadata build 产逻辑 `token_slot_table`
+   (`req_to_token[row, pos]` 的 dense 副本,Phase 2 已有),同时产
+   `phys_slot_table = modulo(token_slot_table)`(纯 device 运算、图安全);
+   每层 attention 前 `page_in_selected(逻辑页)` 按 tag 检查、miss 时
+   host→phys 整页恢复(protect 跳过);decode kernel 改收 `phys_slot_table`
+   (现收 `req_to_token_pool.req_to_token`,`qwen_sparse_attn_backend.py`
+   L2489-2520),kernel 零改动。`token_slot_table` 仍保留逻辑值给
+   `_qsa_write_plan`(压缩槽 = 逻辑 full_slot // ratio)。
+3. **extend 读**:同表;FA2 回退的 Triton `_qsa_fused_kv_prepare` 收
+   phys 表即可。prefill 的读集合是 top-k 并集,streaming 成本
+   O(n²/2/page)≈ 25-40 s @512K(8 分钟 TTFT 的 5%),可接受;不进 §3.3 方案 b
+   的预取,先测实际 miss 字节。
+
+### 10.4 不变量(实现与验收都要盯)
+
+- `req_to_token`、radix、hicache、allocator 里**永远只有逻辑 id**;
+  物理化只发生在 kernel 边界。
+- 一个逻辑页在设备上最多出现一次(tag 唯一);`tags` 与缓冲内容的一致性
+  只由两个 kernel 维护:`mirror`(写 host)与 `page_in`(host→phys)。
+- protect 页的 host 副本必然陈旧,任何 restore 都不得覆盖它;跨 forward
+  半页写入靠 10.3-1 的先恢复后写保证。
+- 关闭开关(`SGLANG_V100_KV_TIER_PHYS_TOKENS=0`)时行为与现网逐字节一致。
+
+### 10.5 里程碑
+
+| Stage | 内容 | 判据 |
+| --- | --- | --- |
+| S1 | 池物理化 + 逻辑压缩 K + 写路径 + 全量 host 镜像(页入关闭) | 261k 三臂数字不回退;内存统计符合 10.1 |
+| S2 | decode/eager 选中页页入 + phys 表 | 261k/4k 输出与前值同噪声包络;miss 计数合理 |
+| S3 | 516K×1 冷 prefill(`/tmp/phase3_512k_once.py`) | 成功出 128 tokens;记录 TTFT/miss/页入字节 |
+| S4 | MTP + CUDA graph(eager MTP 路径本 fork 缺失,先修 `_speculative_max_row_length`) | accept ~2.1;图回放页入位一致 |
+
+### 10.6 已知限制与回退
+
+- 本版仍是**单 kernel 直映射**,不处理 512K×2/×4 的准入工作集(§3.2 组件 5)。
+- radix 保留(逻辑 id),但 **hicache 在 Phase 3 档位关闭**:它的
+  write-back 假设设备槽=逻辑槽;恢复前缀要靠 read 路径页入而非 hicache。
+- MTP 在本版关闭(`--disable-cuda-graph` + target-only),S4 再接;
+  这是已确认的 fork 缺口,不是本版引入。
+- 回退:删 `SGLANG_V100_KV_TIER_PHYS_TOKENS` 即回到 Phase 2/生产语义。

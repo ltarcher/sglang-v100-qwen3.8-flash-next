@@ -184,7 +184,7 @@ class QSAIndexer(MultiPlatformOp):
             and qk.shape[0] > 0
             and self._use_fused_prep(qk)
         ):
-            from sglang.srt.layers.attention.qsa_indexer import (
+            from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
             )
 
@@ -253,7 +253,7 @@ class QSAIndexer(MultiPlatformOp):
         The member source defaults to the pending ring; extend forwards pass
         this forward's packed keys/rope instead (members are chunk-local).
         """
-        from sglang.srt.layers.attention.qsa_indexer import (
+        from sglang.kernels.ops.attention.qsa_indexer import (
             qsa_index_k_compress_store,
         )
 

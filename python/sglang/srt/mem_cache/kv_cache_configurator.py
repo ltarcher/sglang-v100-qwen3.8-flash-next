@@ -2000,8 +2000,30 @@ class KVCacheConfigurator:
             # MTP layer is itself a QSA layer, so draft workers get this pool too
             # rather than a bare hybrid one. QSA is never MLA, so use_mla and the
             # MLA extra_args do not apply.
+            #
+            # Phase 3 host tier (docs/v100/KV_HOST_TIER_DESIGN.md §10): shrink the
+            # full-KV device pool while keeping the LOGICAL token budget everywhere
+            # else.  The draft worker is rejected at startup by the host tier.
+            phys_size = envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get()
+            if phys_size:
+                if self.is_draft_worker:
+                    raise ValueError(
+                        "SGLANG_V100_KV_TIER_PHYS_TOKENS does not support MTP draft "
+                        "workers; serve target-only"
+                    )
+                if phys_size % self.pool_page_size:
+                    raise ValueError(
+                        "SGLANG_V100_KV_TIER_PHYS_TOKENS must be a multiple of the "
+                        f"KV pool page size ({self.pool_page_size}), got {phys_size}"
+                    )
+                if phys_size >= max_total_num_tokens:
+                    raise ValueError(
+                        "SGLANG_V100_KV_TIER_PHYS_TOKENS must be smaller than the "
+                        f"logical KV budget ({max_total_num_tokens}), got {phys_size}"
+                    )
             return QSATokenToKVPool(
                 **common_kwargs,
+                phys_size=int(phys_size),
                 qsa_index_kv_heads=qsa_profile.kv_heads,
                 qsa_index_head_dim=qsa_profile.head_dim,
                 qsa_compress_ratio=qsa_profile.compress_ratio,

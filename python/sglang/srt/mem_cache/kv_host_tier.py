@@ -78,9 +78,33 @@ _CNT_READ_HITS = 6
 _CNT_READ_MISSES = 7
 _CNT_PAGEIN_STEPS = 8
 _CNT_DEGRADES = 9
-_CNT_SLOTS = 10
+# Phase 3 (shrunk device pool, direct-modulo mapping).
+_CNT_P3_MIRROR_PAGES = 10
+_CNT_P3_WRITE_RESTORES = 11
+_CNT_P3_PAGEIN_RESTORES = 12
+_CNT_P3_COLLISIONS = 13
+_CNT_P3_HOST_GATHER_ROWS = 14
+# Diagnostics: a mirror whose tag gate rejects the page (host copy stays
+# invalid), and an extend gather that reads a host page with no valid copy.
+_CNT_P3_MIRROR_SKIPS = 15
+_CNT_P3_GATHER_UNVALID = 16
+# Debug invariants (QSA_P3_CHECK=1): rows whose page is tag-matched, mirrored
+# (hvalid) and not written by this forward must read identical bytes from the
+# device slot and the host mirror; a mismatch means the tag claims a page the
+# slot does not hold, or the mirror stored another page's bytes.
+_CNT_P3_CHECKED_ROWS = 17
+_CNT_P3_HOST_DEV_MISMATCH = 18
+_CNT_SLOTS = 19
+
+# Extend-read gather: rows per program. ROW_ELEMS is one token's K or V row
+# (kv_heads * head_dim); a tile of rows keeps the launches bounded at 512K.
+_P3_GATHER_ROWS = 16
 
 _LOG_EVERY_N_FLUSHES = 1000
+
+# Phase 3 logs per build step: a 516K single request is only ~250 steps, so the
+# 1000-flush cadence above would never fire for it.
+_LOG_EVERY_N_STEPS = 64
 
 # Fixed per-flush mirror capacity, in pages. A full 4k prefill chunk touches
 # 64 pages; the slack absorbs decode tokens appended to the same flush and
@@ -198,6 +222,231 @@ def _degrade_kernel(
     tl.store(garbled_ptr + page, 1)
 
 
+@triton.jit
+def _p3_mirror_kernel(
+    src_ptr,
+    dst_ptr,
+    uniq_ptr,
+    count_ptr,
+    tags_ptr,
+    hvalid_ptr,
+    phys_pages,
+    logical_pages,
+    skip_ptr,
+    counter_ptr,
+    PAGE_ELEMS: tl.constexpr,
+):
+    """Copy one logical page from its device slot into the pinned host mirror.
+
+    Phase 3's mapping is pure modulo, so the device slot for logical page
+    ``lp`` is ``lp % phys_pages``. A page is only mirrored while its tag still
+    names it: with at most ``phys_pages`` distinct writes per forward (checked
+    on the host side) nothing overwrote it in between, but the tag gate keeps
+    a bug from copying another page's bytes into the mirror.
+
+    The store targets pinned host memory directly (UVA); Phase 2's page-in
+    proved device accesses to that memory from a Triton kernel are supported.
+    """
+    i = tl.program_id(0)
+    if i >= tl.load(count_ptr):
+        return
+    lp = tl.load(uniq_ptr + i)
+    if lp >= logical_pages:
+        return
+    pp = lp % phys_pages
+    if tl.load(tags_ptr + pp) != lp:
+        # The slot was re-claimed by another logical page: its host copy stays
+        # whatever it was, and this page's rows must have been rewritten.
+        tl.atomic_add(skip_ptr, 1)
+        return
+    offs = tl.arange(0, PAGE_ELEMS)
+    src = src_ptr + pp * PAGE_ELEMS + offs
+    dst = dst_ptr + lp * PAGE_ELEMS + offs
+    tl.store(dst, tl.load(src))
+    tl.store(hvalid_ptr + lp, 1)
+    tl.atomic_add(counter_ptr, 1)
+
+
+@triton.jit
+def _p3_write_restore_kernel(
+    host_ptr,
+    dev_ptr,
+    uniq_ptr,
+    count_ptr,
+    tags_ptr,
+    protect_ptr,
+    hvalid_ptr,
+    phys_pages,
+    logical_pages,
+    counter_ptr,
+    PAGE_ELEMS: tl.constexpr,
+):
+    """Restore-then-write for this forward's write pages.
+
+    A write may touch only part of a page (decode appends one token to the
+    previous page), while modulo reuse means the device slot may hold another
+    logical page. Restore the host copy of ``lp`` first when one exists
+    (``hvalid``; a freshly allocated page has none and is fully rewritten),
+    then claim the slot with the tag and mark it protected: its host copy is
+    stale for the rows this forward is about to write.
+    """
+    i = tl.program_id(0)
+    if i >= tl.load(count_ptr):
+        return
+    lp = tl.load(uniq_ptr + i)
+    if lp >= logical_pages:
+        return
+    pp = lp % phys_pages
+    if tl.load(tags_ptr + pp) != lp and tl.load(hvalid_ptr + lp) != 0:
+        offs = tl.arange(0, PAGE_ELEMS)
+        tl.store(
+            dev_ptr + pp * PAGE_ELEMS + offs,
+            tl.load(host_ptr + lp * PAGE_ELEMS + offs),
+        )
+        tl.atomic_add(counter_ptr, 1)
+    tl.store(tags_ptr + pp, lp.to(tl.int32))
+    tl.store(protect_ptr + pp, 1)
+
+
+@triton.jit
+def _p3_page_in_kernel(
+    host_ptr,
+    dev_ptr,
+    uniq_ptr,
+    count_ptr,
+    tags_ptr,
+    protect_ptr,
+    hvalid_ptr,
+    phys_pages,
+    logical_pages,
+    restore_ptr,
+    collide_ptr,
+    PAGE_ELEMS: tl.constexpr,
+):
+    """Restore one layer's selected logical pages before its decode read.
+
+    The tag is the truth: a matching tag means the device slot already holds
+    this logical page (it may have been written this forward), so nothing is
+    copied. A protected slot holding a different page is a genuine capacity
+    collision -- the forward's write set aliases a page it must read -- and is
+    counted rather than silently reverting the live write.
+    """
+    i = tl.program_id(0)
+    if i >= tl.load(count_ptr):
+        return
+    lp = tl.load(uniq_ptr + i)
+    if lp >= logical_pages:
+        return
+    pp = lp % phys_pages
+    if tl.load(tags_ptr + pp) == lp:
+        return
+    if tl.load(protect_ptr + pp) != 0:
+        tl.atomic_add(collide_ptr, 1)
+        return
+    if tl.load(hvalid_ptr + lp) == 0:
+        return
+    offs = tl.arange(0, PAGE_ELEMS)
+    tl.store(
+        dev_ptr + pp * PAGE_ELEMS + offs,
+        tl.load(host_ptr + lp * PAGE_ELEMS + offs),
+    )
+    tl.store(tags_ptr + pp, lp.to(tl.int32))
+    tl.atomic_add(restore_ptr, 1)
+
+
+@triton.jit
+def _p3_gather_kernel(
+    dev_ptr,
+    host_ptr,
+    tags_ptr,
+    hvalid_ptr,
+    protect_ptr,
+    slots_ptr,
+    out_ptr,
+    n_rows,
+    phys_pages,
+    logical_tokens,
+    host_rows_ptr,
+    unvalid_ptr,
+    checked_ptr,
+    mismatch_ptr,
+    FORCE_HOST: tl.constexpr,
+    CHECK: tl.constexpr,
+    LOGICAL_SHIFT: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    ROW_ELEMS: tl.constexpr,
+    PAGE_ELEMS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Sparse extend read across the split device/host slot space.
+
+    Each row picks its source by tag: the device slot when it holds the
+    logical page, the pinned host mirror otherwise. No page-in, so a page the
+    same forward just wrote to an aliasing slot cannot clobber a read.
+    Invalid / padding slots are zero-filled, matching the never-written
+    prefix rows the packed kernel already tolerated.
+
+    Debug modes (both off in production):
+    ``FORCE_HOST`` reads every mirrored page (``hvalid`` set) from the host,
+    so a run that still matches the plain path proves the mirror content
+    correct and isolates the tag-gated device read. ``CHECK`` compares the
+    device and host bytes of every tag-matched, mirrored, not-yet-rewritten
+    page and counts rows that disagree.
+    """
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    mask_r = rows < n_rows
+    slots = tl.load(slots_ptr + rows, mask=mask_r, other=0).to(tl.int64)
+    valid = mask_r & (slots >= PAGE_SIZE) & (slots < logical_tokens)
+    lp = slots >> LOGICAL_SHIFT
+    off = slots - (lp << LOGICAL_SHIFT)
+    pp = lp % phys_pages
+    tags = tl.load(tags_ptr + pp, mask=valid, other=-1)
+    hvalid_v = tl.load(hvalid_ptr + lp, mask=valid, other=0)
+    tagmatch = valid & (tags == lp)
+    if FORCE_HOST:
+        on_device = tagmatch & (hvalid_v == 0)
+    else:
+        on_device = tagmatch
+    offs = tl.arange(0, ROW_ELEMS)
+    dev_idx = pp[:, None] * PAGE_ELEMS + off[:, None] * ROW_ELEMS + offs[None, :]
+    host_idx = lp[:, None] * PAGE_ELEMS + off[:, None] * ROW_ELEMS + offs[None, :]
+    value = tl.load(
+        dev_ptr + dev_idx, mask=on_device[:, None], other=0.0
+    ) + tl.load(
+        host_ptr + host_idx, mask=(valid & ~on_device)[:, None], other=0.0
+    )
+    tl.store(
+        out_ptr + rows[:, None] * ROW_ELEMS + offs[None, :],
+        value,
+        mask=mask_r[:, None],
+    )
+    tl.atomic_add(host_rows_ptr, tl.sum((valid & ~on_device).to(tl.int32)))
+    if CHECK:
+        # The host copy of a tag-matched page is only stale for rows written
+        # after the last mirror, and those pages carry a protect bit this
+        # forward. Everything else must be byte-identical.
+        checked = (
+            valid
+            & tagmatch
+            & (hvalid_v != 0)
+            & (tl.load(protect_ptr + pp, mask=valid, other=1) == 0)
+        )
+        both_dev = tl.load(dev_ptr + dev_idx, mask=checked[:, None], other=0.0)
+        both_host = tl.load(host_ptr + host_idx, mask=checked[:, None], other=0.0)
+        bad = (both_dev != both_host).to(tl.int32)
+        tl.atomic_add(checked_ptr, tl.sum(checked.to(tl.int32)))
+        tl.atomic_add(mismatch_ptr, tl.sum((tl.sum(bad, 1) > 0).to(tl.int32)))
+    # A host read of a page with no valid copy yields uninitialized bytes; the
+    # counter makes that visible instead of looking like a model-quality drop.
+    unvalid = valid & ~on_device
+    if tl.sum(unvalid.to(tl.int32)) > 0:
+        tl.atomic_add(
+            unvalid_ptr,
+            tl.sum(((hvalid_v == 0) & unvalid).to(tl.int32)),
+        )
+
+
 class KVHostTier:
     """Pinned host mirror + residency bookkeeping for the QSA full-KV pool."""
 
@@ -259,6 +508,23 @@ class KVHostTier:
                 )
             self._kv_buffers.append((k_buf, v_buf))
         self.device_pages = ref_shape[0] // self.page_size
+
+        # ------------------------------------------------------------------
+        # Phase 3 (docs/v100/KV_HOST_TIER_DESIGN.md §10): the device full-KV
+        # pool is smaller than the logical token budget. Below this level every
+        # logical id (allocator, req_to_token, radix, compressed indexer) is
+        # untouched; only the full-attention buffers shrink. Phase 1/2
+        # machinery is not allocated at all -- its pinned blocks are 32 GiB
+        # per rank by default.
+        # ------------------------------------------------------------------
+        self.phys_tokens = int(
+            getattr(pool, "phys_size", ref_shape[0] - self.page_size)
+        )
+        self.logical_tokens = int(getattr(pool, "logical_size", self.phys_tokens))
+        self.phase3 = self.phys_tokens != self.logical_tokens
+        if self.phase3:
+            self._init_phase3(pagein)
+            return
 
         page_bytes = self.page_size * self.kv_heads * self.head_dim * 2
         layer_page_bytes = 2 * self.layer_num * page_bytes  # K + V across layers
@@ -433,6 +699,430 @@ class KVHostTier:
         )
 
     # ------------------------------------------------------------------
+    # Phase 3: shrunk device pool, direct modulo mapping
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _host_mem_fields() -> str:
+        """One-line /proc/meminfo view around the boot-time pinned allocations.
+
+        The Phase 3 mirror is the last multi-GiB pinned block a rank allocates,
+        and on a 126 GiB box it lands while the checkpoint page cache is still
+        warm; logging both sides of the allocation is what separates "the
+        allocator itself costs more than the shape" from "someone else is
+        holding memory at this instant".
+        """
+        keys = ("MemFree", "MemAvailable", "Cached", "Shmem", "AnonPages", "Mlocked")
+        try:
+            with open("/proc/meminfo", "r") as f:
+                text = f.read()
+        except OSError:
+            return "meminfo unavailable"
+        seen = {}
+        for line in text.splitlines():
+            name, _, rest = line.partition(":")
+            if name in keys:
+                seen[name] = int(rest.split()[0]) // (1 << 20)
+        return " ".join(f"{k}={seen.get(k, -1)}GiB" for k in keys)
+
+    def _init_phase3(self, pagein: bool) -> None:
+        if pagein:
+            raise ValueError(
+                "SGLANG_V100_KV_TIER_PAGEIN is the Phase 2 degrade harness; "
+                "leave it unset when SGLANG_V100_KV_TIER_PHYS_TOKENS shrinks "
+                "the device pool (Phase 3 has its own read path)"
+            )
+        if self.device.type != "cuda":
+            raise ValueError("Phase 3 KV host tier requires a CUDA device")
+        if self.kv_dtype != torch.float16:
+            raise ValueError(
+                f"Phase 3 KV host tier assumes fp16 KV, got {self.kv_dtype}"
+            )
+        if self.page_size & (self.page_size - 1):
+            raise ValueError(
+                f"Phase 3 needs a power-of-two KV page size, got {self.page_size}"
+            )
+        self._page_shift = self.page_size.bit_length() - 1
+        self._page_elems = self.page_size * self.kv_heads * self.head_dim
+        if self._page_elems & (self._page_elems - 1):
+            raise ValueError(
+                f"Page extent {self._page_elems} (page_size={self.page_size}"
+                f" x kv_heads={self.kv_heads} x head_dim={self.head_dim})"
+                " is not a power of two"
+            )
+        row_elems = self.kv_heads * self.head_dim
+        if row_elems & (row_elems - 1):
+            raise ValueError(
+                f"One token's K/V row ({row_elems} = kv_heads {self.kv_heads}"
+                f" x head_dim {self.head_dim}) is not a power of two; the"
+                " Phase 3 gather kernel needs tl.arange over it"
+            )
+        self.phys_pages = self.phys_tokens // self.page_size
+        self.logical_pages = self.logical_tokens // self.page_size
+        if self.device_pages != self.phys_pages + 1:
+            raise ValueError(
+                f"Device KV buffer has {self.device_pages} pages; Phase 3 needs "
+                f"phys_pages={self.phys_pages} plus the reserved padding page"
+            )
+        # Logical page lp lives in device slot lp % phys_pages. The reserved
+        # padding page (index phys_pages) absorbs writes to the padding slot
+        # and page so they can never alias a real logical page.
+        self.phys_slot_base = self.phys_pages * self.page_size
+
+        mirror_elems = (
+            2
+            * self.layer_num
+            * self.logical_pages
+            * self.page_size
+            * self.kv_heads
+            * self.head_dim
+        )
+        mirror_gib = mirror_elems * self.kv_dtype.itemsize / (1 << 30)
+        # Measure the allowance before the allocation itself shrinks MemAvailable;
+        # checking afterwards always reports a fictionially tight budget.
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+
+        budget_gib = host_memory_budget_bytes() / (1 << 30)
+        if mirror_gib > budget_gib:
+            logger.warning(
+                "kv_host_tier phase3: full logical mirror %.2f GiB/rank may "
+                "exceed the host memory budget %.2f GiB.",
+                mirror_gib,
+                budget_gib,
+            )
+        # Weight loading stages tensors through pinned memory, and the caching
+        # host allocator keeps those blocks resident after they are freed. They
+        # are the same unevictable pages the mirror is about to ask for.
+        host_empty = getattr(torch._C, "_host_emptyCache", None)
+        if host_empty is not None:
+            host_empty()
+            logger.info(
+                "kv_host_tier phase3: released cached pinned blocks (%s)",
+                self._host_mem_fields(),
+            )
+        logger.info(
+            "kv_host_tier phase3: allocating %.2f GiB/rank pinned mirror (%s)",
+            mirror_gib,
+            self._host_mem_fields(),
+        )
+        self._host_logical = torch.empty(
+            (2, self.layer_num, self.logical_pages)
+            + (self.page_size, self.kv_heads, self.head_dim),
+            dtype=self.kv_dtype,
+            pin_memory=True,
+        )
+        logger.info(
+            "kv_host_tier phase3: pinned mirror allocated (%s)",
+            self._host_mem_fields(),
+        )
+
+        # Per-layer tags/protect: every full-attention layer has its own device
+        # buffer, so "which logical page is in slot pp" is per layer; a shared
+        # tag would let one layer's restore claim a slot for its neighbours.
+        self._p3_tags = torch.full(
+            (self.layer_num, self.phys_pages + 1),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._p3_protect = torch.zeros(
+            (self.layer_num, self.phys_pages + 1), dtype=torch.uint8, device=self.device
+        )
+        self._p3_hvalid = torch.zeros(
+            (self.layer_num, self.logical_pages), dtype=torch.uint8, device=self.device
+        )
+        # Write-page compaction ping-pong: [cur] is the pending list the next
+        # build mirrors, [1-cur] is being filled. Capacity covers every
+        # logical page plus the invalid sentinel, so compaction never folds
+        # two distinct pages.
+        self._p3_cap = self.logical_pages + 1
+        self._p3_uniq = [
+            torch.zeros(self._p3_cap, dtype=torch.long, device=self.device)
+            for _ in range(2)
+        ]
+        self._p3_count = [
+            torch.zeros(1, dtype=torch.int32, device=self.device) for _ in range(2)
+        ]
+        self._p3_cur = 0
+        self._p3_pending_bound = 0
+        # Decode page-in compaction scratch (recomputed per layer; the
+        # selected set differs per layer and must not touch the pending list).
+        self._p3_pi_uniq = torch.zeros(
+            self._p3_cap, dtype=torch.long, device=self.device
+        )
+        self._p3_pi_count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        # Debug-only read-path switches (production leaves both unset):
+        # FORCE_HOST reads every mirrored page from the host mirror, CHECK
+        # counts device/host disagreements on tag-matched pages.
+        self._p3_force_host = os.environ.get("QSA_P3_FORCE_HOST") == "1"
+        self._p3_check = os.environ.get("QSA_P3_CHECK") == "1"
+
+        self.pagein = False
+        self.layer_slot = {gid: i for i, gid in enumerate(self.layer_ids)}
+        self.rep_k = None
+        self._pending: List[torch.Tensor] = []
+        self.counters = torch.zeros(_CNT_SLOTS, dtype=torch.int64, device=self.device)
+        self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._flush_ev = torch.cuda.Event()
+        self.step_seq = 0
+        self._flush_count = 0
+        logger.info(
+            "kv_host_tier phase3: layers=%d, page=%d tokens, logical_pages=%d, "
+            "phys_pages=%d, host logical mirror %.2f GiB/rank, debug read path "
+            "force_host=%s check=%s",
+            self.layer_num,
+            self.page_size,
+            self.logical_pages,
+            self.phys_pages,
+            mirror_gib,
+            self._p3_force_host,
+            self._p3_check,
+        )
+
+    def map_slots(self, slots: torch.Tensor) -> torch.Tensor:
+        """Logical token slots -> physical device slots (pure modulo).
+
+        Padding / reserved slots (the pool's slot-0 page and anything at or
+        past the logical budget) land on the reserved padding page instead of
+        aliasing a real logical page.
+        """
+        slots = slots.to(torch.long)
+        page = slots >> self._page_shift
+        off = slots & (self.page_size - 1)
+        real = (slots >= self.page_size) & (slots < self.logical_tokens)
+        phys = (page % self.phys_pages) * self.page_size + off
+        return torch.where(real, phys, self.phys_slot_base + off)
+
+    def map_slot_table(self, table: torch.Tensor) -> torch.Tensor:
+        """int32 logical slot table -> int32 physical slot table."""
+        page = table >> self._page_shift
+        off = table & (self.page_size - 1)
+        real = (table >= self.page_size) & (table < self.logical_tokens)
+        phys = (page % self.phys_pages) * self.page_size + off
+        return torch.where(real, phys, self.phys_slot_base + off).to(torch.int32)
+
+    def _p3_compact(
+        self, pages: torch.Tensor, uniq: torch.Tensor, count: torch.Tensor
+    ) -> None:
+        """Dedup logical page numbers into (uniq, count) with no host sync."""
+        sorted_pages = torch.sort(pages.reshape(-1)).values
+        heads = torch.empty_like(sorted_pages, dtype=torch.int32)
+        # fill_, not heads[0] = 1: integer index assignment lowers to a
+        # pageable H2D copy_, which stream capture rejects.
+        heads[0].fill_(1)
+        heads[1:] = sorted_pages[1:] != sorted_pages[:-1]
+        dest = torch.cumsum(heads, dim=0, dtype=torch.long) - 1
+        uniq.scatter_(0, dest.clamp(max=self._p3_cap - 1), sorted_pages)
+        count.copy_(dest[-1] + 1)
+
+    def _p3_logical_pages(self, slots: torch.Tensor) -> torch.Tensor:
+        s = slots.reshape(-1).to(torch.long)
+        page = s >> self._page_shift
+        real = (s >= self.page_size) & (s < self.logical_tokens)
+        return torch.where(real, page, torch.full_like(page, self.logical_pages))
+
+    def _p3_mirror_layer(self, li: int, uniq, count, bound, counter) -> None:
+        k_buf, v_buf = self._kv_buffers[li]
+        skip = self.counters[
+            _CNT_P3_MIRROR_SKIPS : _CNT_P3_MIRROR_SKIPS + 1
+        ]
+        for kv, buf in ((0, k_buf), (1, v_buf)):
+            _p3_mirror_kernel[(bound,)](
+                buf.view(torch.int16),
+                self._host_logical[kv, li].view(torch.int16),
+                uniq,
+                count,
+                self._p3_tags[li],
+                self._p3_hvalid[li],
+                self.phys_pages,
+                self.logical_pages,
+                skip,
+                counter,
+                PAGE_ELEMS=self._page_elems,
+                num_warps=8,
+            )
+
+    def on_build_phase3(self, out_cache_loc: Optional[torch.Tensor]):
+        """Book this forward's writes and return the physical write slots.
+
+        Order matters and is enforced by the stream: mirror the previous
+        build's write pages (their host copies become current), clear the
+        protect bits, then restore-then-claim this forward's write pages.
+        All of it runs before the model forward, so the extend gather and the
+        decode page-in of this forward observe consistent host copies.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Phase 3 KV host tier does not support CUDA-graph capture; "
+                "serve with --disable-cuda-graph"
+            )
+        self.step_seq += 1
+        if self.step_seq % _LOG_EVERY_N_STEPS == 0:
+            # flush() returns early in Phase 3, so the counter dump has to hang
+            # off the build hook instead.
+            self.log_stats()
+        if self._p3_pending_bound > 0:
+            counter = self.counters[
+                _CNT_P3_MIRROR_PAGES : _CNT_P3_MIRROR_PAGES + 1
+            ]
+            for li in range(self.layer_num):
+                self._p3_mirror_layer(
+                    li,
+                    self._p3_uniq[self._p3_cur],
+                    self._p3_count[self._p3_cur],
+                    self._p3_pending_bound,
+                    counter,
+                )
+        self._p3_pending_bound = 0
+        self._p3_protect.zero_()
+
+        cur = 1 - self._p3_cur
+        bound = 0
+        if out_cache_loc is not None and out_cache_loc.numel():
+            bound = min(int(out_cache_loc.numel()), self._p3_cap)
+            pages = self._p3_logical_pages(out_cache_loc)
+            self._p3_compact(pages, self._p3_uniq[cur], self._p3_count[cur])
+            uniq, count = self._p3_uniq[cur], self._p3_count[cur]
+            counter = self.counters[
+                _CNT_P3_WRITE_RESTORES : _CNT_P3_WRITE_RESTORES + 1
+            ]
+            for li in range(self.layer_num):
+                k_buf, v_buf = self._kv_buffers[li]
+                for kv, buf in ((0, k_buf), (1, v_buf)):
+                    _p3_write_restore_kernel[(bound,)](
+                        self._host_logical[kv, li].view(torch.int16),
+                        buf.view(torch.int16),
+                        uniq,
+                        count,
+                        self._p3_tags[li],
+                        self._p3_protect[li],
+                        self._p3_hvalid[li],
+                        self.phys_pages,
+                        self.logical_pages,
+                        counter,
+                        PAGE_ELEMS=self._page_elems,
+                        num_warps=8,
+                    )
+        else:
+            self._p3_count[cur].zero_()
+        self._p3_cur = cur
+        self._p3_pending_bound = bound
+        if out_cache_loc is None:
+            return None
+        return self.map_slots(out_cache_loc)
+
+    def page_in_selected_phase3(
+        self,
+        slot_table: torch.Tensor,
+        positions: torch.Tensor,
+        tier_layer: int,
+    ) -> None:
+        """Restore one layer's selected logical pages before its decode read.
+
+        ``positions`` are logical per-row positions, resolved through the
+        dense logical ``slot_table`` (batch-local rows) exactly like the SM70
+        decode kernel's table. Deduped on-device, so a top-k set touching a
+        page dozens of times copies it once.
+        """
+        if positions.numel() == 0 or slot_table.numel() == 0:
+            return
+        n_rows = int(positions.shape[0])
+        max_len = int(slot_table.shape[1])
+        rows = torch.arange(n_rows, device=self.device, dtype=torch.long).clamp(
+            max=slot_table.shape[0] - 1
+        )
+        pos = positions.to(torch.long)
+        valid = (pos >= 0) & (pos < max_len)
+        pos = pos.clamp(0, max_len - 1)
+        s = slot_table[rows.unsqueeze(1), pos].to(torch.long)
+        real = valid & (s >= self.page_size) & (s < self.logical_tokens)
+        pages = torch.where(
+            real, s >> self._page_shift, torch.full_like(s, self.logical_pages)
+        )
+        bound = min(int(pages.numel()), self._p3_cap)
+        self._p3_compact(pages, self._p3_pi_uniq, self._p3_pi_count)
+        restore = self.counters[
+            _CNT_P3_PAGEIN_RESTORES : _CNT_P3_PAGEIN_RESTORES + 1
+        ]
+        collide = self.counters[_CNT_P3_COLLISIONS : _CNT_P3_COLLISIONS + 1]
+        k_buf, v_buf = self._kv_buffers[tier_layer]
+        for kv, buf in ((0, k_buf), (1, v_buf)):
+            _p3_page_in_kernel[(bound,)](
+                self._host_logical[kv, tier_layer].view(torch.int16),
+                buf.view(torch.int16),
+                self._p3_pi_uniq,
+                self._p3_pi_count,
+                self._p3_tags[tier_layer],
+                self._p3_protect[tier_layer],
+                self._p3_hvalid[tier_layer],
+                self.phys_pages,
+                self.logical_pages,
+                restore,
+                collide,
+                PAGE_ELEMS=self._page_elems,
+                num_warps=8,
+            )
+
+    def gather_kv_rows(
+        self,
+        tier_layer: int,
+        k_buf: torch.Tensor,
+        v_buf: torch.Tensor,
+        slots: torch.Tensor,
+        out_k: torch.Tensor,
+        out_v: torch.Tensor,
+    ) -> None:
+        """Gather logical rows from device *or* the pinned host mirror.
+
+        Extend reads materialize the whole prefix, which modulo mapping
+        cannot hold on device. Reading the host copy in place avoids
+        restoring pages the same forward may be aliasing with its own writes.
+        """
+        n = int(slots.numel())
+        if n == 0:
+            return
+        grid = (triton.cdiv(n, _P3_GATHER_ROWS),)
+        counter = self.counters[
+            _CNT_P3_HOST_GATHER_ROWS : _CNT_P3_HOST_GATHER_ROWS + 1
+        ]
+        unvalid = self.counters[
+            _CNT_P3_GATHER_UNVALID : _CNT_P3_GATHER_UNVALID + 1
+        ]
+        checked = self.counters[
+            _CNT_P3_CHECKED_ROWS : _CNT_P3_CHECKED_ROWS + 1
+        ]
+        mismatch = self.counters[
+            _CNT_P3_HOST_DEV_MISMATCH : _CNT_P3_HOST_DEV_MISMATCH + 1
+        ]
+        tags = self._p3_tags[tier_layer]
+        protect = self._p3_protect[tier_layer]
+        for kv, buf, out in ((0, k_buf, out_k), (1, v_buf, out_v)):
+            _p3_gather_kernel[grid](
+                buf,
+                self._host_logical[kv, tier_layer],
+                tags,
+                self._p3_hvalid[tier_layer],
+                protect,
+                slots,
+                out,
+                n,
+                self.phys_pages,
+                self.logical_tokens,
+                counter,
+                unvalid,
+                checked,
+                mismatch,
+                FORCE_HOST=self._p3_force_host,
+                CHECK=self._p3_check,
+                LOGICAL_SHIFT=self._page_shift,
+                PAGE_SIZE=self.page_size,
+                ROW_ELEMS=self.kv_heads * self.head_dim,
+                PAGE_ELEMS=self._page_elems,
+                BLOCK_ROWS=_P3_GATHER_ROWS,
+                num_warps=4,
+            )
+
+    # ------------------------------------------------------------------
     # Write path (mirror on write)
     # ------------------------------------------------------------------
 
@@ -444,6 +1134,9 @@ class KVHostTier:
         graph replays, where only the step counter advances.
         """
         self.step_seq += 1
+        if self.phase3:
+            # Phase 3 writes are booked/mirrored by on_build_phase3.
+            return
         if torch.cuda.is_current_stream_capturing():
             return
         if out_cache_loc is not None and out_cache_loc.numel() > 0:
@@ -861,6 +1554,24 @@ class KVHostTier:
     def log_stats(self) -> None:
         self._copy_stream.synchronize()
         c = self.counters.tolist()
+        if self.phase3:
+            logger.info(
+                "kv_host_tier phase3 stats: steps=%d mirror_pages=%d "
+                "write_restores=%d pagein_restores=%d collisions=%d "
+                "host_gather_rows=%d mirror_skips=%d gather_unvalid=%d "
+                "checked_rows=%d host_dev_mismatch=%d",
+                self.step_seq,
+                c[_CNT_P3_MIRROR_PAGES],
+                c[_CNT_P3_WRITE_RESTORES],
+                c[_CNT_P3_PAGEIN_RESTORES],
+                c[_CNT_P3_COLLISIONS],
+                c[_CNT_P3_HOST_GATHER_ROWS],
+                c[_CNT_P3_MIRROR_SKIPS],
+                c[_CNT_P3_GATHER_UNVALID],
+                c[_CNT_P3_CHECKED_ROWS],
+                c[_CNT_P3_HOST_DEV_MISMATCH],
+            )
+            return
         reads = c[_CNT_READ_HITS] + c[_CNT_READ_MISSES]
         hit_rate = c[_CNT_READ_HITS] / reads * 100 if reads else 0.0
         logger.info(

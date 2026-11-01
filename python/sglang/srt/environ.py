@@ -1589,6 +1589,15 @@ class Envs:
     # and then garbage-filled, so every subsequent decode read of them must
     # go through page-in. Used by the bit-consistency A/B gate.
     SGLANG_V100_KV_TIER_DEGRADE_FLAG = EnvStr("")
+    # Phase 3 (docs/v100/KV_HOST_TIER_DESIGN.md §10): shrink the full-KV device
+    # pool to this many tokens per rank while the scheduler, allocator,
+    # req_to_token and radix tree keep the logical token budget. Logical pages
+    # direct-map onto the smaller device region (phys_page = logical_page % P)
+    # and a pinned host mirror holds every logical page, so prefill/decode
+    # reads page in on demand and the freed device memory goes to activations.
+    # 0 = off (Phase 1/2 behavior); requires a multiple of the pool page size.
+    # Opt-in only: needs --disable-cuda-graph and target-only serving.
+    SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(0)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)

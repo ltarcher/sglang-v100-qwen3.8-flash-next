@@ -97,6 +97,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
         index_state_dtype: Optional[torch.dtype] = None,
+        phys_size: int = 0,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -112,6 +113,24 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
+        # Phase 3 host tier: the full-KV device pool may shrink while every
+        # logical-id consumer (allocator, req_to_token, radix, compressed
+        # indexer) keeps the logical budget. ``logical_size`` is that budget;
+        # ``size`` (== phys_size) is only the device row count.
+        self.logical_size = int(size)
+        if phys_size:
+            if phys_size <= 0 or phys_size % page_size:
+                raise ValueError(
+                    "phys_size must be a positive multiple of the KV page size "
+                    f"({page_size} tokens), got {phys_size}"
+                )
+            if phys_size >= self.logical_size:
+                raise ValueError(
+                    f"phys_size={phys_size} must be smaller than the logical "
+                    f"pool size={self.logical_size}"
+                )
+            size = int(phys_size)
+        self.phys_size = int(size)
         super().__init__(
             size=size,
             dtype=dtype,
@@ -168,7 +187,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_compressed_dtype,
             self.index_state_dtype,
         )
-        state_size = size + page_size
+        # Compressed keys address the LOGICAL slot space (full_slot // ratio),
+        # so their capacity always follows the logical budget even when the
+        # full-KV device pool is shrunk by the host tier.
+        state_size = self.logical_size + page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio

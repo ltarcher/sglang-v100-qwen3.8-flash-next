@@ -262,6 +262,12 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     fa2_valid_counts: Optional[torch.Tensor] = None
     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    # Phase 3 host tier (docs/v100/KV_HOST_TIER_DESIGN.md §10): the same slot
+    # table remapped into the shrunk device pool, and the mapped write slots
+    # this forward's ``set_kv_buffer`` must use. Both None when the tier's
+    # physical mapping is off.
+    phys_token_slot_table: Optional[torch.Tensor] = None
+    phys_out_cache_loc: Optional[torch.Tensor] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -995,10 +1001,30 @@ class QwenSparseAttnBackend(AttentionBackend):
                 and decode_logical_positions is not None
             ),
         )
+        phys_token_slot_table = None
+        phys_out_cache_loc = None
+        if self._kv_host_tier is not None and self._kv_host_tier.phase3:
+            if speculative_paged:
+                raise ValueError(
+                    "Phase 3 KV host tier supports target-only serving; disable "
+                    "MTP (speculative paged metadata) or unset "
+                    "SGLANG_V100_KV_TIER_PHYS_TOKENS"
+                )
+            # Book this forward's writes (mirror the previous forward's pages,
+            # restore-then-claim the write pages) and remap the slot table.
+            # Runs before any layer, so writes and reads in this forward
+            # observe consistent host copies.
+            phys_out_cache_loc = self._kv_host_tier.on_build_phase3(
+                forward_batch.out_cache_loc
+            )
+            phys_token_slot_table = self._kv_host_tier.map_slot_table(
+                token_slot_table
+            )
         if self._kv_host_tier is not None:
-            # Mirror this forward's KV writes into the host tier (Phase 1
-            # pipeline; async on the tier's copy stream, read path unchanged).
-            self._kv_host_tier.flush(forward_batch.out_cache_loc)
+            if not self._kv_host_tier.phase3:
+                # Mirror this forward's KV writes into the host tier (Phase 1
+                # pipeline; async on the tier's copy stream, read path unchanged).
+                self._kv_host_tier.flush(forward_batch.out_cache_loc)
             if (
                 self._kv_host_tier.pagein
                 and self.req_to_token is not None
@@ -1023,6 +1049,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            phys_token_slot_table=phys_token_slot_table,
+            phys_out_cache_loc=phys_out_cache_loc,
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1668,6 +1696,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         assert self.forward_metadata is not None
         return self.forward_metadata
 
+    def _kv_write_loc(self, forward_batch) -> torch.Tensor:
+        """Write slots for ``set_kv_buffer``: physical under the Phase 3 tier."""
+        tier = self._kv_host_tier
+        if tier is not None and tier.phase3:
+            return self._resolve_metadata(forward_batch).phys_out_cache_loc
+        return forward_batch.out_cache_loc
+
     @staticmethod
     def _logical_to_physical(
         logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
@@ -1820,7 +1855,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 return fused_output
             _kvstats_probe(layer.layer_id, k, v)
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, self._kv_write_loc(forward_batch), k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
@@ -1959,31 +1994,66 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
             return self._pad_extend_output(output, num_output_rows)
-        req_to_token = self.req_to_token_pool.req_to_token
-        if is_in_breakable_cuda_graph():
-            # Reuse the prepared slot table to avoid a D2H sync per layer on replay.
-            req_to_token = self._resolve_metadata(forward_batch).token_slot_table
-            req_indices = range(len(sequence_lens))
-        else:
-            req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
-        packed_k = torch.cat(k_parts)
-        packed_v = torch.cat(v_parts)
+        _tier = self._kv_host_tier
+        if _tier is not None and _tier.phase3:
+            # Phase 3: the prefix spans more logical pages than the device
+            # pool holds, so gather row-by-row from the device slot or the
+            # pinned host mirror (tag decides) instead of index_select over
+            # a nonexistent full-prefix device materialization.
+            slot = _tier.layer_slot.get(layer.layer_id)
+            if slot is None:
+                raise ValueError(
+                    f"Layer {layer.layer_id} has no Phase 3 host tier slot"
+                )
+            table = self._resolve_metadata(forward_batch).token_slot_table
+            total = sum(sequence_lens)
+            packed_k = torch.empty(
+                (total,) + tuple(k_buffer.shape[1:]),
+                dtype=k_buffer.dtype,
+                device=k_buffer.device,
+            )
+            packed_v = torch.empty_like(packed_k)
+            offset = 0
+            for i, n in enumerate(sequence_lens):
+                if n <= 0:
+                    continue
+                _tier.gather_kv_rows(
+                    slot,
+                    k_buffer,
+                    v_buffer,
+                    table[i, :n],
+                    packed_k[offset : offset + n],
+                    packed_v[offset : offset + n],
+                )
+                offset += n
+        else:
+            req_to_token = self.req_to_token_pool.req_to_token
+            if is_in_breakable_cuda_graph():
+                # Reuse the prepared slot table to avoid a D2H sync per layer on replay.
+                req_to_token = self._resolve_metadata(
+                    forward_batch
+                ).token_slot_table
+                req_indices = range(len(sequence_lens))
+            else:
+                req_indices = forward_batch.req_pool_indices.tolist()
+            k_parts = [
+                k_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            v_parts = [
+                v_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            packed_k = torch.cat(k_parts)
+            packed_v = torch.cat(v_parts)
         if packed_k.dtype != q.dtype:
             # SM70 has no FP8 dot instruction. Prefix/chunk prefill is an
             # uncommon path for the bounded 8K deployment, so decode the
@@ -2027,6 +2097,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise NotImplementedError(
                 "QSA prefill CP only supports the zigzag strategy; "
                 f"got {strategy_name}."
+            )
+        if self._kv_host_tier is not None and self._kv_host_tier.phase3:
+            raise NotImplementedError(
+                "Phase 3 KV host tier does not support QSA prefill context "
+                "parallelism; unset SGLANG_V100_KV_TIER_PHYS_TOKENS"
             )
         meta = forward_batch.attn_cp_metadata
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -2412,7 +2487,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 return fused_output
             _kvstats_probe(layer.layer_id, k, v)
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, self._kv_write_loc(forward_batch), k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
@@ -2438,6 +2513,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         _tier = self._kv_host_tier
         if (
             _tier is not None
+            and not _tier.phase3
             and self.req_to_token is not None
             and _tier.step_seq != self._kv_tier_noted_step
             and (
@@ -2480,7 +2556,22 @@ class QwenSparseAttnBackend(AttentionBackend):
                     _pi_slot,
                     force=metadata.is_cuda_graph,
                 )
-        if self._can_use_sm70_dense_decode(
+        tier3 = _tier is not None and _tier.phase3
+        if tier3:
+            _pi_slot = _tier.layer_slot.get(layer.layer_id)
+            if _pi_slot is not None and (
+                forward_batch.forward_mode.is_decode()
+                or QwenSparseAttnBackend._is_speculative_paged_mode(
+                    forward_batch.forward_mode
+                )
+            ):
+                # Phase 3: restore this layer's selected pages (device slots
+                # picked by modulo) before the kernel reads them. Tag-matched
+                # slots are already resident; the host mirror supplies the rest.
+                _tier.page_in_selected_phase3(
+                    metadata.token_slot_table, topk_indices, _pi_slot
+                )
+        if not tier3 and self._can_use_sm70_dense_decode(
             q, k_buffer, v_buffer, forward_batch, metadata
         ):
             return self._forward_sm70_dense_decode(
@@ -2494,9 +2585,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata,
             topk_indices,
         ):
-            req_indices = metadata.row_req_pool_indices
-            if req_indices is None:
-                req_indices = forward_batch.req_pool_indices
+            if tier3:
+                # The physical table's rows are batch-local: the kernel's
+                # ``req_index * req_stride + logical`` resolves exactly like
+                # the logical req_to_token it reads today.
+                kv_table = metadata.phys_token_slot_table
+                req_indices = torch.arange(
+                    kv_table.shape[0], device=q.device, dtype=torch.int32
+                )
+            else:
+                kv_table = self.req_to_token_pool.req_to_token
+                req_indices = metadata.row_req_pool_indices
+                if req_indices is None:
+                    req_indices = forward_batch.req_pool_indices
             from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
                 sm70_cuda_qsa_decode,
             )
@@ -2511,7 +2612,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q,
                 k_buffer,
                 v_buffer,
-                self.req_to_token_pool.req_to_token,
+                kv_table,
                 req_indices,
                 topk_indices,
                 metadata.sequence_lengths,
@@ -2573,11 +2674,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
-            self.req_to_token_pool.req_to_token,
             (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
+                metadata.phys_token_slot_table
+                if tier3
+                else self.req_to_token_pool.req_to_token
+            ),
+            (
+                torch.arange(
+                    metadata.phys_token_slot_table.shape[0],
+                    device=q.device,
+                    dtype=torch.int32,
+                )
+                if tier3
+                else (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                )
             ),
             topk_indices,
             sequence_lens,

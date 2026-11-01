@@ -1126,6 +1126,27 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def drop_checkpoint_cache_at_end(
+    iterator: Iterable[Tuple[str, torch.Tensor]], hf_weights_files: List[str]
+):
+    """Release every shard's page cache after the last tensor has been consumed.
+
+    Per-shard ``posix_fadvise(DONTNEED)`` cannot reclaim a page that another
+    rank still holds mapped -- mapped pages are not candidates for invalidation
+    -- and under TP>1 the ranks are a few shards apart, so the checkpoint page
+    cache survives the per-shard drop. On a box where the weights are a large
+    fraction of RAM that leaves the KV-pool init competing with ~100 GiB of
+    page cache and forces the host into swap. All ranks consume the same shard
+    list, so synchronize on the iterator's tail and drop once more, when every
+    mapping is gone.
+    """
+    yield from iterator
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    for st_file in hf_weights_files:
+        _drop_file_cache_after_load(st_file)
+
+
 def _tensor_from_safetensors_handle(handle, name: str, read_tensor):
     """Materialize one tensor, or None when ``read_tensor`` says this rank skips it."""
     if read_tensor is None:
