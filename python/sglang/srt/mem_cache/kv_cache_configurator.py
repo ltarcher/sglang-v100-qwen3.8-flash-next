@@ -2001,16 +2001,25 @@ class KVCacheConfigurator:
             # rather than a bare hybrid one. QSA is never MLA, so use_mla and the
             # MLA extra_args do not apply.
             #
-            # Phase 3 host tier (docs/v100/KV_HOST_TIER_DESIGN.md §10): shrink the
-            # full-KV device pool while keeping the LOGICAL token budget everywhere
-            # else.  The draft worker is rejected at startup by the host tier.
+            # Phase 3 host tier (docs/v100/KV_HOST_TIER_DESIGN.md §10/S4):
+            # shrink the full-KV device pool while keeping the LOGICAL token
+            # budget everywhere else. Target pools take the phys override;
+            # MTP draft pools skip both the override and the tier entirely
+            # (host_tier=False) -- the draft's single QSA layer stays fully
+            # device-resident at the logical capacity, which keeps the draft
+            # on the plain logical read path and avoids a second pinned
+            # mirror next to the target's.
             phys_size = envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get()
+            draft_pool_tier_free = bool(phys_size) and self.is_draft_worker
+            if draft_pool_tier_free:
+                logger.warning(
+                    "SGLANG_V100_KV_TIER_PHYS_TOKENS is ignored on the MTP draft "
+                    "pool: it stays fully device-resident at the logical budget "
+                    "(%d tokens) with no host tier",
+                    max_total_num_tokens,
+                )
+                phys_size = 0
             if phys_size:
-                if self.is_draft_worker:
-                    raise ValueError(
-                        "SGLANG_V100_KV_TIER_PHYS_TOKENS does not support MTP draft "
-                        "workers; serve target-only"
-                    )
                 if phys_size % self.pool_page_size:
                     raise ValueError(
                         "SGLANG_V100_KV_TIER_PHYS_TOKENS must be a multiple of the "
@@ -2024,6 +2033,7 @@ class KVCacheConfigurator:
             return QSATokenToKVPool(
                 **common_kwargs,
                 phys_size=int(phys_size),
+                host_tier=not draft_pool_tier_free,
                 qsa_index_kv_heads=qsa_profile.kv_heads,
                 qsa_index_head_dim=qsa_profile.head_dim,
                 qsa_compress_ratio=qsa_profile.compress_ratio,

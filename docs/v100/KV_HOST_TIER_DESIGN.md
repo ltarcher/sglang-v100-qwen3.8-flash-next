@@ -421,13 +421,50 @@ phys_slot(s)  = (s // page % P) * page + s % page
 | S1 | 池物理化 + 逻辑压缩 K + 写路径 + 全量 host 镜像(页入关闭) | 261k 三臂数字不回退;内存统计符合 10.1 |
 | S2 | decode/eager 选中页页入 + phys 表 | 261k/4k 输出与前值同噪声包络;miss 计数合理 |
 | S3 | 516K×1 冷 prefill(`/tmp/phase3_512k_once.py`) | 成功出 128 tokens;记录 TTFT/miss/页入字节 |
-| S4 | MTP + CUDA graph(eager MTP 路径本 fork 缺失,先修 `_speculative_max_row_length`) | accept ~2.1;图回放页入位一致 |
+| S4 | MTP + CUDA graph(eager MTP 路径本 fork 缺失,先修 `_speculative_max_row_length`) | accept ~2.1;图回放页入位一致(已达成,见 10.7) |
 
 ### 10.6 已知限制与回退
 
 - 本版仍是**单 kernel 直映射**,不处理 512K×2/×4 的准入工作集(§3.2 组件 5)。
+- **512K×2/×4 宿主内存预估(2026-11-01,×1 实测外推)**:宿主镜像按逻辑页
+  全量 pinned 分配(~12.2 KB/token/rank),而逻辑池为全请求共享,×2/×4 首先
+  要把 `max-total-tokens` 提到 ~1.07M/~2.15M,镜像随之 53.2/106.3 GB。
+  ×1 实测固定开销 ≈97.6 GB(PLE 51 + torch/NCCL 共享池 ~26 + scheduler
+  anon ~11 + OS ~8),MemTotal 131.9 GB → **×2 总占用 ~150.8 GB(缺 ~19 GB),
+  ×4 ~203.9 GB(缺 ~72 GB),均不可行**;镜像 pinned 不可换出,swap(117G)
+  救不了。出路:×2 需把 PLE 下沉 NVMe(省 51 GB → 余 ~32 GB);×4 需 PLE
+  下沉 + §6 杠杆 2 去复制(镜像减半 → ~126.6 GB,余 ~5 GB 贴边),再叠加
+  NVMe KV 冷层(杠杆 3)才稳。无论内存还是语义,×2/×4 都要先做组件 5 准入,
+  并恢复 CUDA graph/MTP(eager 下 ×4 聚合 decode 仅 ~20-24 tok/s,离 §7 门
+  ≥120 tok/s 差 5 倍)。次级约束:设备侧压缩 indexer K 保持逻辑容量
+  (×4 时 3.15 GiB/rank,对 476 MiB 低水位复核);`--max-mamba-cache-size 20`
+  在 ×4 下需按并发复核(mamba extra_buffer 要留并发槽)。
 - radix 保留(逻辑 id),但 **hicache 在 Phase 3 档位关闭**:它的
   write-back 假设设备槽=逻辑槽;恢复前缀要靠 read 路径页入而非 hicache。
-- MTP 在本版关闭(`--disable-cuda-graph` + target-only),S4 再接;
-  这是已确认的 fork 缺口,不是本版引入。
+- MTP 曾在本版关闭(`--disable-cuda-graph` + target-only);S4 已接入
+  MTP + CUDA graph(见 10.7),该 fork 缺口已闭合。
 - 回退:删 `SGLANG_V100_KV_TIER_PHYS_TOKENS` 即回到 Phase 2/生产语义。
+
+### 10.7 S4 实测记录(2026-11-01,4×V100-32GB,/tmp/phase3-repro-small.yaml)
+
+Phase 3 host KV tier 之上接入 MTP + CUDA graph,三图(target verify、draft
+decode、draft extend)全部捕获成功:
+
+- **图捕获**:target verify 130.2s / 0.11 GB、draft decode 3.6s / 0.04 GB、
+  draft extend 1.3s / 0.0 GB(bs=1,backend=full)。tier3 图缓冲为持久全宽表
+  (`_ensure_tier3_graph_buffers`,宽度 = `req_to_token.shape[1]`),回放期经
+  `_tier3_refresh_graph_tables` 入队 `on_build_phase3` + `map_slot_table`
+  刷新(流序在 `launch_graph_metadata` 回写 `row_req_pool_indices` 之后),
+  满足捕获内核烘焙表宽/行数的契约。
+- **正确性**:4K sanity accept len 2.88(cuda graph: True);516K needle
+  (`/tmp/phase3_512k_once.py 516000 needle s4run2`,实测 518,080 tokens、
+  usage 0.97)命中,decode 全程 cuda graph: True,accept len 3.60-3.85
+  (≥ §7 门 1.79);phase3 计数器 steps=192、host_gather_rows=10,321,920、
+  **host_dev_mismatch=0**、collisions=0——图回放页入位一致成立。
+- **性能**:冷 516K TTFT ~308s(平均 ~1.7K tok/s;池占用 >90% 时降至
+  ~1.0K tok/s);decode 98-105 tok/s/流 @518K(vs 现网基线 ~100,无回退)。
+- **MTP draft 隔离**:draft 池按预期跳过 host tier(启动 warning 三 rank
+  可见),draft 图正常捕获,`flush` Phase 3 no-op;eager spec_paged 路径
+  的 Phase 3 raise 移除,与图路径共用 `on_build_phase3`+`map_slot_table`。
+- **显存**:稳态 ~29.0-29.6 GB/卡;516K prefill+decode 峰值 32,152 MiB
+  (GPU0,余 ~0.6 GiB)——单请求贴边,并发扩大必须先做 §3.2 组件 5 准入。

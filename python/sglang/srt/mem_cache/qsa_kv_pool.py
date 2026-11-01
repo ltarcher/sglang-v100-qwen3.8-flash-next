@@ -98,6 +98,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
         index_state_dtype: Optional[torch.dtype] = None,
         phys_size: int = 0,
+        host_tier: bool = True,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -260,7 +261,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.mem_usage = (k_size + v_size) / GB
         # KV host tier (docs/v100/KV_HOST_TIER_DESIGN.md). None unless
         # SGLANG_V100_KV_HOST_TIER is set; consumers check ``is not None``.
-        self.kv_host_tier = attach_kv_host_tier(self, full_attention_layer_ids)
+        # MTP draft pools opt out (host_tier=False): one QSA layer at full
+        # logical residency is affordable on device, and a second direct map
+        # over the shared req_to_token would double the pinned mirror and
+        # fork the residency semantics between draft and target.
+        self.kv_host_tier = (
+            attach_kv_host_tier(self, full_attention_layer_ids) if host_tier else None
+        )
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[

@@ -413,6 +413,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_dummy_token_slot_table = None
         self._graph_dummy_out_cache_loc = None
         self._graph_row_req_pool_indices = None
+        self._graph_p3_token_slot_table = None
+        self._graph_p3_phys_token_slot_table = None
+        self._graph_p3_out_cache_loc = None
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
@@ -431,7 +434,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             return False
         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
 
-    def _tier_on_build_hook(self, req_to_token, rows, seq_lens, forward_mode, spec_info):
+    def _tier_on_build_hook(
+        self, req_to_token, rows, seq_lens, forward_mode, spec_info
+    ):
         """Dispatch the Phase 2 kv_host_tier build hook by forward mode.
 
         Shared by the eager build path and the graph-replay build path, which
@@ -1004,12 +1009,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         phys_token_slot_table = None
         phys_out_cache_loc = None
         if self._kv_host_tier is not None and self._kv_host_tier.phase3:
-            if speculative_paged:
-                raise ValueError(
-                    "Phase 3 KV host tier supports target-only serving; disable "
-                    "MTP (speculative paged metadata) or unset "
-                    "SGLANG_V100_KV_TIER_PHYS_TOKENS"
-                )
             # Book this forward's writes (mirror the previous forward's pages,
             # restore-then-claim the write pages) and remap the slot table.
             # Runs before any layer, so writes and reads in this forward
@@ -1017,9 +1016,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             phys_out_cache_loc = self._kv_host_tier.on_build_phase3(
                 forward_batch.out_cache_loc
             )
-            phys_token_slot_table = self._kv_host_tier.map_slot_table(
-                token_slot_table
-            )
+            phys_token_slot_table = self._kv_host_tier.map_slot_table(token_slot_table)
         if self._kv_host_tier is not None:
             if not self._kv_host_tier.phase3:
                 # Mirror this forward's KV writes into the host tier (Phase 1
@@ -1098,6 +1095,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 num_padding=num_padding if num_padding is not None else 0,
+                out_cache_loc=forward_batch.out_cache_loc,
             )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -1142,6 +1140,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
             num_padding=0,
         )
+
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         return self._verify_mask
@@ -1250,6 +1249,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         speculative_paged = self._is_speculative_paged_mode(forward_mode)
         metadata_rows = num_tokens if speculative_paged else bs
+        tier3 = self._kv_host_tier is not None and self._kv_host_tier.phase3
+        if tier3:
+            self._ensure_tier3_graph_buffers(metadata_rows)
         if speculative_paged:
             row_lengths, row_req_pool_indices, row_prefix_lengths = (
                 self._graph_speculative_layout(
@@ -1303,13 +1305,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
             token_to_batch_idx=self._graph_token_to_batch[:metadata_rows],
-            token_slot_table=self._graph_dummy_token_slot_table[:metadata_rows],
+            token_slot_table=(
+                self._graph_p3_token_slot_table[:metadata_rows]
+                if tier3
+                else self._graph_dummy_token_slot_table[:metadata_rows]
+            ),
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
             fa2_valid_counts=self._graph_fa2_valid_counts[:metadata_rows],
             fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
             fa2_cu_seqlens_q=self._graph_cu_seqlens_q[: metadata_rows + 1],
+            phys_token_slot_table=(
+                self._graph_p3_phys_token_slot_table[:metadata_rows] if tier3 else None
+            ),
+            phys_out_cache_loc=(
+                self._graph_p3_out_cache_loc[:metadata_rows] if tier3 else None
+            ),
         )
         self._cuda_graph_metadata[(forward_mode, bs)] = metadata
         self.forward_metadata = metadata
@@ -1324,6 +1336,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         spec_info,
         seq_lens_cpu,
         num_padding: int = 0,
+        out_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
         _tier = self._kv_host_tier
@@ -1354,6 +1367,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 num_padding=num_padding,
             )
             self.forward_metadata = metadata
+            self._tier3_refresh_graph_tables(metadata, out_cache_loc)
             if self._kv_host_tier is not None:
                 # Captured writes are baked into the graph; Phase 1 only
                 # advances the tier step here (no out_cache_loc available).
@@ -1390,8 +1404,67 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata.indexer_metadata, metadata.row_req_pool_indices
         )
         self.forward_metadata = metadata
+        self._tier3_refresh_graph_tables(metadata, out_cache_loc)
         if self._kv_host_tier is not None:
             self._kv_host_tier.flush(None)
+
+    def _ensure_tier3_graph_buffers(self, metadata_rows: int) -> None:
+        """Persistent full-width tier tables behind captured Phase 3 metadata.
+
+        Captured kernels bake buffer addresses, row counts and the table
+        width (a host int) into their launches, so the logical table, its
+        physical remap and the write-loc vector must be one fixed
+        allocation per bucket size, refreshed out-of-graph before each
+        replay (see _tier3_refresh_graph_tables). Rows grow on demand as
+        larger buckets capture; older captured metadata keeps its own
+        slice alive and consistent through the metadata references.
+        """
+        width = self.req_to_token.shape[1]
+        table = self._graph_p3_token_slot_table
+        if (
+            table is not None
+            and table.shape[0] >= metadata_rows
+            and table.shape[1] == width
+        ):
+            return
+        self._graph_p3_token_slot_table = torch.zeros(
+            (metadata_rows, width), dtype=torch.int32, device=self.device
+        )
+        self._graph_p3_phys_token_slot_table = torch.zeros(
+            (metadata_rows, width), dtype=torch.int32, device=self.device
+        )
+        self._graph_p3_out_cache_loc = torch.zeros(
+            metadata_rows, dtype=torch.int64, device=self.device
+        )
+
+    def _tier3_refresh_graph_tables(
+        self,
+        metadata: QwenSparseAttnMetadata,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        """Refresh the Phase 3 tier graph buffers before a replay launch.
+
+        Graph replay rebuilds the tier state out-of-graph, pre-launch, the
+        same way the eager build does: ``on_build_phase3`` books this
+        forward's writes (mirror the previous build's pages, restore-then-
+        claim the write pages), and the slot tables are re-gathered from
+        req_to_token through the final row indices and remapped by modulo.
+        Copies go through the metadata's own slices so a buffer reallocated
+        by a later capture cannot desynchronize an older captured graph.
+        Everything is a device op with no host sync, enqueued strictly
+        before the graph launch on the same stream; the captured page-in,
+        gather and store kernels then read the refreshed tables.
+        """
+        tier = self._kv_host_tier
+        if tier is None or not tier.phase3:
+            return
+        phys = tier.on_build_phase3(out_cache_loc)
+        if phys is not None and metadata.phys_out_cache_loc is not None:
+            metadata.phys_out_cache_loc.copy_(phys)
+        logical = self.req_to_token[metadata.row_req_pool_indices.long()]
+        metadata.token_slot_table.copy_(logical)
+        if metadata.phys_token_slot_table is not None:
+            metadata.phys_token_slot_table.copy_(tier.map_slot_table(logical))
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
         if self.req_to_token is None:
@@ -2034,9 +2107,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             req_to_token = self.req_to_token_pool.req_to_token
             if is_in_breakable_cuda_graph():
                 # Reuse the prepared slot table to avoid a D2H sync per layer on replay.
-                req_to_token = self._resolve_metadata(
-                    forward_batch
-                ).token_slot_table
+                req_to_token = self._resolve_metadata(forward_batch).token_slot_table
                 req_indices = range(len(sequence_lens))
             else:
                 req_indices = forward_batch.req_pool_indices.tolist()
@@ -3100,9 +3171,7 @@ class QwenSparseMultiStepDraftBackend:
 
         self.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch, bs: int
-    ) -> None:
+    def init_forward_metadata_replay_cuda_graph(self, forward_batch, bs: int) -> None:
         """Refresh per-step QSA graph metadata before replay."""
 
         if forward_batch.batch_size != bs:
