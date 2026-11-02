@@ -82,6 +82,9 @@ _CNT_DEGRADES = 9
 _CNT_P3_MIRROR_PAGES = 10
 _CNT_P3_WRITE_RESTORES = 11
 _CNT_P3_PAGEIN_RESTORES = 12
+# Historical slot: the page-in collision gate this counter used to observe
+# was removed -- every page-in tag-miss now saves and restores instead of
+# skipping. Kept as a zeroed slot so the stats line stays column-stable.
 _CNT_P3_COLLISIONS = 13
 _CNT_P3_HOST_GATHER_ROWS = 14
 # Diagnostics: a mirror whose tag gate rejects the page (host copy stays
@@ -280,10 +283,10 @@ def _p3_write_restore_kernel(
     count_ptr,
     tags_ptr,
     owner_ptr,
+    gen_ptr,
     hvalid_ptr,
     phys_pages,
     logical_pages,
-    gen,
     counter_ptr,
     save_ptr,
     PAGE_ELEMS: tl.constexpr,
@@ -302,9 +305,9 @@ def _p3_write_restore_kernel(
     reallocation fully rewrites the page before any read. Then restore the
     host copy of ``lp`` itself when one exists (``hvalid``; a freshly
     allocated page has none and is fully rewritten), and claim the slot with
-    the tag + this forward's generation: the generation marks the page as
-    this forward's pending write set, so its host copy is stale for the rows
-    this forward is about to write.
+    the tag + the current generation (loaded from ``gen_ptr``): the
+    generation marks the page as this forward's pending write set, so its
+    host copy is stale for the rows this forward is about to write.
     """
     i = tl.program_id(0)
     if i >= tl.load(count_ptr):
@@ -313,6 +316,7 @@ def _p3_write_restore_kernel(
     if lp >= logical_pages:
         return
     pp = lp % phys_pages
+    gen = tl.load(gen_ptr)
     old_lp = tl.load(tags_ptr + pp)
     if old_lp != lp:
         if (old_lp >= 0) & (old_lp < logical_pages):
@@ -342,26 +346,30 @@ def _p3_page_in_kernel(
     count_ptr,
     tags_ptr,
     owner_ptr,
+    gen_ptr,
     hvalid_ptr,
     phys_pages,
     logical_pages,
-    gen,
     restore_ptr,
-    collide_ptr,
     save_ptr,
     PAGE_ELEMS: tl.constexpr,
 ):
     """Restore one layer's selected logical pages before its decode read.
 
+    The generation is loaded from ``gen_ptr``, not baked into the launch:
+    these kernels are captured into the decode CUDA graph, and a frozen
+    python-int generation would make slots claimed by the capture-time build
+    match "owner == gen" for the life of the process.
+
     The tag is the truth: a matching tag means the device slot already holds
     this logical page (it may have been written this forward), so nothing is
-    copied. Otherwise, when the slot belongs to this forward's pending write
-    set (owner == gen), restoring into it would revert a live write -- a
-    genuine capacity collision, counted rather than resolved. Any other slot
-    is safe to overwrite, but only after saving the evicted page's current
-    device bytes to the host mirror, unconditionally: they may be newer than
-    the mirror (the writer's rows were not mirrored yet), and another
-    concurrent reader that loses the tag falls back to the host copy.
+    copied. Any tag-miss is save-then-restore, unconditionally -- including
+    slots this forward's build claimed or a previous layer's page-in
+    restored: the save pushes the displaced page's newest device bytes
+    (this forward's pending write rows included) into its host mirror, and
+    the restore brings the selected page in for this layer's read. The next
+    layer's page-in repeats the dance; every read is preceded by its own
+    layer's restore, so no reader ever sees another page's bytes.
     """
     i = tl.program_id(0)
     if i >= tl.load(count_ptr):
@@ -370,10 +378,8 @@ def _p3_page_in_kernel(
     if lp >= logical_pages:
         return
     pp = lp % phys_pages
+    gen = tl.load(gen_ptr)
     if tl.load(tags_ptr + pp) == lp:
-        return
-    if tl.load(owner_ptr + pp) == gen:
-        tl.atomic_add(collide_ptr, 1)
         return
     old_lp = tl.load(tags_ptr + pp)
     if (old_lp >= 0) & (old_lp < logical_pages):
@@ -407,7 +413,7 @@ def _p3_gather_kernel(
     n_rows,
     phys_pages,
     logical_tokens,
-    gen,
+    gen_ptr,
     host_rows_ptr,
     unvalid_ptr,
     checked_ptr,
@@ -424,9 +430,9 @@ def _p3_gather_kernel(
 
     Each row picks its source by tag: the device slot when it holds the
     logical page, the pinned host mirror otherwise. No page-in, so a page the
-    same forward just wrote to an aliasing slot cannot clobber a read.
-    Invalid / padding slots are zero-filled, matching the never-written
-    prefix rows the packed kernel already tolerated.
+    same forward just wrote to an aliasing slot cannot clobber a read. The
+    generation is loaded from ``gen_ptr`` so a captured launch reads the
+    current build's value at replay.
 
     Debug modes (both off in production):
     ``FORCE_HOST`` reads every mirrored page (``hvalid`` set) from the host,
@@ -439,6 +445,7 @@ def _p3_gather_kernel(
     agree, which is what makes the concurrent-reader fallback to the host
     copy safe.
     """
+    gen = tl.load(gen_ptr)
     pid = tl.program_id(0)
     rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     mask_r = rows < n_rows
@@ -880,7 +887,14 @@ class KVHostTier:
         self._p3_owner = torch.zeros(
             (self.layer_num, self.phys_pages + 1), dtype=torch.int32, device=self.device
         )
-        self._p3_gen = 0
+        # The generation lives in a device scalar, not a python int: the
+        # decode CUDA graph captures the page-in kernels, so a frozen python
+        # int would pin the capture-time generation into every replay --
+        # slots claimed by that long-gone build would keep matching
+        # "owner == gen" forever and their selected-page restores would be
+        # skipped for the life of the process. The build bumps the scalar
+        # on-device; captured kernels read the current value at replay.
+        self._p3_gen_buf = torch.zeros(1, dtype=torch.int32, device=self.device)
         self._p3_hvalid = torch.zeros(
             (self.layer_num, self.logical_pages), dtype=torch.uint8, device=self.device
         )
@@ -1014,8 +1028,10 @@ class KVHostTier:
                 "serve with --disable-cuda-graph"
             )
         self.step_seq += 1
-        self._p3_gen += 1
-        gen = self._p3_gen
+        # Bump the generation on-device: the captured page-in kernels load
+        # this scalar at replay, so the bump must be a device op ordered
+        # before them (it runs on the same stream, out-of-graph).
+        self._p3_gen_buf += 1
         if self.step_seq % _LOG_EVERY_N_STEPS == 0:
             # flush() returns early in Phase 3, so the counter dump has to hang
             # off the build hook instead.
@@ -1055,10 +1071,10 @@ class KVHostTier:
                         count,
                         self._p3_tags[li],
                         self._p3_owner[li],
+                        self._p3_gen_buf,
                         self._p3_hvalid[li],
                         self.phys_pages,
                         self.logical_pages,
-                        gen,
                         counter,
                         save,
                         PAGE_ELEMS=self._page_elems,
@@ -1105,7 +1121,6 @@ class KVHostTier:
         restore = self.counters[
             _CNT_P3_PAGEIN_RESTORES : _CNT_P3_PAGEIN_RESTORES + 1
         ]
-        collide = self.counters[_CNT_P3_COLLISIONS : _CNT_P3_COLLISIONS + 1]
         save = self.counters[_CNT_P3_SAVES : _CNT_P3_SAVES + 1]
         k_buf, v_buf = self._kv_buffers[tier_layer]
         for kv, buf in ((0, k_buf), (1, v_buf)):
@@ -1116,12 +1131,11 @@ class KVHostTier:
                 self._p3_pi_count,
                 self._p3_tags[tier_layer],
                 self._p3_owner[tier_layer],
+                self._p3_gen_buf,
                 self._p3_hvalid[tier_layer],
                 self.phys_pages,
                 self.logical_pages,
-                self._p3_gen,
                 restore,
-                collide,
                 save,
                 PAGE_ELEMS=self._page_elems,
                 num_warps=8,
@@ -1172,7 +1186,7 @@ class KVHostTier:
                 n,
                 self.phys_pages,
                 self.logical_tokens,
-                self._p3_gen,
+                self._p3_gen_buf,
                 counter,
                 unvalid,
                 checked,

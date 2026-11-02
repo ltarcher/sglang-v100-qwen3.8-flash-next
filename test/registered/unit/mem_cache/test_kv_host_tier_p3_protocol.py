@@ -54,14 +54,13 @@ class _Sim:
                 self.host[lp] = self.dev[pp]
                 self.hvalid[lp] = True
 
-    # _p3_page_in_kernel body
+    # _p3_page_in_kernel body (no collision skip: every tag-miss saves then
+    # restores -- the save keeps the displaced page's newest bytes, including
+    # this forward's pending write rows, in the host mirror)
     def page_in(self, writer, pages):
         for lp in pages:
             pp = lp % PHYS
             if self.tags[pp].item() == lp:
-                continue
-            if self.owner[pp].item() == writer:
-                self.collisions += 1
                 continue
             old_lp = self.tags[pp].item()
             if 0 <= old_lp < LOGICAL:
@@ -124,14 +123,58 @@ class TestP3SaveEvictClaim:
         assert torch.equal(s.host[7, 2], s.row(7, 2))
         assert torch.equal(s.dev[3 % PHYS, 1], s.host[3, 1])
 
-    def test_page_in_never_reverts_own_pending_write(self):
+    def test_page_in_resolves_own_pending_alias_via_mirror(self):
+        # A decode step's page-in selects a page whose slot holds this
+        # forward's pending write page: the save pushes the fresh write rows
+        # into the mirror, and a later page-in of the write page restores
+        # them from there. No read ever sees another page's bytes.
         s = self._fresh()
-        s.claim(1, [3])
-        s.write(1, [3])
-        before = s.dev[3 % PHYS].clone()
-        s.page_in(1, [7])  # same slot, own pending page
-        assert s.collisions == 1
-        assert torch.equal(s.dev[3 % PHYS], before)
+        s.claim(1, [1, 2, 3, 4])
+        for lp in (1, 2, 3, 4):
+            s.write(1, [lp])
+        s.mirror([1, 2, 3, 4])
+        s.host[9] = torch.full((ELEMS,), 1009)
+        s.hvalid[9] = True
+        s.claim(2, [5])  # write page 5 -> slot 1 (aliases page 9)
+        s.write(2, [5])
+        s.page_in(2, [9])  # displaces the pending write page
+        assert torch.equal(s.host[5, 2 % PAGE], s.row(5, 2))
+        s.page_in(2, [5])  # a later layer selects the write page again
+        assert torch.equal(s.dev[5 % PHYS, 2 % PAGE], s.row(5, 2))
+        # And the other layer's selected page still reads correctly after
+        # the write page came back.
+        s.page_in(2, [9])
+        assert torch.equal(s.dev[9 % PHYS, 0], s.row(9, 0))
+
+    def test_per_layer_pagein_chain_reads_own_pages(self):
+        # Within one forward, layer i's page-in claims slots; layer i+1's
+        # page-in must save-and-restore through them, so every layer reads
+        # exactly its own selected pages.
+        s = self._fresh()
+        s.claim(1, [1, 2, 3, 4])
+        for lp in (1, 2, 3, 4):
+            s.write(1, [lp])
+        s.mirror([1, 2, 3, 4])
+        s.host[9] = torch.full((ELEMS,), 1009)
+        s.hvalid[9] = True
+        s.claim(2, [5])
+        s.write(2, [5])
+
+        writer_row = {5: 2, 2: 1, 9: 0, 4: 1}  # the row each page's content lives at
+        layer_reads = []
+        for sel in ([5, 2], [9, 4], [2, 4]):
+            s.page_in(2, sel)
+            layer_reads.append(
+                {lp: s.dev[lp % PHYS, writer_row[lp]].tolist() for lp in sel}
+            )
+        expect = [
+            {5: [1005] * ELEMS, 2: [1002] * ELEMS},
+            {9: [1009] * ELEMS, 4: [1004] * ELEMS},
+            {2: [1002] * ELEMS, 4: [1004] * ELEMS},
+        ]
+        for i, layer in enumerate(expect):
+            for lp, exp in layer.items():
+                assert layer_reads[i][lp] == exp, (i, lp, layer_reads[i])
 
     def test_reallocation_full_rewrite_beats_stale_copy(self):
         # A freed page's stale mirror can never be re-read: reallocation
