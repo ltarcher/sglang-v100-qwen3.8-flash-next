@@ -94,7 +94,12 @@ _CNT_P3_GATHER_UNVALID = 16
 # slot does not hold, or the mirror stored another page's bytes.
 _CNT_P3_CHECKED_ROWS = 17
 _CNT_P3_HOST_DEV_MISMATCH = 18
-_CNT_SLOTS = 19
+# Claim-time eviction: a slot being re-claimed held a page whose current bytes
+# only existed on device (its mirror was stale), so they were saved back before
+# the overwrite. Without this a concurrent reader of that page falls back to
+# the stale host copy and reads the wrong context.
+_CNT_P3_SAVES = 19
+_CNT_SLOTS = 20
 
 # Extend-read gather: rows per program. ROW_ELEMS is one token's K or V row
 # (kv_heads * head_dim); a tile of rows keeps the launches bounded at 512K.
@@ -274,21 +279,32 @@ def _p3_write_restore_kernel(
     uniq_ptr,
     count_ptr,
     tags_ptr,
-    protect_ptr,
+    owner_ptr,
     hvalid_ptr,
     phys_pages,
     logical_pages,
+    gen,
     counter_ptr,
+    save_ptr,
     PAGE_ELEMS: tl.constexpr,
 ):
-    """Restore-then-write for this forward's write pages.
+    """Save-evict-then-write for this forward's write pages.
 
     A write may touch only part of a page (decode appends one token to the
     previous page), while modulo reuse means the device slot may hold another
-    logical page. Restore the host copy of ``lp`` first when one exists
-    (``hvalid``; a freshly allocated page has none and is fully rewritten),
-    then claim the slot with the tag and mark it protected: its host copy is
-    stale for the rows this forward is about to write.
+    logical page. When the slot holds a different page (old tag), save its
+    current device bytes back to the host mirror first, unconditionally: they
+    are the newest bytes of that page (its writer's rows were not mirrored
+    yet), and a concurrent reader that loses the tag must fall back to the
+    host copy. The save is safe even when the old page was never mirrored
+    (hvalid == 0): the tag names the last writer, so the slot holds that
+    page's bytes, and a free page's stale mirror can never be re-read because
+    reallocation fully rewrites the page before any read. Then restore the
+    host copy of ``lp`` itself when one exists (``hvalid``; a freshly
+    allocated page has none and is fully rewritten), and claim the slot with
+    the tag + this forward's generation: the generation marks the page as
+    this forward's pending write set, so its host copy is stale for the rows
+    this forward is about to write.
     """
     i = tl.program_id(0)
     if i >= tl.load(count_ptr):
@@ -297,15 +313,25 @@ def _p3_write_restore_kernel(
     if lp >= logical_pages:
         return
     pp = lp % phys_pages
-    if tl.load(tags_ptr + pp) != lp and tl.load(hvalid_ptr + lp) != 0:
-        offs = tl.arange(0, PAGE_ELEMS)
-        tl.store(
-            dev_ptr + pp * PAGE_ELEMS + offs,
-            tl.load(host_ptr + lp * PAGE_ELEMS + offs),
-        )
-        tl.atomic_add(counter_ptr, 1)
+    old_lp = tl.load(tags_ptr + pp)
+    if old_lp != lp:
+        if (old_lp >= 0) & (old_lp < logical_pages):
+            offs = tl.arange(0, PAGE_ELEMS)
+            tl.store(
+                host_ptr + old_lp * PAGE_ELEMS + offs,
+                tl.load(dev_ptr + pp * PAGE_ELEMS + offs),
+            )
+            tl.store(hvalid_ptr + old_lp, 1)
+            tl.atomic_add(save_ptr, 1)
+        if tl.load(hvalid_ptr + lp) != 0:
+            offs = tl.arange(0, PAGE_ELEMS)
+            tl.store(
+                dev_ptr + pp * PAGE_ELEMS + offs,
+                tl.load(host_ptr + lp * PAGE_ELEMS + offs),
+            )
+            tl.atomic_add(counter_ptr, 1)
     tl.store(tags_ptr + pp, lp.to(tl.int32))
-    tl.store(protect_ptr + pp, 1)
+    tl.store(owner_ptr + pp, gen)
 
 
 @triton.jit
@@ -315,21 +341,27 @@ def _p3_page_in_kernel(
     uniq_ptr,
     count_ptr,
     tags_ptr,
-    protect_ptr,
+    owner_ptr,
     hvalid_ptr,
     phys_pages,
     logical_pages,
+    gen,
     restore_ptr,
     collide_ptr,
+    save_ptr,
     PAGE_ELEMS: tl.constexpr,
 ):
     """Restore one layer's selected logical pages before its decode read.
 
     The tag is the truth: a matching tag means the device slot already holds
     this logical page (it may have been written this forward), so nothing is
-    copied. A protected slot holding a different page is a genuine capacity
-    collision -- the forward's write set aliases a page it must read -- and is
-    counted rather than silently reverting the live write.
+    copied. Otherwise, when the slot belongs to this forward's pending write
+    set (owner == gen), restoring into it would revert a live write -- a
+    genuine capacity collision, counted rather than resolved. Any other slot
+    is safe to overwrite, but only after saving the evicted page's current
+    device bytes to the host mirror, unconditionally: they may be newer than
+    the mirror (the writer's rows were not mirrored yet), and another
+    concurrent reader that loses the tag falls back to the host copy.
     """
     i = tl.program_id(0)
     if i >= tl.load(count_ptr):
@@ -340,18 +372,27 @@ def _p3_page_in_kernel(
     pp = lp % phys_pages
     if tl.load(tags_ptr + pp) == lp:
         return
-    if tl.load(protect_ptr + pp) != 0:
+    if tl.load(owner_ptr + pp) == gen:
         tl.atomic_add(collide_ptr, 1)
         return
-    if tl.load(hvalid_ptr + lp) == 0:
-        return
-    offs = tl.arange(0, PAGE_ELEMS)
-    tl.store(
-        dev_ptr + pp * PAGE_ELEMS + offs,
-        tl.load(host_ptr + lp * PAGE_ELEMS + offs),
-    )
+    old_lp = tl.load(tags_ptr + pp)
+    if (old_lp >= 0) & (old_lp < logical_pages):
+        offs = tl.arange(0, PAGE_ELEMS)
+        tl.store(
+            host_ptr + old_lp * PAGE_ELEMS + offs,
+            tl.load(dev_ptr + pp * PAGE_ELEMS + offs),
+        )
+        tl.store(hvalid_ptr + old_lp, 1)
+        tl.atomic_add(save_ptr, 1)
+    if tl.load(hvalid_ptr + lp) != 0:
+        offs = tl.arange(0, PAGE_ELEMS)
+        tl.store(
+            dev_ptr + pp * PAGE_ELEMS + offs,
+            tl.load(host_ptr + lp * PAGE_ELEMS + offs),
+        )
+        tl.atomic_add(restore_ptr, 1)
     tl.store(tags_ptr + pp, lp.to(tl.int32))
-    tl.atomic_add(restore_ptr, 1)
+    tl.store(owner_ptr + pp, gen)
 
 
 @triton.jit
@@ -360,12 +401,13 @@ def _p3_gather_kernel(
     host_ptr,
     tags_ptr,
     hvalid_ptr,
-    protect_ptr,
+    owner_ptr,
     slots_ptr,
     out_ptr,
     n_rows,
     phys_pages,
     logical_tokens,
+    gen,
     host_rows_ptr,
     unvalid_ptr,
     checked_ptr,
@@ -390,8 +432,12 @@ def _p3_gather_kernel(
     ``FORCE_HOST`` reads every mirrored page (``hvalid`` set) from the host,
     so a run that still matches the plain path proves the mirror content
     correct and isolates the tag-gated device read. ``CHECK`` compares the
-    device and host bytes of every tag-matched, mirrored, not-yet-rewritten
-    page and counts rows that disagree.
+    device and host bytes of every tag-matched, mirrored page that is not
+    part of this forward's pending write set (owner != gen) and counts rows
+    that disagree. Pending pages are excluded because their host copies are
+    stale by design until the next build mirrors them; every other page must
+    agree, which is what makes the concurrent-reader fallback to the host
+    copy safe.
     """
     pid = tl.program_id(0)
     rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -423,14 +469,15 @@ def _p3_gather_kernel(
     )
     tl.atomic_add(host_rows_ptr, tl.sum((valid & ~on_device).to(tl.int32)))
     if CHECK:
-        # The host copy of a tag-matched page is only stale for rows written
-        # after the last mirror, and those pages carry a protect bit this
-        # forward. Everything else must be byte-identical.
+        # The host copy of a page this forward claimed is stale by this
+        # forward's own writes until the next build mirrors it (owner == gen);
+        # everything else was saved/mirrored by the claiming build and must be
+        # byte-identical.
         checked = (
             valid
             & tagmatch
             & (hvalid_v != 0)
-            & (tl.load(protect_ptr + pp, mask=valid, other=1) == 0)
+            & (tl.load(owner_ptr + pp, mask=valid, other=-1) != gen)
         )
         both_dev = tl.load(dev_ptr + dev_idx, mask=checked[:, None], other=0.0)
         both_host = tl.load(host_ptr + host_idx, mask=checked[:, None], other=0.0)
@@ -816,18 +863,24 @@ class KVHostTier:
             self._host_mem_fields(),
         )
 
-        # Per-layer tags/protect: every full-attention layer has its own device
+        # Per-layer tags/owner: every full-attention layer has its own device
         # buffer, so "which logical page is in slot pp" is per layer; a shared
         # tag would let one layer's restore claim a slot for its neighbours.
+        # owner is the build generation of the last claim: readers exclude
+        # this forward's pending pages (their host copies are stale by its
+        # own writes until the next build mirrors them), and it replaces the
+        # per-build-erased protect bitmap that a concurrent build used to
+        # wipe while its predecessor was still reading the pages.
         self._p3_tags = torch.full(
             (self.layer_num, self.phys_pages + 1),
             -1,
             dtype=torch.int32,
             device=self.device,
         )
-        self._p3_protect = torch.zeros(
-            (self.layer_num, self.phys_pages + 1), dtype=torch.uint8, device=self.device
+        self._p3_owner = torch.zeros(
+            (self.layer_num, self.phys_pages + 1), dtype=torch.int32, device=self.device
         )
+        self._p3_gen = 0
         self._p3_hvalid = torch.zeros(
             (self.layer_num, self.logical_pages), dtype=torch.uint8, device=self.device
         )
@@ -946,8 +999,12 @@ class KVHostTier:
         """Book this forward's writes and return the physical write slots.
 
         Order matters and is enforced by the stream: mirror the previous
-        build's write pages (their host copies become current), clear the
-        protect bits, then restore-then-claim this forward's write pages.
+        build's write pages (their host copies become current), then
+        save-evict-then-claim this forward's write pages (the evicted page's
+        newest bytes go back to the host mirror before the overwrite, which
+        is what keeps a concurrent reader's host fallback correct). Each
+        build bumps the generation, so pending pages are marked by owner ==
+        gen and stay marked until another build actually reclaims the slot.
         All of it runs before the model forward, so the extend gather and the
         decode page-in of this forward observe consistent host copies.
         """
@@ -957,6 +1014,8 @@ class KVHostTier:
                 "serve with --disable-cuda-graph"
             )
         self.step_seq += 1
+        self._p3_gen += 1
+        gen = self._p3_gen
         if self.step_seq % _LOG_EVERY_N_STEPS == 0:
             # flush() returns early in Phase 3, so the counter dump has to hang
             # off the build hook instead.
@@ -974,7 +1033,6 @@ class KVHostTier:
                     counter,
                 )
         self._p3_pending_bound = 0
-        self._p3_protect.zero_()
 
         cur = 1 - self._p3_cur
         bound = 0
@@ -986,6 +1044,7 @@ class KVHostTier:
             counter = self.counters[
                 _CNT_P3_WRITE_RESTORES : _CNT_P3_WRITE_RESTORES + 1
             ]
+            save = self.counters[_CNT_P3_SAVES : _CNT_P3_SAVES + 1]
             for li in range(self.layer_num):
                 k_buf, v_buf = self._kv_buffers[li]
                 for kv, buf in ((0, k_buf), (1, v_buf)):
@@ -995,11 +1054,13 @@ class KVHostTier:
                         uniq,
                         count,
                         self._p3_tags[li],
-                        self._p3_protect[li],
+                        self._p3_owner[li],
                         self._p3_hvalid[li],
                         self.phys_pages,
                         self.logical_pages,
+                        gen,
                         counter,
+                        save,
                         PAGE_ELEMS=self._page_elems,
                         num_warps=8,
                     )
@@ -1045,6 +1106,7 @@ class KVHostTier:
             _CNT_P3_PAGEIN_RESTORES : _CNT_P3_PAGEIN_RESTORES + 1
         ]
         collide = self.counters[_CNT_P3_COLLISIONS : _CNT_P3_COLLISIONS + 1]
+        save = self.counters[_CNT_P3_SAVES : _CNT_P3_SAVES + 1]
         k_buf, v_buf = self._kv_buffers[tier_layer]
         for kv, buf in ((0, k_buf), (1, v_buf)):
             _p3_page_in_kernel[(bound,)](
@@ -1053,12 +1115,14 @@ class KVHostTier:
                 self._p3_pi_uniq,
                 self._p3_pi_count,
                 self._p3_tags[tier_layer],
-                self._p3_protect[tier_layer],
+                self._p3_owner[tier_layer],
                 self._p3_hvalid[tier_layer],
                 self.phys_pages,
                 self.logical_pages,
+                self._p3_gen,
                 restore,
                 collide,
+                save,
                 PAGE_ELEMS=self._page_elems,
                 num_warps=8,
             )
@@ -1095,19 +1159,20 @@ class KVHostTier:
             _CNT_P3_HOST_DEV_MISMATCH : _CNT_P3_HOST_DEV_MISMATCH + 1
         ]
         tags = self._p3_tags[tier_layer]
-        protect = self._p3_protect[tier_layer]
+        owner = self._p3_owner[tier_layer]
         for kv, buf, out in ((0, k_buf, out_k), (1, v_buf, out_v)):
             _p3_gather_kernel[grid](
                 buf,
                 self._host_logical[kv, tier_layer],
                 tags,
                 self._p3_hvalid[tier_layer],
-                protect,
+                owner,
                 slots,
                 out,
                 n,
                 self.phys_pages,
                 self.logical_tokens,
+                self._p3_gen,
                 counter,
                 unvalid,
                 checked,
@@ -1558,13 +1623,14 @@ class KVHostTier:
             logger.info(
                 "kv_host_tier phase3 stats: steps=%d mirror_pages=%d "
                 "write_restores=%d pagein_restores=%d collisions=%d "
-                "host_gather_rows=%d mirror_skips=%d gather_unvalid=%d "
-                "checked_rows=%d host_dev_mismatch=%d",
+                "saves=%d host_gather_rows=%d mirror_skips=%d "
+                "gather_unvalid=%d checked_rows=%d host_dev_mismatch=%d",
                 self.step_seq,
                 c[_CNT_P3_MIRROR_PAGES],
                 c[_CNT_P3_WRITE_RESTORES],
                 c[_CNT_P3_PAGEIN_RESTORES],
                 c[_CNT_P3_COLLISIONS],
+                c[_CNT_P3_SAVES],
                 c[_CNT_P3_HOST_GATHER_ROWS],
                 c[_CNT_P3_MIRROR_SKIPS],
                 c[_CNT_P3_GATHER_UNVALID],
