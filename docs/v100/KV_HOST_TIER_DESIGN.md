@@ -330,17 +330,29 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 | prefill P2P 读 | 全前缀半数重读,63 chunk 合计 ~51 GiB → **+3.9 s(~+3.5%)** | @13.1 GB/s,memcpy 引擎不占 SM |
 | 容量 | PHYS=663,104(256K×2 唯一 tokens,页对齐)@ 6,144 B/tok/rank = **3.88 GiB/rank(+0.12 vs s8)**,激活余量 4.05 GB | s8 available_gpu_mem 4.17 GB |
 
-实现面(全部收在 QSA 池 + QSA backend + kv_host_tier 三文件):
+实现面(收在 QSA 池 + QSA backend + kv_host_tier 三文件;2026-11-03 修订):
 
-1. **池分配**:每 rank 分配 PHYS/2 行;逻辑页 `p % PHYS` 偶数→本地、奇数→
-   对家,本地下标 `(p % PHYS) // 2`。写路径 `set_kv_buffer` 经 P3 的
-   `phys_out_cache_loc` 重映射已存在,扩展为奇偶重定向(对家写入经
-   symm-mem 映射指针,固定分配,CUDA graph 安全——custom AR v2 同型)。
-2. **读路径**:P3 gather/page-in 的「device-or-host」二源扩为
-   「local-or-peer-or-host」三源。对家 tags/owner 位图镜像(1.3 MiB int32,
-   每 build 一次 P2P 拷贝,进 build 流)。
-3. **准入探测**:boot 时用现成 `can_actually_p2p` 助手实测对家可达性,
-   失败即拒绝以 pair-split 启动(硬失败,不静默降级)。
+**写侧(owner-computes)**:每 rank 只存自己奇偶半的页;非己半的计算结果
+丢弃(经 `map_slots` 路由到保留 padding 页,store kernel 原地丢弃,零跨卡
+写)。`_p3_write_restore`/`_p3_mirror` 对非己页 early-return。
+
+**读侧(v2 owner-bit 双指针,实施中的关键修正)**:v1 草案「把对家页 fetch
+进本地行」被协议测试证伪——本地行数只有对半,己有页与 fetch 页必然碰撞
+(gp=4 与 gp=5 同落 row 2)。正确形态:物理表项编码 owner 位 + owner 行号,
+decode/gather kernel 按位选基指针(本地池或 IPC 导入的对家池)。受影响的
+三个表消费者:`_p3_gather_kernel`(Triton,自有)、
+`qwen_sparse_kv_extraction_compact_triton`(Triton)、`sm70_cuda_qsa_decode`
+(JIT CUDA,改动最大)。
+
+** rendezvous**:boot 时一次 `cudaIpcGetMemHandle/OpenMemHandle` 交换
+(`pair_split_ipc.py`,池张量常驻 → 无生命周期管理,图安全);对家 tags
+每 build 一次 P2P 刷新。boot 用 `can_actually_p2p` 硬探测,失败拒绝启动。
+
+**已落地(scaffolding)**:environ 枚举 + block 旋钮、configurator PHYS
+对半、奇偶所有权图、写侧 parity guards、IPC 模块、协议测试(owner-bit
+双指针语义,CPU 重放)。**读侧 v2 切片未落地**——PAIR_PARITY boot 以
+`SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH` 门拒绝服务,防静默错读。
+
 4. MTP draft 池不参与(host_tier=False 语义不变);radix/调度器零改动
    (逻辑空间与页粒度不变)。
 

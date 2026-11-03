@@ -63,7 +63,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
+from sglang.srt.environ import KVHeadLayout, envs
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,12 @@ _CNT_P3_HOST_DEV_MISMATCH = 18
 # the overwrite. Without this a concurrent reader of that page falls back to
 # the stale host copy and reads the wrong context.
 _CNT_P3_SAVES = 19
-_CNT_SLOTS = 20
+# Pair-split: a page-in fetched a peer-owned page whose row the pair member
+# no longer holds (its tag moved). v1 refuses pair-pool oversubscription at
+# boot, so any nonzero count means the no-oversubscription invariant broke --
+# the affected reads served wrong bytes.
+_CNT_P3_PEER_MISS = 20
+_CNT_SLOTS = 21
 
 # Extend-read gather: rows per program. ROW_ELEMS is one token's K or V row
 # (kv_heads * head_dim); a tile of rows keeps the launches bounded at 512K.
@@ -243,6 +248,10 @@ def _p3_mirror_kernel(
     skip_ptr,
     counter_ptr,
     PAGE_ELEMS: tl.constexpr,
+    PAIR: tl.constexpr = 0,
+    pair_pages=0,
+    pair_block=0,
+    rank_bit=0,
 ):
     """Copy one logical page from its device slot into the pinned host mirror.
 
@@ -261,7 +270,15 @@ def _p3_mirror_kernel(
     lp = tl.load(uniq_ptr + i)
     if lp >= logical_pages:
         return
-    pp = lp % phys_pages
+    if PAIR:
+        # Peer-owned pages are claimed (and mirrored) by the pair member's
+        # build in ITS rows; our rows never hold them.
+        gp = lp % pair_pages
+        if ((gp // pair_block) & 1) != rank_bit:
+            return
+        pp = (gp // (2 * pair_block)) * pair_block + gp % pair_block
+    else:
+        pp = lp % phys_pages
     if tl.load(tags_ptr + pp) != lp:
         # The slot was re-claimed by another logical page: its host copy stays
         # whatever it was, and this page's rows must have been rewritten.
@@ -290,6 +307,10 @@ def _p3_write_restore_kernel(
     counter_ptr,
     save_ptr,
     PAGE_ELEMS: tl.constexpr,
+    PAIR: tl.constexpr = 0,
+    pair_pages=0,
+    pair_block=0,
+    rank_bit=0,
 ):
     """Save-evict-then-write for this forward's write pages.
 
@@ -315,7 +336,18 @@ def _p3_write_restore_kernel(
     lp = tl.load(uniq_ptr + i)
     if lp >= logical_pages:
         return
-    pp = lp % phys_pages
+    if PAIR:
+        # Peer-owned pages are claimed by the pair member's build in ITS
+        # rows; saving or claiming them here would alias a different page.
+        gp = lp % pair_pages
+        if ((gp // pair_block) & 1) != rank_bit:
+            return
+        # Local rows follow the pair-half bijection, matching map_slots and
+        # page-in, so a self-owned write and a fetched peer page can never
+        # collide.
+        pp = (gp // (2 * pair_block)) * pair_block + gp % pair_block
+    else:
+        pp = lp % phys_pages
     gen = tl.load(gen_ptr)
     old_lp = tl.load(tags_ptr + pp)
     if old_lp != lp:
@@ -353,6 +385,10 @@ def _p3_page_in_kernel(
     restore_ptr,
     save_ptr,
     PAGE_ELEMS: tl.constexpr,
+    PAIR: tl.constexpr = 0,
+    pair_pages=0,
+    pair_block=0,
+    rank_bit=0,
 ):
     """Restore one layer's selected logical pages before its decode read.
 
@@ -377,8 +413,19 @@ def _p3_page_in_kernel(
     lp = tl.load(uniq_ptr + i)
     if lp >= logical_pages:
         return
-    pp = lp % phys_pages
     gen = tl.load(gen_ptr)
+    if PAIR:
+        # Pair-split v2 design (owner-bit dual-pointer): the decode kernels
+        # read peer-owned pages straight from the pair member's buffers via
+        # the owner bit in the physical table, so page-in does nothing for
+        # them here. Counting a miss would need the dual-pointer table that
+        # slice does not build yet; leave the local row untouched.
+        gp = lp % pair_pages
+        if ((gp // pair_block) & 1) != rank_bit:
+            return
+        pp = (gp // (2 * pair_block)) * pair_block + gp % pair_block
+    else:
+        pp = lp % phys_pages
     if tl.load(tags_ptr + pp) == lp:
         return
     old_lp = tl.load(tags_ptr + pp)
@@ -425,6 +472,10 @@ def _p3_gather_kernel(
     ROW_ELEMS: tl.constexpr,
     PAGE_ELEMS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    PAIR: tl.constexpr = 0,
+    pair_pages=0,
+    pair_block=0,
+    rank_bit=0,
 ):
     """Sparse extend read across the split device/host slot space.
 
@@ -453,10 +504,23 @@ def _p3_gather_kernel(
     valid = mask_r & (slots >= PAGE_SIZE) & (slots < logical_tokens)
     lp = slots >> LOGICAL_SHIFT
     off = slots - (lp << LOGICAL_SHIFT)
-    pp = lp % phys_pages
+    if PAIR:
+        # Local rows follow the pair-half bijection (see map_slots): every
+        # pair page has exactly one local row, owned pages by our own
+        # writes, peer pages after a page-in fetch.
+        gp = lp % pair_pages
+        pp = (gp // (2 * pair_block)) * pair_block + gp % pair_block
+    else:
+        pp = lp % phys_pages
     tags = tl.load(tags_ptr + pp, mask=valid, other=-1)
     hvalid_v = tl.load(hvalid_ptr + lp, mask=valid, other=0)
     tagmatch = valid & (tags == lp)
+    if PAIR:
+        # v2 read path (owner-bit dual pointer) resolves peer-owned rows in
+        # the kernel that consumes the table; this gather only serves
+        # self-owned rows until that slice lands.
+        owned = ((gp // pair_block) & 1) == rank_bit
+        tagmatch = tagmatch & owned
     if FORCE_HOST:
         on_device = tagmatch & (hvalid_v == 0)
     else:
@@ -576,6 +640,13 @@ class KVHostTier:
         )
         self.logical_tokens = int(getattr(pool, "logical_size", self.phys_tokens))
         self.phase3 = self.phys_tokens != self.logical_tokens
+        # Pair-split state defaults (FULL layout): the kernel launches read
+        # these unconditionally; _init_pair_split overwrites them.
+        self.pair_split = False
+        self.pair_pages = 0
+        self.pair_block = 1
+        self.pair_rank_bit = 0
+        self.peer_rank = -1
         if self.phase3:
             self._init_phase3(pagein)
             return
@@ -822,6 +893,94 @@ class KVHostTier:
         # padding page (index phys_pages) absorbs writes to the padding slot
         # and page so they can never alias a real logical page.
         self.phys_slot_base = self.phys_pages * self.page_size
+        if envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY:
+            self._init_pair_split()
+
+    def _init_pair_split(self) -> None:
+        """Pair-split layout (docs/v100/KV_HOST_TIER_DESIGN.md §6.1).
+
+        ``self.phys_pages`` here is this rank's LOCAL page count (the pool
+        was built with PHYS/2 rows); the PAIR-total physical space is
+        ``pair_pages = 2 * phys_pages``. Logical page ``gp = lp %
+        pair_pages`` belongs to the parity group ``gp // block``: even
+        groups are local, odd groups belong to the pair member (which rank
+        is "even" is fixed by the TP rank, so both sides agree without
+        communication). Self-owned pages map to local device row
+        ``local_page_index(gp)``; peer-owned pages are restored from the
+        peer's imported buffers at page-in and read locally after the
+        restore, so the attention kernels never touch peer memory.
+
+        v1 constraint: no oversubscription of the PAIR pool. The peer-owne
+        d pages must always sit in the peer's device slots -- a peer that
+        paged them out would need a cross-process host-mirror read path
+        that does not exist yet.
+        """
+        from sglang.srt.distributed.parallel_state import get_parallel
+
+        self.pair_split = True
+        self.pair_block = envs.SGLANG_V100_KV_HEAD_LAYOUT_BLOCK.get()
+        self.pair_pages = 2 * self.phys_pages
+        rank = get_parallel().attn_tp_rank
+        # Group parity inside the pair: even TP ranks own even groups. The
+        # pair members are (2i, 2i+1); QKVParallelLinear's shard_id =
+        # kv_tp_rank // replicas places both members on the same head, so
+        # both compute the same head and each stores its parity half.
+        self.pair_rank_bit = rank & 1
+        self.peer_rank = rank ^ 1
+        # v1 scaffolding lands the ownership map, write-side parity guards
+        # and the IPC rendezvous; the read path (owner-bit dual-pointer
+        # decode/gather tables, docs/v100/KV_HOST_TIER_DESIGN.md §6.1 v2)
+        # is a separate slice, so serving under PAIR_PARITY is refused
+        # rather than silently mis-reading peer-owned pages.
+        if not envs.SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH.get():
+            raise RuntimeError(
+                "SGLANG_V100_KV_HEAD_LAYOUT=PAIR_PARITY read path is not "
+                "wired yet (owner-bit dual-pointer slice pending); write "
+                "scaffolding only -- set SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH"
+                "=1 to boot the testbench build"
+            )
+        if self.logical_pages > self.pair_pages:
+            raise ValueError(
+                "Pair-split v1 requires the logical pool to fit the PAIR-total "
+                f"physical space: logical_pages={self.logical_pages} > "
+                f"pair_pages={self.pair_pages}. Raise SGLANG_V100_KV_TIER_PHYS_"
+                "TOKENS (the PAIR total) or lower --max-total-tokens."
+            )
+        # Tag mirror of the pair member: refreshed at every build so page-in
+        # knows which of the peer's slots currently hold the pages it reads.
+        # phys layout mirrors ours (both ranks build symmetric pools).
+        self._peer_tags = torch.full(
+            (self.layer_num, self.phys_pages + 1),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Imported peer K/V buffers, set by attach_peer_buffers() after the
+        # IPC rendezvous. Kernels never dereference them until then; boot
+        # refuses to serve without them.
+        self._peer_kv_buffers: Optional[List[tuple]] = None
+        logger.info(
+            "kv_host_tier pair-split: rank=%d peer=%d block=%d pair_pages=%d "
+            "local_pages=%d logical_pages=%d",
+            rank,
+            self.peer_rank,
+            self.pair_block,
+            self.pair_pages,
+            self.phys_pages,
+            self.logical_pages,
+        )
+
+    def pair_owns_page(self, group_page: int) -> bool:
+        """Whether the local rank stores global pair page ``group_page``."""
+        return (group_page // self.pair_block) & 1 == self.pair_rank_bit
+
+    def pair_local_page(self, group_page: int) -> int:
+        """Local device page index for a self-owned pair page."""
+        # Drop one parity bit per block: groups alternate, so the local
+        # index is the group sequence number times the block size plus the
+        # offset inside the block.
+        group = group_page // self.pair_block
+        return (group >> 1) * self.pair_block + group_page % self.pair_block
 
         mirror_elems = (
             2
@@ -947,24 +1106,42 @@ class KVHostTier:
         )
 
     def map_slots(self, slots: torch.Tensor) -> torch.Tensor:
-        """Logical token slots -> physical device slots (pure modulo).
+        """Logical token slots -> physical device slots.
 
-        Padding / reserved slots (the pool's slot-0 page and anything at or
-        past the logical budget) land on the reserved padding page instead of
-        aliasing a real logical page.
+        FULL layout: pure modulo. PAIR_PARITY: self-owned pages map to
+        their local row; PEER-OWNED pages map to the reserved padding page
+        so the store kernel's skip index discards them -- the peer computes
+        the same head and stores its own parity half (owner-computes; there
+        are no cross-rank writes).
         """
         slots = slots.to(torch.long)
         page = slots >> self._page_shift
         off = slots & (self.page_size - 1)
         real = (slots >= self.page_size) & (slots < self.logical_tokens)
-        phys = (page % self.phys_pages) * self.page_size + off
+        if getattr(self, "pair_split", False):
+            gp = page % self.pair_pages
+            owned = ((gp // self.pair_block) & 1) == self.pair_rank_bit
+            local = (gp // (2 * self.pair_block)) * self.pair_block + gp % self.pair_block
+            phys = torch.where(owned, local, self.phys_pages) * self.page_size + off
+        else:
+            phys = (page % self.phys_pages) * self.page_size + off
         return torch.where(real, phys, self.phys_slot_base + off)
 
     def map_slot_table(self, table: torch.Tensor) -> torch.Tensor:
-        """int32 logical slot table -> int32 physical slot table."""
+        """int32 logical slot table -> int32 physical slot table (read side).
+
+        READ-side remap: every real page maps to its LOCAL bijection row --
+        self-owned pages by our own writes, peer-owned pages after page-in
+        fetches them in. (map_slots is the write-side counterpart: it
+        routes peer-owned writes to the padding page, whose bytes the pair
+        member produces independently.)
+        """
         page = table >> self._page_shift
         off = table & (self.page_size - 1)
         real = (table >= self.page_size) & (table < self.logical_tokens)
+        # PAIR read-side tables are the v2 dual-pointer slice (owner bit +
+        # peer base pointer); the boot gate below refuses to serve PAIR
+        # until that lands, so this map stays FULL-only today.
         phys = (page % self.phys_pages) * self.page_size + off
         return torch.where(real, phys, self.phys_slot_base + off).to(torch.int32)
 
@@ -981,6 +1158,44 @@ class KVHostTier:
         dest = torch.cumsum(heads, dim=0, dtype=torch.long) - 1
         uniq.scatter_(0, dest.clamp(max=self._p3_cap - 1), sorted_pages)
         count.copy_(dest[-1] + 1)
+
+    def attach_peer_buffers(self, peer_k_buffers, peer_v_buffers, peer_tags) -> None:
+        """Install the pair member's imported full-KV buffers and tag tables.
+
+        Called once at boot after the IPC rendezvous; both ranks build
+        symmetric pools, so the tensors line up layer-for-layer with ours.
+        Serving refuses to start without them under PAIR_PARITY (checked in
+        ensure_peer_ready).
+        """
+        if not self.pair_split:
+            return
+        if len(peer_k_buffers) != self.layer_num:
+            raise ValueError(
+                f"Peer buffer count {len(peer_k_buffers)} != layers "
+                f"{self.layer_num}"
+            )
+        self._peer_kv_buffers = list(zip(peer_k_buffers, peer_v_buffers))
+        self._peer_tags_source = list(peer_tags)
+
+    def ensure_peer_ready(self) -> None:
+        """Boot-time hard gate: pair-split needs the peer buffers attached."""
+        if self.pair_split and self._peer_kv_buffers is None:
+            raise RuntimeError(
+                "SGLANG_V100_KV_HEAD_LAYOUT=PAIR_PARITY requires the pair "
+                "member's KV buffers (IPC import failed or was skipped)"
+            )
+
+    def _refresh_peer_tags(self) -> None:
+        """Copy the pair member's tag tables into the local mirror.
+
+        P2P device-to-device, one small copy per layer on the current
+        stream: the build already ordered everything else, so the refresh
+        lands before this forward's page-in and gather.
+        """
+        for li in range(self.layer_num):
+            self._peer_tags[li].copy_(
+                self._peer_tags_source[li], non_blocking=True
+            )
 
     def _p3_logical_pages(self, slots: torch.Tensor) -> torch.Tensor:
         s = slots.reshape(-1).to(torch.long)
@@ -1006,6 +1221,10 @@ class KVHostTier:
                 skip,
                 counter,
                 PAGE_ELEMS=self._page_elems,
+                PAIR=self.pair_split,
+                pair_pages=self.pair_pages,
+                pair_block=self.pair_block,
+                rank_bit=self.pair_rank_bit,
                 num_warps=8,
             )
 
@@ -1027,6 +1246,11 @@ class KVHostTier:
                 "Phase 3 KV host tier does not support CUDA-graph capture; "
                 "serve with --disable-cuda-graph"
             )
+        if self.pair_split:
+            # Refresh the pair member's tag mirror before this forward's
+            # page-in/gather consult it: after the refresh, "peer tag ==
+            # lp" means the peer's row holds the page's current bytes.
+            self._refresh_peer_tags()
         self.step_seq += 1
         # Bump the generation on-device: the captured page-in kernels load
         # this scalar at replay, so the bump must be a device op ordered
@@ -1078,6 +1302,10 @@ class KVHostTier:
                         counter,
                         save,
                         PAGE_ELEMS=self._page_elems,
+                        PAIR=self.pair_split,
+                        pair_pages=self.pair_pages,
+                        pair_block=self.pair_block,
+                        rank_bit=self.pair_rank_bit,
                         num_warps=8,
                     )
         else:
@@ -1138,6 +1366,10 @@ class KVHostTier:
                 restore,
                 save,
                 PAGE_ELEMS=self._page_elems,
+                PAIR=self.pair_split,
+                pair_pages=self.pair_pages,
+                pair_block=self.pair_block,
+                rank_bit=self.pair_rank_bit,
                 num_warps=8,
             )
 
@@ -1198,6 +1430,10 @@ class KVHostTier:
                 ROW_ELEMS=self.kv_heads * self.head_dim,
                 PAGE_ELEMS=self._page_elems,
                 BLOCK_ROWS=_P3_GATHER_ROWS,
+                PAIR=self.pair_split,
+                pair_pages=self.pair_pages,
+                pair_block=self.pair_block,
+                rank_bit=self.pair_rank_bit,
                 num_warps=4,
             )
 
@@ -1638,7 +1874,8 @@ class KVHostTier:
                 "kv_host_tier phase3 stats: steps=%d mirror_pages=%d "
                 "write_restores=%d pagein_restores=%d collisions=%d "
                 "saves=%d host_gather_rows=%d mirror_skips=%d "
-                "gather_unvalid=%d checked_rows=%d host_dev_mismatch=%d",
+                "gather_unvalid=%d checked_rows=%d host_dev_mismatch=%d "
+                "peer_miss=%d",
                 self.step_seq,
                 c[_CNT_P3_MIRROR_PAGES],
                 c[_CNT_P3_WRITE_RESTORES],
@@ -1650,6 +1887,7 @@ class KVHostTier:
                 c[_CNT_P3_GATHER_UNVALID],
                 c[_CNT_P3_CHECKED_ROWS],
                 c[_CNT_P3_HOST_DEV_MISMATCH],
+                c[_CNT_P3_PEER_MISS],
             )
             return
         reads = c[_CNT_READ_HITS] + c[_CNT_READ_MISSES]

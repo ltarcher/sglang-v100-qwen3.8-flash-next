@@ -274,6 +274,24 @@ class DsparkFoldedSampling(IntEnum):
     FORCE = 2
 
 
+class KVHeadLayout(IntEnum):
+    """Device full-KV pool layout across TP ranks (docs/v100/
+    KV_HOST_TIER_DESIGN.md §6.1 pair-split).
+
+    FULL: every rank stores its whole local KV head (today's layout; the
+    per-rank pool is exactly the head that rank's q-heads need).
+    PAIR_PARITY: the rank pair that shares a KV head (shard_id =
+    kv_tp_rank // replicas) splits its pages by block parity -- each rank
+    stores every other block and P2P-reads the rest from its pair member,
+    halving the device pool. Requires the Phase 3 tier: prefill/decode reads
+    resolve blocks through the tier's three-source page-in/gather kernels,
+    and the device pool is sized to PHYS/2.
+    """
+
+    FULL = 0
+    PAIR_PARITY = 1
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -1597,8 +1615,7 @@ class Envs:
     # reads page in on demand and the freed device memory goes to activations.
     # 0 = off (Phase 1/2 behavior); requires a multiple of the pool page size.
     # Opt-in only: needs --disable-cuda-graph and target-only serving.
-    SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(0)
-    # Phase 3 logical-capacity extension kill-switch: when set, the tier keeps
+    SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(0)    # Phase 3 logical-capacity extension kill-switch: when set, the tier keeps
     # the profiled device capacity even if --max-total-tokens asks for more.
     # The extension re-charges the freed PHYS bytes to the logical budget,
     # which can starve prefill activations on tight pools (measured OOM: a
@@ -1607,6 +1624,24 @@ class Envs:
     # bytes for activations instead by disabling the extension and sizing
     # PHYS to the longest context actually served.
     SGLANG_V100_KV_TIER_DISABLE_EXTEND = EnvBool(False)
+    # Pair-split device full-KV layout across the rank pair that shares a KV
+    # head (docs/v100/KV_HOST_TIER_DESIGN.md §6.1). FULL keeps today's layout;
+    # PAIR_PARITY halves the device pool (PHYS is the PAIR TOTAL) by storing
+    # alternating blocks per rank and P2P-reading the pair member's blocks.
+    # Requires SGLANG_V100_KV_TIER_PHYS_TOKENS (the tier's three-source read
+    # path resolves remote blocks) and a working P2P link to the pair member
+    # (probed at boot; failure refuses to start rather than degrade).
+    SGLANG_V100_KV_HEAD_LAYOUT = EnvInt(KVHeadLayout.FULL)
+    # Blocks per parity group in PAIR_PARITY: 1 = page parity, N = consecutive
+    # blocks alternate (N=8 turns 64-token pages into 512-token copy granules
+    # for better P2P bandwidth at coarser page-in granularity). Must divide
+    # the pair-total physical page count.
+    SGLANG_V100_KV_HEAD_LAYOUT_BLOCK = EnvInt(1)
+    # Testbench escape for the PAIR_PARITY scaffolding: the read path
+    # (owner-bit dual-pointer decode/gather tables) is a pending slice, so
+    # boots under PAIR_PARITY refuse to serve without this set. Write-side
+    # parity guards and the IPC rendezvous run either way.
+    SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
