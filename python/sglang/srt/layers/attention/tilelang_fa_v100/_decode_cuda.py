@@ -188,8 +188,14 @@ def sm70_cuda_qsa_decode(
     indices,
     seq_lens,
     softmax_scale,
+    peer_kv=None,
 ):
-    """Run QSA split-KV decode directly from selected E5M2 or FP16 cache rows."""
+    """Run QSA split-KV decode directly from selected E5M2 or FP16 cache rows.
+
+    ``peer_kv`` = ``(peer_k, peer_v)`` enables the pair-split read path: the
+    table carries owner-bit entries (``kv_host_tier.map_slot_table``) and
+    peer-owned rows are read from the pair member's IPC-imported pools.
+    """
     ext = _load_sm70_cuda_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 CUDA QSA decode extension is unavailable.")
@@ -203,10 +209,22 @@ def sm70_cuda_qsa_decode(
     )
     seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
     indices = indices.to(dtype=torch.int32).contiguous()
+    if peer_kv is not None:
+        # Same byte/half view as the local caches so the op's dtype and
+        # shape checks hold.
+        peer_k = _qsa_cache_view(peer_kv[0])
+        peer_v = _qsa_cache_view(peer_kv[1])
+    else:
+        # Absent peers leave the op's owner-bit select defaulting to the
+        # local caches (FULL-layout tables never set bit 30).
+        peer_k = None
+        peer_v = None
     ext.sm70_qsa_decode(
         q.contiguous(),
         _qsa_cache_view(k_cache),
         _qsa_cache_view(v_cache),
+        peer_k,
+        peer_v,
         req_to_token.to(dtype=torch.int32).contiguous(),
         req_indices.to(dtype=torch.int32).contiguous(),
         indices,

@@ -2082,7 +2082,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                 raise ValueError(
                     f"Layer {layer.layer_id} has no Phase 3 host tier slot"
                 )
-            table = self._resolve_metadata(forward_batch).token_slot_table
+            metadata = self._resolve_metadata(forward_batch)
+            if _tier.pair_split:
+                # Owner-bit dual pointer: the gather consumes the PHYS slot
+                # table so peer-owned rows carry the owner bit + peer row.
+                table = metadata.phys_token_slot_table
+            else:
+                table = metadata.token_slot_table
             total = sum(sequence_lens)
             packed_k = torch.empty(
                 (total,) + tuple(k_buffer.shape[1:]),
@@ -2688,6 +2694,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 metadata.sequence_lengths,
                 layer.scaling,
+                peer_kv=(
+                    _tier.pair_peer_kv(_tier.layer_slot.get(layer.layer_id))
+                    if tier3 and _tier.pair_split
+                    else None
+                ),
             )
             return output.reshape(q.shape[0], -1)
         trtllm_decode = _resolve_trtllm_sparse_decode()
@@ -2770,6 +2781,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            pair_peer_kv=(
+                _tier.pair_peer_kv(_tier.layer_slot.get(layer.layer_id))
+                if tier3 and _tier.pair_split
+                else None
+            ),
         )
         if is_hip():
             relative_indices = torch.arange(

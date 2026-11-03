@@ -101,6 +101,8 @@ __device__ __forceinline__ void kv8_to_fp16_16(
 template <typename KV>
 __device__ __forceinline__ void load_kv_tile(const KV* __restrict__ k_cache,
                                              const KV* __restrict__ v_cache,
+                                             const KV* __restrict__ peer_k_cache,
+                                             const KV* __restrict__ peer_v_cache,
                                              const int* __restrict__ slots,
                                              const int tile_tokens, const int tid,
                                              const __half* __restrict__ lut,
@@ -118,18 +120,28 @@ __device__ __forceinline__ void load_kv_tile(const KV* __restrict__ k_cache,
     uint4* dk = reinterpret_cast<uint4*>(ks + dst);
     uint4* dv = reinterpret_cast<uint4*>(vs + dst);
     if (tok_local < tile_tokens && slot >= 0) {
-      const int64_t base = (int64_t)slot * kDim + d_off;
+      // Pair-split physical table (kv_host_tier.map_slot_table): bit 30
+      // marks a row the PAIR member owns, so the row indexes its imported
+      // buffers instead of ours. FULL-layout entries never set the bit and
+      // the peer pointers alias the local caches, making this a no-op
+      // select. No PAIR-pool oversubscription (boot gate), so a valid row
+      // is always device-resident on one side.
+      const bool peer = (slot >> 30) != 0;
+      const int row = slot & 0x3FFFFFFF;
+      const KV* kb = peer ? peer_k_cache : k_cache;
+      const KV* vb = peer ? peer_v_cache : v_cache;
+      const int64_t base = (int64_t)row * kDim + d_off;
       if constexpr (sizeof(KV) == 1) {
         // Byte cache (E5M2 or E4M3): base is in bytes, one 16-byte vector
         // per thread; the LUT pointer selects the conversion.
-        kv8_to_fp16_16(*reinterpret_cast<const uint4*>(k_cache + base),
+        kv8_to_fp16_16(*reinterpret_cast<const uint4*>(kb + base),
                        ks + dst, lut);
-        kv8_to_fp16_16(*reinterpret_cast<const uint4*>(v_cache + base),
+        kv8_to_fp16_16(*reinterpret_cast<const uint4*>(vb + base),
                        vs + dst, lut);
       } else {
         // FP16 cache: base is in halves, two 16-byte vectors per thread.
-        const uint4* sk = reinterpret_cast<const uint4*>(k_cache + base);
-        const uint4* sv = reinterpret_cast<const uint4*>(v_cache + base);
+        const uint4* sk = reinterpret_cast<const uint4*>(kb + base);
+        const uint4* sv = reinterpret_cast<const uint4*>(vb + base);
         dk[0] = sk[0];
         dk[1] = sk[1];
         dv[0] = sv[0];
@@ -378,7 +390,8 @@ template <typename KV>
 __global__ void __launch_bounds__(kThreads, 1)
 qsa_decode_partial_kernel(
     const __half* __restrict__ q, const KV* __restrict__ k_cache,
-    const KV* __restrict__ v_cache,
+    const KV* __restrict__ v_cache, const KV* __restrict__ peer_k_cache,
+    const KV* __restrict__ peer_v_cache,
     const int* __restrict__ req_to_token,
     const int* __restrict__ req_indices, const int* __restrict__ indices,
     const int* __restrict__ seq_lens, const int req_stride, const int topk,
@@ -452,7 +465,8 @@ qsa_decode_partial_kernel(
     }
     __syncthreads();
 
-    load_kv_tile<KV>(k_cache, v_cache, slots, tile_tokens, tid, lut, ks, vs);
+    load_kv_tile<KV>(k_cache, v_cache, peer_k_cache, peer_v_cache, slots,
+                     tile_tokens, tid, lut, ks, vs);
     __syncthreads();
 
     if (is_compute_warp) {
@@ -1171,7 +1185,10 @@ void sm70_longctx_decode(torch::Tensor q, torch::Tensor k_cache,
 }
 
 void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
-                     torch::Tensor v_cache, torch::Tensor req_to_token,
+                     torch::Tensor v_cache,
+                     c10::optional<torch::Tensor> peer_k_cache,
+                     c10::optional<torch::Tensor> peer_v_cache,
+                     torch::Tensor req_to_token,
                      torch::Tensor req_indices, torch::Tensor indices,
                      torch::Tensor seq_lens, int64_t max_splits,
                      int64_t min_tokens_per_split, double softmax_scale,
@@ -1218,12 +1235,31 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
                 "sm70_qsa_decode lut must be 256 fp16 entries");
     lut_ptr = reinterpret_cast<const __half*>(lut->data_ptr());
   }
+  // Pair-split read path: the peer pointers default to the local caches,
+  // which makes the per-row owner-bit select in load_kv_tile a no-op for
+  // FULL-layout tables (entries never set bit 30). With pair-split the
+  // peer tensors are the pair member's IPC-imported pools.
+  const uint8_t* peer_k_ptr =
+      static_cast<const uint8_t*>(k_cache.data_ptr());
+  const uint8_t* peer_v_ptr =
+      static_cast<const uint8_t*>(v_cache.data_ptr());
+  if (peer_k_cache.has_value() && peer_k_cache->defined()) {
+    TORCH_CHECK(
+        peer_v_cache.has_value() && peer_v_cache->defined() &&
+            peer_k_cache->scalar_type() == k_cache.scalar_type() &&
+            peer_k_cache->sizes() == k_cache.sizes() &&
+            peer_v_cache->sizes() == v_cache.sizes(),
+        "sm70_qsa_decode peer KV must match the local cache layout");
+    peer_k_ptr = static_cast<const uint8_t*>(peer_k_cache->data_ptr());
+    peer_v_ptr = static_cast<const uint8_t*>(peer_v_cache->data_ptr());
+  }
   auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(1, (unsigned int)max_splits, (unsigned int)q.size(0));
   if (is_e5m2) {
     qsa_decode_partial_kernel<uint8_t><<<grid, kThreads, 0, stream>>>(
         reinterpret_cast<const __half*>(q.data_ptr()),
         k_cache.data_ptr<uint8_t>(), v_cache.data_ptr<uint8_t>(),
+        peer_k_ptr, peer_v_ptr,
         req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
         indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
         (int)req_to_token.size(1), (int)indices.size(1), (int)max_splits,
@@ -1235,6 +1271,8 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
         reinterpret_cast<const __half*>(q.data_ptr()),
         reinterpret_cast<const __half*>(k_cache.data_ptr()),
         reinterpret_cast<const __half*>(v_cache.data_ptr()),
+        reinterpret_cast<const __half*>(peer_k_ptr),
+        reinterpret_cast<const __half*>(peer_v_ptr),
         req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
         indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
         (int)req_to_token.size(1), (int)indices.size(1), (int)max_splits,

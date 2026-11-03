@@ -442,9 +442,13 @@ def _compact_kv(
     req_stride: tl.constexpr,
     idx_stride: tl.constexpr,
     pad_cols,
+    PAIR_OWNER_MASK,
+    peer_k,
+    peer_v,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    PAIR: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -460,6 +464,16 @@ def _compact_kv(
         mask=valid,
         other=0,
     )
+    if PAIR:
+        # Pair-split physical table (kv_host_tier.map_slot_table): bit 30
+        # marks a page the PAIR member owns and the low bits index the
+        # member's buffers. No PAIR-pool oversubscription (boot gate), so a
+        # valid row always reads device-side -- from our pool or the pair
+        # member's imported buffers, selected per row by the owner bit.
+        peer = (slots & PAIR_OWNER_MASK) != 0
+        slots = slots & ~PAIR_OWNER_MASK
+    else:
+        peer = tl.zeros((1,), tl.int1)
     # 64-bit element offsets: slot * heads * dim exceeds int32 once the pool holds
     # more than 2^31 / (heads * dim) tokens (~4.2M for 2 x 256), which an FP8 pool
     # on one GPU does reach.
@@ -483,16 +497,34 @@ def _compact_kv(
     # without per-tensor k/v scales (see set_kv_buffer calls in
     # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
-    tl.store(
-        out_k + dst,
-        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
-    tl.store(
-        out_v + dst,
-        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
+    if PAIR:
+        tl.store(
+            out_k + dst,
+            tl.load(k + src, mask=(load_mask & ~peer[:, None]), other=0.0).to(out_dtype)
+            + tl.load(peer_k + src, mask=(load_mask & peer[:, None]), other=0.0).to(
+                out_dtype
+            ),
+            mask=store_mask,
+        )
+        tl.store(
+            out_v + dst,
+            tl.load(v + src, mask=(load_mask & ~peer[:, None]), other=0.0).to(out_dtype)
+            + tl.load(peer_v + src, mask=(load_mask & peer[:, None]), other=0.0).to(
+                out_dtype
+            ),
+            mask=store_mask,
+        )
+    else:
+        tl.store(
+            out_k + dst,
+            tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
+            mask=store_mask,
+        )
+        tl.store(
+            out_v + dst,
+            tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
+            mask=store_mask,
+        )
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -523,6 +555,7 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
+    pair_peer_kv=None,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -539,11 +572,26 @@ def qwen_sparse_kv_extraction_compact_triton(
     Both layouts assume the valid entries of each ``indices`` row are contiguous at
     the front (``expand_qsa_block_indices`` sorts them that way): ``valid_count`` is a
     count, not a mask, so a ``-1`` in the middle of a row would shift the packing.
+
+    ``pair_peer_kv`` = ``(owner_mask, peer_k, peer_v)`` enables the pair-split read
+    path: the table carries owner-bit entries (``kv_host_tier.map_slot_table``) and
+    peer-owned rows are read from the pair member's imported buffers.
     """
     _, heads, dim = k.shape
     block_topk = 16
     zero_fill = zero_fill_cols > 0
     num_cols = zero_fill_cols if zero_fill else topk
+    pair = pair_peer_kv is not None
+    if pair:
+        owner_mask, peer_k, peer_v = pair_peer_kv
+    else:
+        # Triton binds pointer args even in constexpr-dead branches; hand it
+        # a real 1-element stand-in instead of None.
+        from sglang.srt.mem_cache.kv_host_tier import _PAIR_OWNER_MASK
+
+        owner_mask = _PAIR_OWNER_MASK
+        peer_k = k.reshape(-1)[:1]
+        peer_v = v.reshape(-1)[:1]
     _compact_kv[(batch, heads, triton.cdiv(num_cols, block_topk))](
         k,
         v,
@@ -560,9 +608,13 @@ def qwen_sparse_kv_extraction_compact_triton(
         req_to_token.stride(0),
         indices.stride(0),
         num_cols,
+        owner_mask,
+        peer_k,
+        peer_v,
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        PAIR=pair,
         num_warps=8,
     )
 
