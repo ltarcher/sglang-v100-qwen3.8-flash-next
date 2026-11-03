@@ -64,6 +64,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import KVHeadLayout, envs
+from sglang.srt.mem_cache.pair_split_ipc import imported_as_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -1243,8 +1244,13 @@ class KVHostTier:
         lands before this forward's page-in and gather.
         """
         for li in range(self.layer_num):
+            # The source is an IPC-imported pointer wrapper; torch copy_
+            # needs a real tensor, so wrap the allocation zero-copy.
             self._peer_tags[li].copy_(
-                self._peer_tags_source[li], non_blocking=True
+                imported_as_tensor(
+                    self._peer_tags_source[li], self._peer_tags[li].shape
+                ),
+                non_blocking=True,
             )
 
     def _p3_logical_pages(self, slots: torch.Tensor) -> torch.Tensor:

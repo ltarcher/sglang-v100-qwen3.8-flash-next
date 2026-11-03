@@ -20,6 +20,7 @@ from pathlib import Path
 import torch
 from sglang.kernels.sm70_paths import sm70_csrc
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.pair_split_ipc import ImportedDeviceBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -167,13 +168,23 @@ def sm70_cuda_qsa_prefill(
     return output
 
 
-def _qsa_cache_view(cache: torch.Tensor) -> torch.Tensor:
+def _qsa_cache_view(cache: torch.Tensor, like: torch.Tensor = None) -> torch.Tensor:
     """View the paged KV cache for the CUDA op.
 
     The E5M2 pool is one byte per element and is read as uint8; an FP16 pool is
     read as half. Reinterpreting an FP16 cache to bytes would double the
-    element count, so the view is dtype-dependent.
+    element count, so the view is dtype-dependent. Pair-split peers arrive
+    as ImportedDeviceBuffer pointer wrappers: the pybind op only takes
+    torch tensors, so wrap the foreign allocation as a zero-copy view
+    (from_blob, no deleter -- the IPC holder owns the memory).
     """
+    if isinstance(cache, ImportedDeviceBuffer):
+        ext = _load_sm70_cuda_decode_ops()
+        assert ext is not None, "SM70 decode ops required for pair-split peers"
+        shape = list(like.shape) if like is not None else [cache.numel]
+        return ext.sm70_as_tensor(
+            cache.data_ptr(), shape, cache.dtype
+        )
     if cache.dtype == torch.float8_e5m2:
         return cache.view(torch.uint8).contiguous()
     return cache.contiguous()
@@ -211,9 +222,10 @@ def sm70_cuda_qsa_decode(
     indices = indices.to(dtype=torch.int32).contiguous()
     if peer_kv is not None:
         # Same byte/half view as the local caches so the op's dtype and
-        # shape checks hold.
-        peer_k = _qsa_cache_view(peer_kv[0])
-        peer_v = _qsa_cache_view(peer_kv[1])
+        # shape checks hold; imported buffers are flat wrappers, so they
+        # inherit the local cache's shape.
+        peer_k = _qsa_cache_view(peer_kv[0], like=k_cache)
+        peer_v = _qsa_cache_view(peer_kv[1], like=v_cache)
     else:
         # Absent peers leave the op's owner-bit select defaulting to the
         # local caches (FULL-layout tables never set bit 30).

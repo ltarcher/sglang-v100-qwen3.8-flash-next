@@ -1392,4 +1392,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "QSA indexer decode scoring (H4 D128 FP16)");
   m.def("sm70_qsa_prefill", &sm70_qsa_prefill,
         "QSA chunk-prefill (D256 G6 E5M2)");
+  m.def("sm70_as_tensor",
+        [](uintptr_t addr, std::vector<int64_t> sizes, at::ScalarType st) {
+          // Wrap a foreign device allocation (IPC-imported pair peer
+          // buffer) as a read-only tensor without copying. Lifetime: the
+          // Python ImportedDeviceBuffer holder must outlive the returned
+          // view; from_blob registers no deleter.
+          return at::from_blob(reinterpret_cast<void*>(addr), sizes,
+                               at::TensorOptions().dtype(st).device(at::kCUDA));
+        },
+        "Wrap a device pointer as a tensor view (no copy, no deleter)");
 }

@@ -13,6 +13,8 @@ attributes the boot path sets; ``map_slot_table`` produces the real
 physical table (owner bit 30 folded into peer-owned entries).
 """
 
+import ctypes
+
 import pytest
 import torch
 
@@ -27,6 +29,7 @@ from sglang.srt.mem_cache.kv_host_tier import (
     KVHostTier,
     _p3_gather_kernel,
 )
+from sglang.srt.mem_cache.pair_split_ipc import ImportedDeviceBuffer
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a GPU"
@@ -317,7 +320,16 @@ class TestSm70DecodePair:
             indices,
             seq_lens,
             scale,
-            peer_kv=(peer_k, peer_v),
+            # Real boot passes the IPC-imported pointer wrappers, not
+            # tensors -- _qsa_cache_view must pass them through.
+            peer_kv=(
+                ImportedDeviceBuffer(
+                    ctypes.c_void_p(peer_k.data_ptr()), peer_k.numel(), peer_k.dtype
+                ),
+                ImportedDeviceBuffer(
+                    ctypes.c_void_p(peer_v.data_ptr()), peer_v.numel(), peer_v.dtype
+                ),
+            ),
         ).reshape(batch, self.HEADS, self.DIM)
 
         rows = []

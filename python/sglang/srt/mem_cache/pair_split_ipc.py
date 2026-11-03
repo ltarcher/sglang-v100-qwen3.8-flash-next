@@ -74,6 +74,23 @@ class ImportedDeviceBuffer:
         return ImportedDeviceBuffer(shifted, self.numel - start, self.dtype)
 
 
+def imported_as_tensor(buf: ImportedDeviceBuffer, shape) -> torch.Tensor:
+    """Zero-copy torch view of an imported allocation.
+
+    Torch ops cannot consume the raw pointer wrapper (``copy_`` and friends
+    require a real tensor), so wrap the foreign allocation via the SM70
+    decode ext's ``from_blob`` binding -- no copy, no deleter: the
+    exporting process owns the memory for the whole job.
+    """
+    from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
+        _load_sm70_cuda_decode_ops,
+    )
+
+    ext = _load_sm70_cuda_decode_ops()
+    assert ext is not None, "SM70 decode ops required for pair-split peers"
+    return ext.sm70_as_tensor(buf.data_ptr(), list(shape), buf.dtype)
+
+
 def exchange_pair_tensors(
     local_tensors: List[torch.Tensor], peer_rank: int
 ) -> List[ImportedDeviceBuffer]:
