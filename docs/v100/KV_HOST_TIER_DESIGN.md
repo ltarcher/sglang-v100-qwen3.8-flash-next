@@ -286,6 +286,7 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 | SGLANG_V100_KV_STREAM_PREFILL | 0 | 方案 b 开关(1M 场景) |
 | SGLANG_V100_KV_TIER_PAGEIN | 0 | Phase 2 页入路径(需 HOST_TIER=1;稳镜像 + UVA 原地恢复,零 host sync、图安全) |
 | SGLANG_V100_KV_TIER_DEGRADE_FLAG | "" | 手动降级测试钩子:文件存在即在下次 decode-like build 一次性全量镜像 + closed 页 qNaN 垃圾化 |
+| SGLANG_V100_KV_TIER_DISABLE_EXTEND | 0 | 关闭 Phase 3 逻辑容量扩展:保持 profiled 设备容量,释放字节留给激活(推荐开启;见 §10 头部修订) |
 
 上线时同步 serve 脚本注释与 README 表格(fork 纪律)。
 
@@ -350,6 +351,17 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 prefill 激活没有余量**(首 4K chunk `F.silu(conv_output)` 80 MiB 申请失败,
 free 12 MiB)。因此 Phase 3 最小闭环不是"扩逻辑容量",而是**缩设备池、把差额
 换成 host 页**,同时让播散的 top-k 读仍能取到数据。
+
+**逻辑容量扩展(2026-11-03 修订为默认禁用)**:`_tier_extend_logical_capacity`
+曾把 `--max-total-tokens` 超出 GPU profile 的部分重新充入逻辑预算(516,352 →
+540,672),但 s7/s8 门测证明它在紧池上饿死 prefill 激活——0.93 fraction 的
+255K 对照在扩展抬容量后死于 80 MiB `F.silu` 申请,同配置保持 profiled 容量则
+存活且 needle 全过。现由 `SGLANG_V100_KV_TIER_DISABLE_EXTEND=1` 关闭扩展
+(推荐部署形态):逻辑容量保持 profiled 值,释放的 PHYS 字节留在激活;
+`PHYS` 直接按实际服务的最长上下文取整到页(255K → 327,680,实测 255K×1
+needle 3/3、`host_dev_mismatch=0`)。注意卷绕约束:上下文必须 ≤ PHYS,
+否则 `lp % P` 槽位复用会使召回随超出比单调劣化(150K/156K 边界全过,
+170K 起 1/2,255K@196K PHYS 0/8;PHYS=393,216 无卷绕 3/3 同 nonce 转好)。
 
 ### 10.1 容量切分
 
