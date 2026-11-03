@@ -1598,6 +1598,15 @@ class Envs:
     # 0 = off (Phase 1/2 behavior); requires a multiple of the pool page size.
     # Opt-in only: needs --disable-cuda-graph and target-only serving.
     SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(0)
+    # Phase 3 logical-capacity extension kill-switch: when set, the tier keeps
+    # the profiled device capacity even if --max-total-tokens asks for more.
+    # The extension re-charges the freed PHYS bytes to the logical budget,
+    # which can starve prefill activations on tight pools (measured OOM: a
+    # 0.93-fraction 255K-context run died in an 80 MiB activation alloc after
+    # the extension raised the logical budget 516K -> 540K). Keep the freed
+    # bytes for activations instead by disabling the extension and sizing
+    # PHYS to the longest context actually served.
+    SGLANG_V100_KV_TIER_DISABLE_EXTEND = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)

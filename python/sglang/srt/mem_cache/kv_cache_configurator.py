@@ -2417,12 +2417,20 @@ class KVCacheConfigurator:
         device-resident pool must track the target's logical capacity.
         """
         user_limit = get_schedule().max_total_tokens
-        if (
-            not user_limit
-            or user_limit <= config.max_total_num_tokens
-            or not envs.SGLANG_V100_KV_HOST_TIER.get()
-            or not envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get()
-        ):
+        if not user_limit or user_limit <= config.max_total_num_tokens:
+            return config
+        if not envs.SGLANG_V100_KV_HOST_TIER.get():
+            return config
+        if not envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get():
+            return config
+        if envs.SGLANG_V100_KV_TIER_DISABLE_EXTEND.get():
+            logger.info(
+                "Host tier logical-capacity extension disabled "
+                "(SGLANG_V100_KV_TIER_DISABLE_EXTEND=1): keeping the profiled "
+                "device capacity %d; the freed PHYS bytes stay with "
+                "activations.",
+                config.max_total_num_tokens,
+            )
             return config
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
