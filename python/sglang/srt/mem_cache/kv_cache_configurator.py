@@ -2025,27 +2025,30 @@ class KVCacheConfigurator:
                         "SGLANG_V100_KV_TIER_PHYS_TOKENS must be a multiple of the "
                         f"KV pool page size ({self.pool_page_size}), got {phys_size}"
                     )
-                if phys_size >= max_total_num_tokens:
+                if envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY:
+                    # Pair-split (docs/v100/KV_HOST_TIER_DESIGN.md §6.1): PHYS
+                    # is the PAIR TOTAL; each rank allocates half and P2P-
+                    # reads the pair member's blocks through the tier's read
+                    # path. The tier owns the parity mapping, so the pool
+                    # only sees a smaller device region. The PAIR total is
+                    # allowed to meet or exceed the logical budget (that is
+                    # the point: the logical pool fits the PAIR-total space
+                    # instead of wraparound-shrinking into one rank's half);
+                    # the logical_pages <= pair_pages check lives in the
+                    # tier's _init_pair_split.
+                    block = envs.SGLANG_V100_KV_HEAD_LAYOUT_BLOCK.get()
+                    if block <= 0 or (phys_size // self.pool_page_size) % (2 * block):
+                        raise ValueError(
+                            "SGLANG_V100_KV_HEAD_LAYOUT_BLOCK must divide the "
+                            f"pair-total physical page count "
+                            f"({phys_size // self.pool_page_size}), got {block}"
+                        )
+                    phys_size //= 2
+                elif phys_size >= max_total_num_tokens:
                     raise ValueError(
                         "SGLANG_V100_KV_TIER_PHYS_TOKENS must be smaller than the "
                         f"logical KV budget ({max_total_num_tokens}), got {phys_size}"
                     )
-            if phys_size and (
-                envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY
-            ):
-                # Pair-split (docs/v100/KV_HOST_TIER_DESIGN.md §6.1): PHYS is
-                # the PAIR TOTAL; each rank allocates half and P2P-reads the
-                # pair member's blocks through the tier's read path. The tier
-                # owns the parity mapping, so the pool only sees a smaller
-                # device region.
-                block = envs.SGLANG_V100_KV_HEAD_LAYOUT_BLOCK.get()
-                if block <= 0 or (phys_size // self.pool_page_size) % (2 * block):
-                    raise ValueError(
-                        "SGLANG_V100_KV_HEAD_LAYOUT_BLOCK must divide the "
-                        f"pair-total physical page count "
-                        f"({phys_size // self.pool_page_size}), got {block}"
-                    )
-                phys_size //= 2
             return QSATokenToKVPool(
                 **common_kwargs,
                 phys_size=int(phys_size),

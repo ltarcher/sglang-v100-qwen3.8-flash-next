@@ -79,20 +79,38 @@ def exchange_pair_tensors(
 ) -> List[ImportedDeviceBuffer]:
     """Send our IPC handles to ``peer_rank`` and open theirs.
 
-    One point-to-point broadcast each way on the world group carries the
+    One point-to-point send/recv each way on the world group carries the
     raw handle blobs; shapes and dtypes are symmetric by construction
     (both ranks build identical pools), so nothing else travels.
     """
     lib = CudaRTLibrary()
     blobs = [_tensor_ipc_bytes(t) for t in local_tensors]
     send = torch.frombuffer(b"".join(blobs), dtype=torch.uint8).clone()
-    recv = torch.empty_like(send)
-    dist.broadcast(recv, src=peer_rank)
+    # The world group is NCCL-only (no gloo backend in the serve image), so
+    # the handle blobs must ride on the device; and this is a pairwise
+    # exchange, not a collective -- broadcast(src=peer) would issue two
+    # different collectives on the world group (each rank joins the other's
+    # src, so neither collective ever has all ranks) and deadlock. A
+    # point-to-point send/recv pair matches by ordering instead.
+    send_gpu = torch.empty(
+        send.numel(), dtype=torch.uint8, device=local_tensors[0].device
+    )
+    send_gpu.copy_(send)
+    recv_gpu = torch.empty_like(send_gpu)
+    if dist.get_rank() < peer_rank:
+        dist.send(send_gpu, dst=peer_rank)
+        dist.recv(recv_gpu, src=peer_rank)
+    else:
+        dist.recv(recv_gpu, src=peer_rank)
+        dist.send(send_gpu, dst=peer_rank)
+    recv = recv_gpu.cpu()
     opened = []
     for i, t in enumerate(local_tensors):
-        blob = bytes(recv[i * _HANDLE_BYTES : (i + 1) * _HANDLE_BYTES].tolist())
+        blob = recv[i * _HANDLE_BYTES : (i + 1) * _HANDLE_BYTES].tolist()
         handle = cudaIpcMemHandle_t()
-        handle.internal = (ctypes.c_char * _HANDLE_BYTES).from_buffer_copy(blob)
+        # memmove, not attribute assignment: the wrapper's internal field is
+        # c_byte_Array_128 and a c_char_Array_128 assignment raises TypeError.
+        ctypes.memmove(handle.internal, bytes(blob), _HANDLE_BYTES)
         ptr = lib.cudaIpcOpenMemHandle(handle)
         opened.append(ImportedDeviceBuffer(ptr, t.numel(), t.dtype))
     return opened

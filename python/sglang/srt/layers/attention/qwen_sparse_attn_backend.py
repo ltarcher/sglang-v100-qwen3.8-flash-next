@@ -2685,6 +2685,14 @@ class QwenSparseAttnBackend(AttentionBackend):
                     "inside grouped split-K attention."
                 )
                 self._sm70_sparse_decode_logged = True
+            # pair_peer_kv is (owner_mask, peer_k, peer_v); the decode op
+            # only takes the two imported buffers -- the table's owner bit
+            # carries the selection.
+            pkv = (
+                _tier.pair_peer_kv(_tier.layer_slot.get(layer.layer_id))
+                if tier3 and _tier.pair_split
+                else None
+            )
             output = sm70_cuda_qsa_decode(
                 q,
                 k_buffer,
@@ -2694,11 +2702,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 metadata.sequence_lengths,
                 layer.scaling,
-                peer_kv=(
-                    _tier.pair_peer_kv(_tier.layer_slot.get(layer.layer_id))
-                    if tier3 and _tier.pair_split
-                    else None
-                ),
+                peer_kv=(pkv[1], pkv[2]) if pkv is not None else None,
             )
             return output.reshape(q.shape[0], -1)
         trtllm_decode = _resolve_trtllm_sparse_decode()
