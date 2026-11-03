@@ -293,11 +293,68 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 ## 6. Plan B 杠杆(按启用成本排序)
 
 1. 窗口/预算参数化(已含):窗 48k→24k,hicache 16G→4G。
-2. 去复制(NVLink P2P):2 KV 头 TP4 目前每头双份(rank0/2 共享头0)。改为
-   每头单份,缺头 rank 经 NVLink P2P 读邻卡。物理 KV 减半,1M×4 从不可行
-   变贴边。侵入 attention TP 逻辑,仅在 §2 矩阵判定不足时启用。
+2. 去复制(**2026-11-03 重定案为「对拆」pair-split,原 head-dedup 前提证伪**,
+   见 §6.1):每 rank 对拆自己那份 KV 头的页,物理 KV 减半,256K×2 从
+   不可行变可行。
 3. NVMe 冷层 + 选择预取:利用选择的时间相关性(步 t 的选中集预测 t+1)。
    仅在局部性实测通过后作为 1M×4 的补充,不作为随机访问的兜底。
+
+### 6.1 杠杆 2 重定案:对拆 pair-split(2026-11-03,PCIe 实测)
+
+原设计假设 NVLink P2P 读邻卡补缺头;本机 PCIe-only(PXB/PIX),前提不成立。
+重做账本后**原 head-dedup 方案对 Qwen3.8(nkv=2, TP4)本身不成立**:
+
+- 头-排布映射:`QKVParallelLinear` 的 `shard_id = kv_tp_rank // replicas`
+  (replicas=2)⇒ rank{0,1} 持头 0、rank{2,3} 持头 1;GQA 组(q0-11→头 0、
+  q12-23→头 1)× 每 rank 6 q 头 ⇒ **每个 rank 本地池恰好就是它需要的头**
+  ——rank1 需要 head0 才能算自己的 6 个 q 头,删掉它的副本并不省字节,
+  只是把字节搬家。
+- 对称约束:sglang 调度器/req_to_token/P3 直接映射都假设各 rank 池对称。
+  「owner 持全量、rider 持零」的不对称池破坏模映射不变量;且 head0 全量
+  7.6 GiB(663K tokens)集中到单 rank 装不下。
+- **结论:全局字节数下限 = 663,104 tok × 12,288 B/tok/rank ÷ 4 rank = 每
+  rank 3.88 GiB,对称。dedup 能做到的极限就是这个对称下限。**
+
+**pair-split(对拆)**:每对 rank(0,1 / 2,3)把共享头的页按奇偶对拆——
+每 rank 存 PHYS/2 行(偶页),另一半(奇页)P2P 读对家的对称内存。
+页级路由三层源:本机 device → 对家 device(P2P)→ 本机 host 镜像。
+
+实测成本模型(2026-11-03,本机,`torch._SymmetricMemory.empty_strided_p2p`
+原语已在 custom_all_reduce_v2 在役):
+
+| 项 | 值 | 来源 |
+| --- | --- | --- |
+| P2P D2D 带宽 | **13.1 GB/s**(全部 6 对,PCIe Gen4 x16) | 256 MiB `copy_` ×10 实测 |
+| 32 KiB 页拷贝延迟 | 23.6 µs | 1000 次小拷贝实测 |
+| decode P2P 读 | 2048 选页半数 × 1024 B × 12 层 = 12.6 MiB/步/rank → **0.96 ms/步(~2%)** | @13.1 GB/s |
+| prefill P2P 读 | 全前缀半数重读,63 chunk 合计 ~51 GiB → **+3.9 s(~+3.5%)** | @13.1 GB/s,memcpy 引擎不占 SM |
+| 容量 | PHYS=663,104(256K×2 唯一 tokens,页对齐)@ 6,144 B/tok/rank = **3.88 GiB/rank(+0.12 vs s8)**,激活余量 4.05 GB | s8 available_gpu_mem 4.17 GB |
+
+实现面(全部收在 QSA 池 + QSA backend + kv_host_tier 三文件):
+
+1. **池分配**:每 rank 分配 PHYS/2 行;逻辑页 `p % PHYS` 偶数→本地、奇数→
+   对家,本地下标 `(p % PHYS) // 2`。写路径 `set_kv_buffer` 经 P3 的
+   `phys_out_cache_loc` 重映射已存在,扩展为奇偶重定向(对家写入经
+   symm-mem 映射指针,固定分配,CUDA graph 安全——custom AR v2 同型)。
+2. **读路径**:P3 gather/page-in 的「device-or-host」二源扩为
+   「local-or-peer-or-host」三源。对家 tags/owner 位图镜像(1.3 MiB int32,
+   每 build 一次 P2P 拷贝,进 build 流)。
+3. **准入探测**:boot 时用现成 `can_actually_p2p` 助手实测对家可达性,
+   失败即拒绝以 pair-split 启动(硬失败,不静默降级)。
+4. MTP draft 池不参与(host_tier=False 语义不变);radix/调度器零改动
+   (逻辑空间与页粒度不变)。
+
+质量门:去复制后字节内容与全副本逐位一致(只是换了物理位置),needle
+梯度 + CHECK(host_dev_mismatch 必须保持 0,新增 peer 源失配计数)+ 262k
+锚点数字不回退。对照验收:256K×2(PHYS=663,104)unwrap 区全过、
+decode/prefill 吞吐对 s8 基线 −3% 内。
+
+### 6.2 fp8 KV 对照(判死备胎,记录防重扫)
+
+`kv-cache-dtype fp8` 理论减半(6,144 B/tok/rank → PHYS 655,360 @ 4.03 GiB),
+但 V100 无 fp8 硬件,fork 的 sm70 fp8 KV 全池路径(QSA full-KV)未走通
+(记忆:1M 线「fp8 KV 池仍差 1.4 GB/rank」),质量门另有量化损失;
+pair-split 零精度损失、实测成本更低,维持 fp8 判死。
 
 ## 7. 验证矩阵与验收门
 
