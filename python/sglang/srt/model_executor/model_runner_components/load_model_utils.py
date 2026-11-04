@@ -381,6 +381,7 @@ def load_model_with_memory_saver(
         and get_exec().offload.ple_offload_embedding
         and device == "cuda"
     ):
+        _materialize_ple_staged_tables(model)
         current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
@@ -394,6 +395,18 @@ def load_model_with_memory_saver(
         remote_instance_weight_info=remote_instance_weight_info,
         startup_weight_load=startup_weight_load,
     )
+
+
+def _materialize_ple_staged_tables(model) -> None:
+    """After weight loading, dump staged-backend PLE tables to their shard
+    files and free the pinned loading copies (docs/v100/
+    PLE_NVME_TIER_DESIGN.md Phase 1). No-op unless --ple-offload-backend
+    staged constructed them; safe to call on any model."""
+    from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
+
+    for module in model.modules():
+        if isinstance(module, Qwen4ExpPinnedHostEmbedding):
+            module.materialize_staged_table()
 
 
 def dist_barrier_after_load(

@@ -972,8 +972,13 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
-            choices=["pinned", "file"],
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. 'staged' "
+            "keeps the table in per-shard files on NVMe (SGLANG_QWEN4_PLE_"
+            "STAGED_DIR) and reads rows through a small pinned staging "
+            "buffer per gather; works on discrete GPUs (Phase 1: eager "
+            "paths only, decode CUDA graphs must be disabled — see "
+            "docs/v100/PLE_NVME_TIER_DESIGN.md).",
+            choices=["pinned", "file", "staged"],
         ),
     ] = "pinned"
     ple_offload_dir: A[

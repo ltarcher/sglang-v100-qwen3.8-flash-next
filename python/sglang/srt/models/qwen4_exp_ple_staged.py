@@ -1,0 +1,303 @@
+"""Staged (NVMe + pinned-staging) storage for the offloaded Qwen4-Exp PLE
+n-gram table.
+
+Phase 1 of docs/v100/PLE_NVME_TIER_DESIGN.md. Discrete GPUs (V100) cannot use
+the stock ``file`` backend: the gather kernel would have to dereference a
+pageable mmap pointer, which only works on unified-memory parts (GB10 / DGX
+Spark, ``cudaDevAttrPageableMemoryAccessUsesHostPageTables``). This module
+replaces the "device walks host page tables" trick with explicit host staging:
+
+  L0  pinned staging buffer - one slot per flat gather id position
+  L2  Linux page cache      - reclaimable; this is what frees the 47.7 GiB
+                              hard-pinned table (buffered pread only, never
+                              O_DIRECT, so the kernel can deduplicate IO)
+  L3  per-rank shard file   - one dense file per TP shard, written once by
+                              ``materialize`` after weight loading
+
+Every gather runs as eager host code: flat ids are synced to the CPU, valid
+shard-local rows are pread into staging slots by a small thread pool, invalid
+slots are zeroed, and the *unchanged* gather kernel reads the staging pointer
+with a widened vocabulary range and slot ids 0..N-1. Rows outside this rank's
+shard land in zero slots, preserving the kernel's ``in_range`` zeroing
+semantics bit-exactly.
+
+Limitations (Phase 1): CUDA graph capture is refused (a captured gather would
+replay stale staging contents). Decode-phase pre-replay staging from
+CPU-computed row ids is Phase 2 of the design doc.
+
+Like ``qwen4_exp_ple_table.py``, this module has no Triton or CUDA-kernel
+imports so its IO machinery can be unit-tested on CPU.
+"""
+
+import json
+import os
+import struct
+from concurrent.futures import ThreadPoolExecutor
+
+import torch
+
+from sglang.srt.environ import envs
+
+PLE_STAGED_MAGIC = b"SGPLSTG1"
+PLE_STAGED_VERSION = 1
+_HEADER_FMT = "8sIIQII"  # magic, version, row_bytes, shard_rows, dtype_code, meta_len
+_HEADER_STRUCT = struct.Struct(_HEADER_FMT)
+
+_DTYPE_CODES = {
+    torch.float8_e4m3fn: 1,
+    torch.float8_e5m2: 2,
+    torch.bfloat16: 3,
+    torch.float16: 4,
+}
+
+
+def staged_table_file_name(shape, dtype, tag: str) -> str:
+    """Deterministic per-shard file name (distinct from the file-backend mmap
+    table names on purpose: the staged layout carries a header)."""
+    row_bytes = shape[1] * torch.tensor([], dtype=dtype).element_size()
+    return f"ple_staged_{shape[0]}x{row_bytes}_{_DTYPE_CODES[dtype]}_{tag}.bin"
+
+
+def _dtype_code(dtype: torch.dtype) -> int:
+    if dtype not in _DTYPE_CODES:
+        raise ValueError(f"unsupported PLE staged dtype: {dtype}")
+    return _DTYPE_CODES[dtype]
+
+
+class PleStagedTable:
+    """Dense per-shard PLE row file with a small self-describing header."""
+
+    def __init__(self, shape, dtype: torch.dtype, table_dir: str, tag: str):
+        if len(shape) != 2:
+            raise ValueError(f"PLE staged table must be 2D, got shape {shape}")
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.row_bytes = shape[1] * torch.tensor([], dtype=dtype).element_size()
+        self.shard_rows = int(shape[0])
+        self.header_size = _HEADER_STRUCT.size
+        os.makedirs(table_dir, exist_ok=True)
+        self.path = os.path.join(table_dir, staged_table_file_name(shape, dtype, tag))
+        self.data_offset = self.header_size + len(json.dumps(self._meta()).encode())
+        self._fd: int | None = None
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _open_rw(self) -> int:
+        if self._fd is None or self._fd < 0:
+            self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        return self._fd
+
+    def close(self) -> None:
+        if self._fd is not None and self._fd >= 0:
+            os.close(self._fd)
+            self._fd = None
+
+    # -- materialization ---------------------------------------------------
+
+    def _read_header(self) -> tuple | None:
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return None
+        if size < self.header_size:
+            return None
+        with open(self.path, "rb") as f:
+            head = f.read(self.header_size)
+            magic, version, row_bytes, shard_rows, dtype_code, meta_len = (
+                _HEADER_STRUCT.unpack(head)
+            )
+            if magic != PLE_STAGED_MAGIC or version != PLE_STAGED_VERSION:
+                return None
+            meta = json.loads(f.read(meta_len))
+        expected = self._meta()
+        return (row_bytes, shard_rows, dtype_code, meta), size, expected
+
+    def _meta(self) -> dict:
+        return {
+            "shape": list(self.shape),
+            "dtype": str(self.dtype),
+            "version": PLE_STAGED_VERSION,
+        }
+
+    def materialize(self, host_table: torch.Tensor, reuse: bool) -> bool:
+        """Write ``host_table`` into the shard file. Returns True when bytes
+        were written, False when an existing file was reused untouched."""
+        expected = (
+            self.row_bytes,
+            self.shard_rows,
+            _dtype_code(self.dtype),
+            self._meta(),
+        )
+        if reuse:
+            found = self._read_header()
+            if found is not None:
+                header, size, _ = found
+                if (
+                    header == expected
+                    and size == self.data_offset + self.shard_rows * self.row_bytes
+                ):
+                    return False
+
+        fd = self._open_rw()
+        meta_bytes = json.dumps(expected[3]).encode()
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(
+            fd,
+            _HEADER_STRUCT.pack(
+                PLE_STAGED_MAGIC,
+                PLE_STAGED_VERSION,
+                self.row_bytes,
+                self.shard_rows,
+                _dtype_code(self.dtype),
+                len(meta_bytes),
+            )
+            + meta_bytes,
+        )
+
+        flat = host_table.contiguous().view(torch.uint8).reshape(-1)
+        chunk_rows = max(1, (8 << 20) // self.row_bytes)  # ~8 MiB per write
+        for start in range(0, self.shard_rows, chunk_rows):
+            end = min(start + chunk_rows, self.shard_rows)
+            chunk = flat[start * self.row_bytes : end * self.row_bytes]
+            buf = self._as_write_buffer(chunk)
+            n = os.write(fd, buf)
+            if n != chunk.numel():
+                raise OSError(f"short write into {self.path}: {n} < {chunk.numel()}")
+        os.fsync(fd)
+        return True
+
+    @staticmethod
+    def _as_write_buffer(chunk: torch.Tensor) -> memoryview:
+        try:
+            return memoryview(chunk.numpy())
+        except (TypeError, RuntimeError):
+            # Hugepage-backed tensors may not expose __array__; fall back to
+            # one copy per chunk.
+            import ctypes
+
+            addr = chunk.data_ptr()
+            nbytes = chunk.numel()
+            return memoryview((ctypes.c_char * nbytes).from_address(addr))
+
+    # -- reads -------------------------------------------------------------
+
+    def _ensure_open(self) -> int:
+        if self._fd is None:
+            if not os.path.exists(self.path):
+                raise FileNotFoundError(
+                    f"PLE staged shard file missing: {self.path} "
+                    "(materialize() must run after weight loading)"
+                )
+            self._fd = os.open(self.path, os.O_RDONLY)
+        return self._fd
+
+    def read_rows(self, dest: torch.Tensor, rows: list[int]) -> None:
+        """Blocking debug/read path: copy file rows into ``dest`` rows."""
+        fd = self._ensure_open()
+        row_bytes = self.row_bytes
+        dest_flat = dest.contiguous().view(torch.uint8).reshape(-1)
+        import ctypes
+
+        for slot, row in enumerate(rows):
+            if not 0 <= row < self.shard_rows:
+                raise IndexError(f"row {row} out of range [0, {self.shard_rows})")
+            addr = dest_flat.data_ptr() + slot * row_bytes
+            buf = (ctypes.c_char * row_bytes).from_address(addr)
+            n = os.preadv(fd, [buf], self.data_offset + row * row_bytes)
+            if n != row_bytes:
+                raise OSError(f"short read from {self.path}: {n} < {row_bytes}")
+
+
+class PleRowStaging:
+    """Pinned staging buffer, one slot per flat gather id position.
+
+    ``stage(ids, vocab_start, vocab_end)`` fills every slot for this gather:
+    valid shard-local rows are pread from the shard file (thread pool, GIL
+    released inside preadv), invalid slots are zeroed. Stateless on purpose —
+    zeroing ALL invalid slots each call makes slot reuse across gathers safe.
+    """
+
+    def __init__(
+        self, table: PleStagedTable, max_rows: int, io_threads: int | None = None
+    ):
+        if io_threads is None:
+            io_threads = envs.SGLANG_QWEN4_PLE_STAGED_IO_THREADS.get()
+        self.table = table
+        self.max_rows = max_rows
+        self.row_bytes = table.row_bytes
+        if io_threads > 1:
+            self._pool = ThreadPoolExecutor(
+                max_workers=io_threads, thread_name_prefix="ple-staged-io"
+            )
+        else:
+            self._pool = None
+
+        try:
+            self.buffer = torch.empty(
+                (max_rows, self.row_bytes), dtype=torch.uint8, pin_memory=True
+            )
+        except (RuntimeError, AssertionError):
+            # CPU-only test environments (and engines without a visible CUDA
+            # driver) cannot pin; the gather kernel never touches this path
+            # there anyway.
+            self.buffer = torch.empty((max_rows, self.row_bytes), dtype=torch.uint8)
+        self._zero_row = torch.zeros(self.row_bytes, dtype=torch.uint8)
+        self._arange: torch.Tensor | None = None
+
+    def slot_arange(self, device: torch.device) -> torch.Tensor:
+        """Device-side slot ids 0..max_rows-1 (cached; sliced per gather)."""
+        if self._arange is None or self._arange.device != device:
+            self._arange = torch.arange(self.max_rows, device=device, dtype=torch.long)
+        return self._arange
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
+
+    def _read_into_slot(self, fd: int, slot: int, row: int) -> None:
+        import ctypes
+
+        addr = self.buffer.data_ptr() + slot * self.row_bytes
+        buf = (ctypes.c_char * self.row_bytes).from_address(addr)
+        n = os.preadv(fd, [buf], self.table.data_offset + row * self.row_bytes)
+        if n != self.row_bytes:
+            raise OSError(f"short read from {self.table.path}: {n} < {self.row_bytes}")
+
+    def stage(self, ids: torch.Tensor, vocab_start: int, vocab_end: int) -> int:
+        """Fill staging for ``ids`` (1D global ids). Returns the slot count."""
+        n = int(ids.numel())
+        if n > self.max_rows:
+            raise ValueError(
+                f"gather of {n} rows exceeds staging capacity {self.max_rows} "
+                "(raise SGLANG_QWEN4_PLE_STAGED_MAX_ROWS)"
+            )
+        ids_np = ids.detach().to(torch.long).cpu().numpy()
+        local = ids_np - vocab_start
+        valid = (local >= 0) & (local < self.table.shard_rows) & (ids_np < vocab_end)
+
+        invalid_t = torch.from_numpy((~valid).nonzero()[0])
+        if invalid_t.numel():
+            self.buffer.index_fill_(0, invalid_t, 0)
+
+        rows = local[valid].tolist()
+        if rows:
+            fd = self.table._ensure_open()
+            slots = valid.nonzero()[0].tolist()
+            if self._pool is None:
+                for slot, row in zip(slots, rows):
+                    self._read_into_slot(fd, slot, row)
+            else:
+                futures = [
+                    self._pool.submit(self._read_into_slot, fd, slot, row)
+                    for slot, row in zip(slots, rows)
+                ]
+                exc = None
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as e:  # noqa: BLE001 - re-raise first failure
+                        exc = exc or e
+                if exc is not None:
+                    raise exc
+        return n

@@ -357,6 +357,18 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # --ple-offload-backend staged (discrete-GPU NVMe tier, Phase 1 of
+    # docs/v100/PLE_NVME_TIER_DESIGN.md): where the per-shard staged table
+    # files live, how many threads issue preads into the pinned staging
+    # buffer, the staging capacity in rows (prefill chunks need
+    # tokens * (ngram_size-1) * heads_per_ngram rows; 262144 covers a 16k
+    # chunk at 160 B/row = 40 MiB pinned per rank), and whether an existing
+    # shard file with a matching header may be reused across boots (default
+    # off: a changed checkpoint with the same shape must not be served stale).
+    SGLANG_QWEN4_PLE_STAGED_DIR = EnvStr(lambda: _default_cache_subdir("ple_staged"))
+    SGLANG_QWEN4_PLE_STAGED_IO_THREADS = EnvInt(16)
+    SGLANG_QWEN4_PLE_STAGED_MAX_ROWS = EnvInt(262144)
+    SGLANG_QWEN4_PLE_STAGED_REUSE = EnvBool(False)
     # Qwen4-Exp PLE and HiCache host slabs of at least 1 GiB prefer the
     # boot-reserved 1 GiB hugetlb pool, on the GPU's NUMA node when that node
     # has enough free pages. Machines without the pool, or with too few free

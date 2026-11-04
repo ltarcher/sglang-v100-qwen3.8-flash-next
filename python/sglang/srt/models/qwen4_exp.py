@@ -959,17 +959,47 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
+        shard_tag = (
+            f"rows{self.shard_indices.org_vocab_start_index}"
+            f"-{self.shard_indices.org_vocab_end_index}"
+        )
+        staged_table = None
+        host_backend = backend
+        if backend == "staged":
+            from sglang.srt.models.qwen4_exp_ple_staged import PleStagedTable
+
+            # Discrete-GPU NVMe tier (Phase 1 of docs/v100/
+            # PLE_NVME_TIER_DESIGN.md): the loading table is allocated pinned,
+            # materialized to a per-shard file after weight loading, then
+            # released; gathers read the shard file through a small pinned
+            # staging buffer. The full table never stays pinned.
+            staged_table = PleStagedTable(
+                shape=tuple(source_weight.shape),
+                dtype=source_weight.dtype,
+                table_dir=table_dir or envs.SGLANG_QWEN4_PLE_STAGED_DIR.get(),
+                tag=shard_tag,
+            )
+            host_backend = "pinned"
+            logger.warning(
+                "PLE staged backend: the full %d-row table will be dumped to "
+                "%s after weight loading and the pinned copy released. "
+                "Decode CUDA graphs are NOT supported yet (Phase 2); disable "
+                "them with --cuda-graph-config '{\"decode\":{\"backend\":"
+                "\"disabled\"}}'.",
+                staged_table.shard_rows,
+                staged_table.path,
+            )
         host_table = allocate_ple_host_table(
             shape=source_weight.shape,
             dtype=source_weight.dtype,
-            backend=backend,
+            backend=host_backend,
             table_dir=table_dir,
             # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
+            tag=shard_tag,
         )
+        self._staged_table = staged_table
+        self._staged_materialized = staged_table is None
+        self._staged_staging = None
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -1025,6 +1055,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            if self._staged_table is not None:
+                return self._gather_staged(flat_ids, output)
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids,
@@ -1043,6 +1075,88 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 BLOCK_D=self._block_d,
             )
         return output
+
+    def _gather_staged(
+        self, flat_ids: torch.Tensor, output: torch.Tensor
+    ) -> torch.Tensor:
+        """Discrete-GPU NVMe tier: stage the gather's rows into pinned memory,
+        then run the unchanged gather kernel against the staging buffer with
+        slot ids and a widened vocabulary range (always in-range, so out-of-
+        shard slots read as the zeros ``stage()`` wrote)."""
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "PLE staged backend does not support CUDA graph capture yet "
+                "(Phase 2 adds pre-replay staging; see "
+                "docs/v100/PLE_NVME_TIER_DESIGN.md). Disable decode graphs "
+                "with --cuda-graph-config '{\"decode\":{\"backend\":"
+                "\"disabled\"}}'."
+            )
+        from sglang.srt.models.qwen4_exp_ple_staged import PleRowStaging
+
+        staging = self._staged_staging
+        if staging is None:
+            staging = PleRowStaging(
+                table=self._staged_table,
+                max_rows=envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
+            )
+            self._staged_staging = staging
+        n = flat_ids.numel()
+        staging.stage(
+            flat_ids.cpu(),
+            vocab_start=self.shard_indices.org_vocab_start_index,
+            vocab_end=self.shard_indices.org_vocab_end_index,
+        )
+        slots = staging.slot_arange(flat_ids.device)[:n]
+        _gather_ple_embedding_from_pinned_kernel[(n,)](
+            staging.buffer.data_ptr(),
+            slots,
+            output,
+            embedding_dim=self.embedding_dim,
+            tp_vocab_start=0,
+            tp_vocab_end=1 << 62,
+            is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+            emit_fp16=self._emit_dtype == torch.float16,
+            BLOCK_D=self._block_d,
+        )
+        return output
+
+    def materialize_staged_table(self) -> None:
+        """Dump the loaded host table into the per-shard staged file, then
+        free the pinned copy (called once after weight loading)."""
+        if self._staged_table is None or self._staged_materialized:
+            return
+        wrote = self._staged_table.materialize(
+            self.weight.data,
+            reuse=envs.SGLANG_QWEN4_PLE_STAGED_REUSE.get(),
+        )
+        self._staged_materialized = True
+        if wrote:
+            logger.info(
+                "PLE staged table written to %s (%.1f GiB), releasing the "
+                "pinned loading table",
+                self._staged_table.path,
+                self._staged_table.shard_rows * self._staged_table.row_bytes / 2**30,
+            )
+        else:
+            logger.info(
+                "PLE staged table reused from %s, releasing the pinned "
+                "loading table",
+                self._staged_table.path,
+            )
+        self._release_loading_table()
+
+    def _release_loading_table(self) -> None:
+        if self._staged_table is None:
+            return
+        # Swap the 12+ GiB loading table for a 1-row placeholder that keeps
+        # the dtype (the kernel's is_fp8 flag reads it). The hugepage/pinned
+        # storage is dropped with the old Parameter object (its owner tensor
+        # unregisters via the allocator's finalizer).
+        dtype = self.weight.dtype
+        dummy = nn.Parameter(
+            torch.empty((1, self.embedding_dim), dtype=dtype), requires_grad=False
+        )
+        self.register_parameter("weight", dummy)
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:

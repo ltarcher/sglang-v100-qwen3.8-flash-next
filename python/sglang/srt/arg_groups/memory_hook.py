@@ -43,6 +43,12 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "the file-backed table is the offloaded table."
         )
 
+    if cfg.ple_offload_backend == "staged" and cfg.ple_offload_embedding is False:
+        raise ValueError(
+            "--ple-offload-backend staged requires --ple-offload-embedding: "
+            "the staged shard files are the offloaded table."
+        )
+
 
 def handle_gpu_memory_settings(server_args: Any):
     """
