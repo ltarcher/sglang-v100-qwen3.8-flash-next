@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 import warnings
 from functools import lru_cache, partial
@@ -433,15 +434,60 @@ class VisionSdpaAttention(nn.Module):
         else:
             # SDPA
             # [b, h, s, head_size]
-            output = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout,
-                is_causal=False,
-                scale=self.scale,
-            )
+            # Large vision sequences can make the automatic dispatcher fall
+            # back to the MATH backend, which materialises the full
+            # [b, h, s, s] matrix (2.28 GiB at s=8748) and OOMs a 32 GB GPU.
+            # Constrain SDPA to the memory-efficient kernel and, if it cannot
+            # handle this shape, attend in query chunks instead.
+            if q.is_cuda:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                try:
+                    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+                        output = F.scaled_dot_product_attention(
+                            q,
+                            k,
+                            v,
+                            attn_mask=attention_mask,
+                            dropout_p=self.dropout,
+                            is_causal=False,
+                            scale=self.scale,
+                        )
+                except RuntimeError:
+                    logging.getLogger(__name__).warning(
+                        "efficient SDPA unavailable for shape %s; "
+                        "using chunked attention",
+                        tuple(q.shape),
+                    )
+                    torch.cuda.empty_cache()
+                    output = torch.empty_like(q)
+                    chunk = 512
+                    for start in range(0, q.shape[2], chunk):
+                        end = min(start + chunk, q.shape[2])
+                        mask_chunk = (
+                            None
+                            if attention_mask is None
+                            else attention_mask[..., start:end, :]
+                        )
+                        output[:, :, start:end, :] = F.scaled_dot_product_attention(
+                            q[:, :, start:end, :],
+                            k,
+                            v,
+                            attn_mask=mask_chunk,
+                            dropout_p=self.dropout,
+                            is_causal=False,
+                            scale=self.scale,
+                        )
+            else:
+                output = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attention_mask,
+                    dropout_p=self.dropout,
+                    is_causal=False,
+                    scale=self.scale,
+                )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
         output = output.transpose(1, 2).reshape(bsz * s, self.num_heads, self.head_size)
