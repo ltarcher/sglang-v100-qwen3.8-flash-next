@@ -299,6 +299,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
+        # Compute-ahead PLE staged-prep gate (built lazily in capture());
+        # None for every model without a staged PLE table.
+        self._ple_decode_prep = None
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
@@ -1120,6 +1123,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         alloc_aux = getattr(self.model_runner.model, "alloc_dspark_aux_hidden", None)
         if callable(alloc_aux):
             alloc_aux(int(self.captured_req_width))
+        self._build_ple_decode_prep()
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1572,6 +1576,60 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
+    def _build_ple_decode_prep(self) -> None:
+        """Wire the compute-ahead PLE staged-prep gate before capture
+        (docs/v100/PLE_NVME_TIER_DESIGN.md §11.3): per-layer pinned staging
+        shared with the in-graph capture-safe gather, plus the pre-replay id
+        recompute. No-op for every model without a staged PLE table."""
+        if not envs.SGLANG_QWEN4_PLE_STAGED_DECODE_PREP.get():
+            return
+        from sglang.srt.models.qwen4_exp_ple_prep import (
+            build_qwen4_exp_ple_decode_prep,
+        )
+
+        self._ple_decode_prep = build_qwen4_exp_ple_decode_prep(self.model_runner.model)
+        if self._ple_decode_prep is not None and (
+            self.capture_forward_mode != ForwardMode.DECODE
+            or self.enable_pdmux
+            or self.require_mlp_sync
+        ):
+            raise NotImplementedError(
+                "PLE staged decode prep covers plain-DECODE graphs only "
+                f"(this runner captures {self.capture_forward_mode.name}, "
+                f"pdmux={self.enable_pdmux}, dp/gather={self.require_mlp_sync}); "
+                "MTP draft/verify prep is Phase 2 step 4 "
+                "(docs/v100/PLE_NVME_TIER_DESIGN.md §11.9)."
+            )
+
+    def _prep_ple_staged_decode(self, forward_batch: ForwardBatch) -> None:
+        """Compute-ahead launch gate: fill every PLE layer's pinned staging
+        for the batch about to replay.
+
+        Re-runs the captured graph's exact ``_prepare_ple_batch`` on the same
+        static buffers (padded input_ids / req_pool_indices / out_cache_loc,
+        all refreshed by load_batch) and the same pool n-gram history the
+        previous replay's in-graph commit wrote (stream-ordered). The single
+        ``ids.cpu()`` sync inside also retires the previous step's sample;
+        ``backend.replay`` launches only after the fill completes.
+        """
+        num_tokens = self.bs * self.captured_req_width
+        registry = self.buffer_registry
+        prep_input = SimpleNamespace(
+            forward_mode=self.capture_forward_mode,
+            spec_algorithm=forward_batch.spec_algorithm,
+            spec_info=forward_batch.spec_info,
+            input_ids=registry.get_slot("input_ids").slice_for(self.bs, num_tokens),
+            req_pool_indices=registry.get_slot("req_pool_indices").slice_for(
+                self.bs, num_tokens
+            ),
+            out_cache_loc=registry.get_slot("out_cache_loc").slice_for(
+                self.bs, num_tokens
+            ),
+            global_num_token_non_padded_cpu=None,
+            extend_seq_lens_cpu=None,
+        )
+        self._ple_decode_prep.prep_and_fill(prep_input.input_ids, prep_input)
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1585,6 +1643,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            if self._ple_decode_prep is not None and (
+                forward_batch.forward_mode.is_decode()
+            ):
+                self._prep_ple_staged_decode(forward_batch)
             if envs.SGLANG_DSV41_PREFILL_SYNC.get():
                 ids = forward_batch.input_ids
                 pos = forward_batch.positions

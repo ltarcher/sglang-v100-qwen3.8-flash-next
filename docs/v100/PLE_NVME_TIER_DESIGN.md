@@ -260,43 +260,66 @@ replay 返回后(host 侧,调度器 CPU 相位,不在 GPU 关键路径上):
 > 一致性论据不变:prep 与图内 gather 复算用的是同一 pool history(图内
 > commit,stream-ordered)+ 同一采样 token(同流 sample 产物)。
 
-### 11.3 数据结构
+> **修订(2026-11-04,§11.6.1 验证后)**:实测采样在 decode 图**外**
+> (eager,`model_runner.sample` 在 replay 后由 tp_worker 调用),prep 不需要
+> captured D2H——改为 **launch gate 计算超前**:decode runner 在 `load_batch`
+> 之后、`backend.replay` 之前,用**本 batch 的真实输入**(静态缓冲内容 +
+> pool history,均 stream-ordered 就绪)重算 gather 行号并填 staging,然后才
+> launch replay。图捕获零改动;上图的"图尾 captured D2H"与
+> "[prep kernels] 在图内"作废。一致性由构造保证:gate 与图内 gather 调用
+> 同一 `_prepare_ple_batch`/`compute_ngram_ids`,读同一静态缓冲与同一
+> pool 状态,gate 先于 replay 且其间无写者。
 
-| 结构 | 位置 | 生命周期 |
-| --- | --- | --- |
-| prep 请求缓冲 `next_ids[L][bs_max*rows_per_tok]` | pinned,图尾 D2H 目标(地址稳定,捕获要求) | 每 step 覆写 |
-| mismatch 位图 `prep_mismatch[L]` | pinned | 每 step 覆写 |
-| staging + slot arange | pinned + device | Phase 1 已有 |
-| prep 输入(history 视图、采样 token 视图) | device 静态缓冲 | 图捕获期接线 |
+### 11.3 数据结构(修订 2:compute-ahead 后大幅缩减)
 
-`rows_per_tok = (ngram_size-1) × heads_per_ngram = 16`;4 个 PLE 层 ×
-bs_max(4)× 16 = 256 ids/step,D2H 量 KB 级。
+| 结构 | 状态 |
+| --- | --- |
+| staging + slot arange | Phase 1 已有,不变 |
+| pinned prep 请求缓冲 `next_ids[L][...]` | **删除**——无 captured D2H,`ids.cpu()` 即时所得 |
+| mismatch 位图 `prep_mismatch[L]` | **删除**——无预测即无漂移(§11.5) |
+| `PleDecodePrep` + 每层 `PlePrepEntry` | 新增(2026-11-04 已落地 + 9 单测):哈希 multiplier 含 `ple_layer_index` → **每层行号不同**,每层独立 staging 与 entry;`_PLEBatch` 每 step 只构建一次 |
 
-### 11.4 模式分解
+gate 时序(iteration k,overlap 循环):
 
-| 模式 | prep 挂载点 | 说明 |
-| --- | --- | --- |
-| 纯 decode | decode 图尾 | history + 图内采样 token → 下一步 decode 行号 |
-| MTP draft | draft 图尾 | draft token 图内可得,复算 **verify 模式**行号(draft stride 布局) |
-| target-verify | 消费 draft prep | verify 图 gather 的 ids 必须与 draft 图 prep 的一致(mismatch 位图兜底) |
-| prefill/extend/verify-eager | 无 prep | eager 路径沿用 Phase 1 的即时 D2H staging |
-| 首 step / 新 req / retract 后 | host 兜底 | prep 缓冲带"无效"标记;host 见标记则该步退化为 eager gather(禁用该 step 图,或接受一次 D2H sync) |
+```text
+run_batch(B_k):
+  load_batch:input_ids/req_pool_indices → 图静态缓冲
+             (input_ids 来自 future_map.output_tokens_buf 的纯 device gather,
+              overlap_utils.py L110-111,不过 CPU)
+  [GATE] batch_builder = _prepare_ple_batch(静态缓冲, B_k)
+         每层 compute_ngram_ids(batch) → flat_ids
+         ids.cpu()          ← 唯一 sync;涵盖 sample(B_{k-1}) 完成
+         每层 staging.stage(flat_ids)   ← preadv,页缓存热为 memcpy 级
+  backend.replay(B_k)       ← 图内 staged gather 读 staging + slot arange
+```
 
-**边界场景(必须覆盖)**:req 进入/退出(free slot 的 prep 行号无效化)、
-retract(序列回退,history 与 prep 失配 → mismatch 位图报警 + eager 回退)、
-bs bucket 变化(每 bucket 独立 prep 缓冲,与图的静态 shape 对齐)、
-pad 行(state_indices 指向 dummy slot 0,prep 同样产 pad 行号,gather 读
-pad 行无害——与现状一致)。
+成本核算(修订):gate 的 sync 使 CPU 与 GPU 对齐一次;GPU 空窗 = host fill
+时间——稳态页缓存全热约 10~50μs/步(优于 §5 按 NVMe p50/p99 估的
+124~337μs),冷读 p99 337μs 仍在预算内。
 
-### 11.5 一致性自检(mismatch 位图)
+### 11.4 模式分解(修订 2)
 
-每个含 staged gather 的图在捕获时追加一个比对内核:图内真实
-`lookup_ids` vs prep 预测行号,逐行比较写 pinned 位图。host 在既有每步
-sample sync 上顺带读位图(4B):
+| 模式 | 处理 |
+| --- | --- |
+| decode(走图) | gate:`replay` 前 `prep_and_fill`(实现在 `DecodeCudaGraphRunner.execute` 的 `load_batch` 之后、`backend.replay` 之前;prep 输入取静态缓冲切片) |
+| decode(eager,图不适用) | Phase 1 路径自含 D2H+staging,gate 不介入 |
+| prefill/extend/verify-eager | Phase 1 路径(生产 prefill 图已禁,verify 走 eager) |
+| MTP draft / verify 图 / pdmux / DP-gather | prep 接线后若 runner 的 capture 模式非 plain DECODE,`_build_ple_decode_prep` 启动期 raise `NotImplementedError`(MTP draft/verify prep 是第 4 步;当前 verify 走 eager 不经此路径) |
+| 首 step / 新 req / retract 后 | **无需特殊处理**:gate 每步用真实输入重算,无预测可失效;superseded 的"无效标记/eager 回退"机制整体删除 |
 
-- 全零 → 正常;
-- 非零 → 立即 raise(**fail loud,不做静默纠错**),日志带 layer/行/两侧行号。
-  这是防"prep 与 gather 漂移"的最后防线,位图检查本身 D2H 仅 4B。
+边界场景(pad 行、req 进出、bucket 切换)由构造覆盖:gate 与图内读同一
+静态缓冲(pad 区内容一致)与同一 forward_batch;保留的 fail-loud 只有
+①跨层宽度一致性(`PleDecodePrep` RuntimeError)②max_rows 超限
+(ValueError 透传,带 env 提示)。
+
+### 11.5 一致性自检(修订 2:mismatch 位图删除)
+
+无预测即无漂移:gate 与图内 gather 是**同函数、同输入、同流序**,不存在
+两套实现。运行时防线改为:
+
+1. 跨层宽度一致性检查(每步,零成本);
+2. §11.9 第 3 步真机逐位 oracle(一次性验收):`scripts/oracle_ple_staged_v100.sh`
+   双 boot A/B,7 条响应 296 token 全逐位一致(见 §11.9 第 3 步实施记录)。
 
 ### 11.6 图捕获细节与前置验证项
 
@@ -311,10 +334,11 @@ sample sync 上顺带读位图(4B):
    "commit 后"的 history(commit 在采样后即可;若 commit 在下一图首,
    prep 需自带 commit 语义,复杂度上升一档,单独评估)。
 
-捕获期 prep 内核会真实执行一次(capture runs kernels):首捕获用 dummy
-输入,pinned 请求缓冲内容无效 → 首个真实 step 前必须有一次 eager warm
-gather 或 host 强制标记"staging 未就位"→ 首 step 走 eager 回退(与
-新 req 兜底同路径)。
+捕获与首 step(修订 2):prep 全在图外,capture 期唯一要求是图内的
+staged gather 走"内核直发"路径(staging 指针 + slot arange,静态指针,
+与 pinned 后端被生产图证明的机制相同);capture 前对 staging 做一次
+零填充,保证捕获 warmup 读到确定内容。首 step 由 gate 正常覆盖(每步
+重算,无"未就位"状态)。
 
 #### 11.6.1 前置验证结果(2026-11-04,代码考古定论,未跑 GPU toy)
 
@@ -325,28 +349,30 @@ gather 或 host 强制标记"staging 未就位"→ 首 step 走 eager 回退(与
 | 3 | PLE commit 时序 | **成立**(比预期更干净) | `_commit_ple_batch` 在模型 forward 内、全部 decoder 层之后、final norm 之前(L2108-2111),随图执行;decode fast path 把 `[X_{t-1}, X_t]` 写回 pool(L424-433)。图外 prep 同流读 pool 天然看到 commit 后状态。行号语义:步骤 t+1 gather 行号 = `hash([X_t, X_{t+1}])`,X_{t+1} 即步骤 t 的 sample 输出——prep 输入齐备 |
 | 4(新) | overlap 调度下 fill 的落点 | **关键约束,非新成本** | `event_loop_overlap`(scheduler.py L2074-2087):`run_batch(t+1)` 在 `pop_and_process()`(resolve t)**之前** launch,故 CPU 在 launch replay(t+1) 时不可能已读到 prep(t) 结果 → fill 必须有 launch 前的 sync gate(sample(t) event → 读 prep 缓冲 → fill → launch replay)。该串行窗口即 §5 已预算的每步 124~337μs(-1.3~-3.4%),不是新增成本;稳态页缓存全热后趋近 memcpy 下界 |
 
-结论:三假设中唯一不成立的(1)带来的是**架构简化**而非降级;方案核心
-(prep→fill→gather 三段、零 CPU 哈希复刻、mismatch fail-loud)全部保留。
+结论:三假设中唯一不成立的(1)带来的是**架构简化**而非降级;后续
+§11.3-11.5 已按"compute-ahead launch gate"二次修订(预测类机制整体删除)。
 前置验证阶段完成,无 GPU 侧遗留;下一个 GPU 触点是 §11.9 第 3 步的
 逐位 oracle。
 
 ### 11.7 TDD 测试清单
 
-CPU 侧(`test/registered/unit/models/`,先测后写):
+CPU 侧(`test/registered/unit/models/`,先测后写)——**已完成(2026-11-04,
+`test_qwen4_exp_ple_prep.py` 9/9 + Phase 1 回归 13/13,CI 同版本 ruff 全绿)**:
 
 | 测试组 | 覆盖 |
 | --- | --- |
-| prep 请求缓冲 | 布局/stride、多 layer 多 bucket 寻址、无效标记语义、覆写不复用旧值 |
-| fill 调度 | prep→stage() 桥接、首 step eager 回退、retract 无效化路径、mismatch 非零即 raise |
-| 边界 | bucket 切换、pad 行、req 进出、max_rows 超限(与 Phase 1 同标准) |
+| per-layer 填充 | 两个 fake 层不同行号集 → 各自 staging 字节逐一正确;`_PLEBatch` 每 step 仅构建一次 |
+| 展平契约 | 2D `[T, heads]` → 行主序展平,slot i = `flat_ids[i]`(与 eager gather 的 `reshape(-1)` 一致) |
+| 词表区间 | 越界 id(`local<0`、`≥shard_rows`、`≥vocab_end`)slot 清零,`local = id - vocab_start` 映射正确 |
+| bucket 切换 | 宽度变化后当次宽度内 slot 全部反映最新 ids(重填 + 宽度内清零);宽度外旧字节安全(内核 grid 恰为当次宽度,永不读) |
+| fail-loud | 跨层宽度不一致 RuntimeError;max_rows 超限 ValueError(带 env 提示);空 entries 拒绝 |
+| 契约 | `DECODE_PREP` 默认 True;返回值 = 展平宽度 |
 
-GPU 侧(真机,复用 Phase 1 的容器外路径):
+GPU 侧(真机,§11.9 第 3 步起):
 
 | 测试组 | 覆盖 |
 | --- | --- |
-| toy captured D2H | §11.6 假设 2 |
-| 逐位 oracle | 同进程 pinned 后端 vs staged 后端,同输入 decode 32 步输出逐位一致 |
-| mismatch 注入 | 人为改 prep 输入 → 位图置位 → raise |
+| 逐位 oracle | `scripts/oracle_ple_staged_v100.sh` 双 boot A/B(pinned boot → staged boot,4×V100 TP4、无 MTP、无 hicache,`cuda_graph_bs_decode 1 2 4`):同请求序列(warmup + 3 条逐条 + 3 条 0.6s 错峰重叠),比对每条响应的 token ids + 逐 token logprobs + text 逐位一致。**并发同时 burst 不可比**:同时到达的 prefill 批组成存在准入竞态,两次 boot 间 extend batch 组成不同导致 prefill 期数值微差并逐步放大——错峰发送消除竞态(prefill 独占、decode 窗口重叠走 padded bucket 1→2→3→2→1) |
 | accept/吞吐 | A/B 门(§11.1) |
 
 ### 11.8 环境变量与开关
@@ -354,30 +380,75 @@ GPU 侧(真机,复用 Phase 1 的容器外路径):
 | 变量 | 语义 |
 | --- | --- |
 | `SGLANG_QWEN4_PLE_STAGED_DECODE_PREP = EnvBool(True)` | Phase 2 主开关;False 退回 Phase 1 行为(capture 拒绝),便于 A/B 与回退 |
-| `SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG = EnvBool(False)` | DEBUG_ 级:每步 dump prep vs 实际行号(oracle 调试用) |
+| `SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG = EnvBool(False)` | DEBUG 级 oracle 探针:图内 gather 在 capture 期把 flat ids 记入持久缓冲(capture-only,eager prefill/warmup 不覆写),gate 每步把它与上一步 gate ids 比对,失配 `logger.error`、命中 `logger.info`(每步一条;每层一次 D2H,严禁生产常开)。接线成功时打 `gate wired: N PLE layers` |
 
 staged 后端 + decode 图 + `DECODE_PREP=False` → 启动期显式 raise
-(把 Phase 1 的 capture 期错误提前到启动)。
+(把 Phase 1 的 capture 期错误提前到启动)。gate 接线成功与失配都有
+显式日志——接线类故障(如 builder 因模型外层 wrapper 解包失败返回
+None)不能靠"没有报错"判定为健康。
 
 ### 11.9 实施顺序
 
 1. ~~§11.6 三个假设的验证脚本~~ **已完成(2026-11-04,§11.6.1)**:全部由
    代码考古定论,假设 1 不成立但带来架构简化(prep 图外化),假设 2 moot,
    新增假设 4(overlap launch gate);GPU toy 不需要;
-2. CPU 单测组(prep 缓冲 / fill 调度 / 边界);
-3. prep 内核接线:decode 无 MTP 先行(最简路径),端到端跑通"逐位 oracle";
+2. ~~CPU 单测组~~ **已完成(2026-11-04)**:`qwen4_exp_ple_prep.py`
+   (`PleDecodePrep`/`PlePrepEntry`,DI 注入 batch_builder,CPU 可测)+
+   `SGLANG_QWEN4_PLE_STAGED_DECODE_PREP` env + 9 单测(§11.7),全绿;
+3. prep 内核接线:decode 无 MTP 先行(最简路径),端到端跑通"逐位 oracle"
+   —— **已完成(2026-11-04,实施记录见下)**;
 4. MTP draft/verify prep 接入 + mismatch 自检;
 5. 真机 A/B:吞吐门 + accept + 262k/64k 阶梯;
 6. 摘除 decode-disabled 限制,更新 compose 注释与 README 表格,过
    Qwen3.8 NVFP4 全套回归。
 
+#### 11.9.1 第 3 步实施记录(2026-11-04,4×V100 真机)
+
+接线与实现:
+
+- gate 挂点:`DecodeCudaGraphRunner.execute()` 在 `load_batch` 之后、
+  `backend.replay` 之前调 `PleDecodePrep.prep_and_fill()`;prep 输入取
+  静态缓冲切片(`input_ids/req_pool_indices/out_cache_loc`),仅 forward
+  模式为 plain decode 时介入;capture 模式非 plain DECODE(verify 图/
+  pdmux/MLP-sync)时启动期 `NotImplementedError`。
+- capture-safe 图内 gather:`_gather_staged` 以
+  `torch.cuda.is_current_stream_capturing()`(非 `get_is_capture_mode`,
+  breakable eager break 须保持 stage 语义)区分:图内跳过 `stage()`,
+  内核直读 staging 指针 + `slot_arange[:n]`,tp 词表区间放宽为
+  `[0, 1<<62)`。
+- **接线修复(oracle 首跑 FAIL 的根因)**:`build_qwen4_exp_ple_decode_prep`
+  原以 `isinstance(model, Qwen4ExpModel)` 门控,而生产加载的实例是 VL
+  wrapper `Qwen4ExpForConditionalGeneration` → builder 静默返回 None →
+  gate 从未接线,图内 gather 读到 prefill 阶段最后一次 eager stage 的
+  陈旧行,所有 decode 步不刷新。该故障表现为首个 decode 图步起与
+  pinned 逐位偏离(两次独立 boot 可复现、逐位相同的错误输出),且无任何
+  报错。修复:wrapper 解包 `model.model`(Qwen4ExpVLModel ⊂
+  Qwen4ExpModel);并加 `gate wired: N PLE layers` INFO 日志——接线类
+  故障不得靠"无报错"判定健康(§11.8 已同步)。
+
+诊断过程(供后续排障参考):`SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG=1` 下
+gate ids vs 图内 ids 每步比对除两处外全部相等——两处失配是 prefill 的
+eager gather 覆写 debug 缓冲造成的假警报,已改为 capture-only 记录;
+`PREP_CORRUPT` 一次性探针(gate fill 后清零首个有效 staging 行,输出
+随之改变)证明图内 gather 确实读取 gate 填充的 staging 缓冲,探针已
+移除。
+
+oracle 结论:`scripts/oracle_ple_staged_v100.sh` 双 boot A/B
+(pinned → staged,4×V100 TP4,无 MTP、无 hicache,
+`cuda_graph_bs_decode 1 2 4`),请求序列 = warmup + 3 条逐条(bs=1
+bucket)+ 3 条 0.6s 错峰重叠(decode bs 走 1→2→3→2→1,padded bucket
+全覆盖):**7 条响应、296 个输出 token、296 个逐 token logprob 与
+decoder 文本全部逐位一致**。首跑曾 FAIL 于并发同时 burst——同批到达
+的 prefill 批组成存在准入竞态,跨 boot 不可比,已改为错峰发送消除
+(见 §11.7)。配套单测 `test_qwen4_exp_ple_prep.py` 9/9 通过。
+
 ### 11.10 风险清单
 
 | # | 风险 | 缓解 |
 | --- | --- | --- |
-| 1 | prep 与图内 gather 的行号漂移(EOS 语义、commit 时序) | mismatch 位图 fail-loud;同内核同输入构造保证;DEBUG dump 对照 |
+| 1 | gate 与图内 gather 的输入不一致(静态缓冲 pad 区、forward_batch 字段切片) | 二者为同一函数同一输入(§11.3 修订 2);**已验收(§11.9.1)**:逐位 oracle 296 token 一致(padded bucket 1→2→3→2→1 全覆盖);跨层宽度一致性检查兜底;另:builder 因模型外层 wrapper 解包失败会静默不接线,已加 `gate wired` 日志 + wrapper 解包 |
 | 2 | captured D2H 在 multi-stream capture 下不合法 | **已消解(§11.6.1)**:prep 图外化后无 captured memcpy |
-| 3 | 首 step / 异常路径回退到 eager 造成吞吐抖动 | 回退仅限首 step 与 retract 后首步;日志计数,稳态占比应为 0 |
-| 4 | staging 未就位时图已启动(调度竞态) | prep 缓冲"已消费"标志,fill 未完成前禁止 replay(调度器单线程序天然满足,断言兜底) |
-| 5 | 每 bucket prep 放大捕获体积(4 层 × 256 ids) | D2H KB 级;图体积增量 <1%,捕获时间可忽略 |
-| 6 | MTP verify 布局对齐(draft stride) | §11.4 单列;先无 MTP 交付,MTP 作为独立增量门 |
+| 3 | gate 的 sync 造成的每步 GPU 空窗超预算 | 空窗 = host fill 时间,稳态页缓存全热 10~50μs(§11.3 修订 2 核算);A/B 门(≥基线 -3%)实测裁决 |
+| 4 | staging 未就位时图已启动(调度竞态) | **结构性消解**:replay 在 gate 的 fill 完成后才 launch(同函数内顺序执行,无竞态窗口) |
+| 5 | prep 放大 decode 关键路径 | `_PLEBatch` 每 step 构建一次;ids D2H 仅 KB 级;`_hash_contexts` 与图内同源,无额外内核 |
+| 6 | MTP verify 布局对齐(draft stride) | verify 走 eager(生产 prefill 图已禁)→ Phase 1 路径天然覆盖;draft 若含 PLE 层,§11.9 第 4 步独立评估 |

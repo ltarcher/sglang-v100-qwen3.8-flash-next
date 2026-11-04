@@ -639,7 +639,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         # weight_scale stays a real device tensor.
         ngram_embedding.register_buffer(
-            "weight_scale", torch.ones(1, dtype=torch.get_default_dtype()), persistent=True
+            "weight_scale",
+            torch.ones(1, dtype=torch.get_default_dtype()),
+            persistent=True,
         )
         if offload_embedding:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
@@ -983,9 +985,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             logger.warning(
                 "PLE staged backend: the full %d-row table will be dumped to "
                 "%s after weight loading and the pinned copy released. "
-                "Decode CUDA graphs are NOT supported yet (Phase 2); disable "
-                "them with --cuda-graph-config '{\"decode\":{\"backend\":"
-                "\"disabled\"}}'.",
+                "Plain-DECODE CUDA graphs are supported via the Phase 2 "
+                "compute-ahead prep gate (SGLANG_QWEN4_PLE_STAGED_DECODE_PREP"
+                "=1, default); MTP/speculative capture is not yet "
+                "(docs/v100/PLE_NVME_TIER_DESIGN.md §11.9).",
                 staged_table.shard_rows,
                 staged_table.path,
             )
@@ -1000,6 +1003,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._staged_table = staged_table
         self._staged_materialized = staged_table is None
         self._staged_staging = None
+        # Oracle debugging only (SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG=1): the
+        # decode-prep builder allocates it; every staged gather records the
+        # flat ids it was called with, eager or captured alike.
+        self._staged_debug_ids = None
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -1082,30 +1089,57 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         """Discrete-GPU NVMe tier: stage the gather's rows into pinned memory,
         then run the unchanged gather kernel against the staging buffer with
         slot ids and a widened vocabulary range (always in-range, so out-of-
-        shard slots read as the zeros ``stage()`` wrote)."""
-        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "PLE staged backend does not support CUDA graph capture yet "
-                "(Phase 2 adds pre-replay staging; see "
-                "docs/v100/PLE_NVME_TIER_DESIGN.md). Disable decode graphs "
-                "with --cuda-graph-config '{\"decode\":{\"backend\":"
-                "\"disabled\"}}'."
-            )
-        from sglang.srt.models.qwen4_exp_ple_staged import PleRowStaging
+        shard slots read as the zeros ``stage()`` wrote).
 
+        Phase 2 (docs/v100/PLE_NVME_TIER_DESIGN.md §11.3): inside a captured
+        decode graph the gather is kernel-direct on the staging pointer with
+        slot ids 0..n-1 — the compute-ahead launch gate
+        (``PleDecodePrep.prep_and_fill``, wired by the decode graph runner)
+        fills the staging with this step's rows right before replay. Only
+        actual stream capture takes that path: breakable-graph eager breaks
+        keep the capture-mode flag on but must re-stage with the live ids."""
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not envs.SGLANG_QWEN4_PLE_STAGED_DECODE_PREP.get():
+            raise RuntimeError(
+                "PLE staged backend does not support CUDA graph capture with "
+                "SGLANG_QWEN4_PLE_STAGED_DECODE_PREP=0; enable the Phase 2 "
+                "decode-prep gate or disable decode graphs with "
+                '--cuda-graph-config \'{"decode":{"backend":"disabled"}}\' '
+                "(docs/v100/PLE_NVME_TIER_DESIGN.md)."
+            )
         staging = self._staged_staging
         if staging is None:
+            if capturing:
+                raise RuntimeError(
+                    "PLE staged gather hit CUDA graph capture without the "
+                    "decode-prep staging being wired; the decode graph runner "
+                    "must call build_qwen4_exp_ple_decode_prep() before "
+                    "capture (docs/v100/PLE_NVME_TIER_DESIGN.md §11.3)."
+                )
+            from sglang.srt.models.qwen4_exp_ple_staged import PleRowStaging
+
             staging = PleRowStaging(
                 table=self._staged_table,
                 max_rows=envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
             )
             self._staged_staging = staging
         n = flat_ids.numel()
-        staging.stage(
-            flat_ids.cpu(),
-            vocab_start=self.shard_indices.org_vocab_start_index,
-            vocab_end=self.shard_indices.org_vocab_end_index,
-        )
+        if (
+            capturing
+            and envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get()
+            and self._staged_debug_ids is not None
+            and n <= self._staged_debug_ids.numel()
+        ):
+            # In-graph record only: an eager gather (prefill, warmup, or a
+            # breakable eager break) must not clobber the buffer the gate
+            # compares against the previous replay's in-graph ids.
+            self._staged_debug_ids[:n].copy_(flat_ids)
+        if not capturing:
+            staging.stage(
+                flat_ids.cpu(),
+                vocab_start=self.shard_indices.org_vocab_start_index,
+                vocab_end=self.shard_indices.org_vocab_end_index,
+            )
         slots = staging.slot_arange(flat_ids.device)[:n]
         _gather_ple_embedding_from_pinned_kernel[(n,)](
             staging.buffer.data_ptr(),
@@ -1139,8 +1173,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         else:
             logger.info(
-                "PLE staged table reused from %s, releasing the pinned "
-                "loading table",
+                "PLE staged table reused from %s, releasing the pinned loading table",
                 self._staged_table.path,
             )
         self._release_loading_table()

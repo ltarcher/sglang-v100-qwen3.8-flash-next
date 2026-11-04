@@ -369,6 +369,14 @@ class Envs:
     SGLANG_QWEN4_PLE_STAGED_IO_THREADS = EnvInt(16)
     SGLANG_QWEN4_PLE_STAGED_MAX_ROWS = EnvInt(262144)
     SGLANG_QWEN4_PLE_STAGED_REUSE = EnvBool(False)
+    # Phase 2 decode prep gate (compute-ahead, design doc section 11.8):
+    # False falls back to Phase 1 behavior (decode CUDA graph capture refused).
+    SGLANG_QWEN4_PLE_STAGED_DECODE_PREP = EnvBool(True)
+    # Oracle debugging: every staged gather (eager and captured) records its
+    # flat ids into a persistent per-embedding buffer, and the decode gate
+    # compares them against the ids it staged for the previous step (section
+    # 11.8). Adds one D2H per layer per step; never enable in production.
+    SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG = EnvBool(False)
     # Qwen4-Exp PLE and HiCache host slabs of at least 1 GiB prefer the
     # boot-reserved 1 GiB hugetlb pool, on the GPU's NUMA node when that node
     # has enough free pages. Machines without the pool, or with too few free
@@ -1627,7 +1635,9 @@ class Envs:
     # reads page in on demand and the freed device memory goes to activations.
     # 0 = off (Phase 1/2 behavior); requires a multiple of the pool page size.
     # Opt-in only: needs --disable-cuda-graph and target-only serving.
-    SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(0)    # Phase 3 logical-capacity extension kill-switch: when set, the tier keeps
+    SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(
+        0
+    )  # Phase 3 logical-capacity extension kill-switch: when set, the tier keeps
     # the profiled device capacity even if --max-total-tokens asks for more.
     # The extension re-charges the freed PHYS bytes to the logical budget,
     # which can starve prefill activations on tight pools (measured OOM: a
