@@ -530,7 +530,12 @@ class MambaComponent(TreeComponent):
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            if slot is None:
+                from sglang.srt.mem_cache.memory_pool import MambaPoolExhausted
+
+                raise MambaPoolExhausted(
+                    "Can not alloc mamba cache for chunked-radix donation"
+                )
         return slot
 
     @property

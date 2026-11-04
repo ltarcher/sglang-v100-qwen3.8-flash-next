@@ -13,7 +13,7 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import MambaPoolExhausted, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -180,7 +180,14 @@ def checkpoint_kv_cache(
     if req.skip_radix_cache_insert:
         return
 
-    tree_cache.checkpoint(req, up_to=req.extend_range.end, chunked=chunked)
+    try:
+        tree_cache.checkpoint(req, up_to=req.extend_range.end, chunked=chunked)
+    except MambaPoolExhausted:
+        logger.warning(
+            "mamba pool exhausted while checkpointing request %s; "
+            "skipping radix insert and keeping its own KV",
+            req.rid,
+        )
 
 
 def evict_from_tree_cache(
@@ -327,7 +334,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         )
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
-        tree_cache.checkpoint(req, up_to=owned_kv_len)
+        try:
+            tree_cache.checkpoint(req, up_to=owned_kv_len)
+        except MambaPoolExhausted:
+            logger.warning(
+                "mamba pool exhausted while releasing request %s; "
+                "skipping radix insert",
+                req.rid,
+            )
+            is_insert = False
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unpin(req)

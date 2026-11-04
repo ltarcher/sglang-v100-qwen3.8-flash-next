@@ -99,6 +99,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class MambaPoolExhausted(RuntimeError):
+    """The mamba state pool cannot satisfy a chunked-cache donation right now.
+
+    Retryable: callers skip the radix insert and keep the request's own KV
+    instead of letting an AssertionError take the scheduler process down.
+    """
+
 # Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
 # forces a per-request cudaStreamSynchronize on the scheduler thread and can stall
 # the scheduler under load. Off by default; set SGLANG_MAMBA_DEBUG_ASSERTS=1 to
