@@ -34,6 +34,7 @@ import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -212,10 +213,23 @@ class PleRowStaging:
     """Pinned staging buffer, one slot per flat gather id position.
 
     ``stage(ids, vocab_start, vocab_end)`` fills every slot for this gather:
-    valid shard-local rows are pread from the shard file (thread pool, GIL
-    released inside preadv), invalid slots are zeroed. Stateless on purpose —
-    zeroing ALL invalid slots each call makes slot reuse across gathers safe.
-    """
+    valid shard-local rows are pread from the shard file, invalid slots are
+    zeroed. The fill is a pure function of the id set (the vocab range is
+    fixed per instance), so the last staged ids are cached and an identical
+    repeat call returns without touching the buffer; any different id set
+    refills ALL slots (zeroing included), which keeps slot reuse across
+    gathers safe.
+
+    ``stage_async`` is the Phase 2 prefill double-buffering entry point
+    (docs/v100/PLE_NVME_TIER_DESIGN.md §4.2/§11.9.4): the caller stages every
+    PLE layer's rows at extend-forward start and the pool overlaps the preads
+    with early-layer compute; the later gather calls ``fill_pending`` (which
+    trusts the pending width, no second D2H) or ``stage`` (which blocks until
+    the pending fill is done before refilling)."""
+
+    # Rows per background read task: enough to amortize dispatch, small
+    # enough that io_threads tasks run concurrently for a 4096-row chunk.
+    _ASYNC_CHUNK_ROWS = 512
 
     def __init__(
         self, table: PleStagedTable, max_rows: int, io_threads: int | None = None
@@ -225,6 +239,7 @@ class PleRowStaging:
         self.table = table
         self.max_rows = max_rows
         self.row_bytes = table.row_bytes
+        self._io_threads = io_threads
         if io_threads > 1:
             self._pool = ThreadPoolExecutor(
                 max_workers=io_threads, thread_name_prefix="ple-staged-io"
@@ -243,6 +258,12 @@ class PleRowStaging:
             self.buffer = torch.empty((max_rows, self.row_bytes), dtype=torch.uint8)
         self._zero_row = torch.zeros(self.row_bytes, dtype=torch.uint8)
         self._arange: torch.Tensor | None = None
+        # Id set currently materialized in ``buffer`` (numpy view of the last
+        # staged CPU ids, at most max_rows * 8 bytes), plus the outstanding
+        # ``stage_async`` fill: (ids_np, futures). ``buffer`` must not be read
+        # by a gather kernel while a fill is pending.
+        self._staged_ids = None
+        self._pending = None
 
     def slot_arange(self, device: torch.device) -> torch.Tensor:
         """Device-side slot ids 0..max_rows-1 (cached; sliced per gather)."""
@@ -264,40 +285,146 @@ class PleRowStaging:
         if n != self.row_bytes:
             raise OSError(f"short read from {self.table.path}: {n} < {self.row_bytes}")
 
-    def stage(self, ids: torch.Tensor, vocab_start: int, vocab_end: int) -> int:
-        """Fill staging for ``ids`` (1D global ids). Returns the slot count."""
+    def _read_slice(self, fd: int, slots: list[int], rows: list[int]) -> None:
+        # os.preadv releases the GIL, so sliced tasks genuinely run in
+        # parallel across the pool.
+        for slot, row in zip(slots, rows):
+            self._read_into_slot(fd, slot, row)
+
+    def _to_ids_np(self, ids: torch.Tensor) -> np.ndarray:
+        if ids.dtype == torch.long and ids.is_cpu:
+            return ids.numpy()
+        return ids.detach().to(torch.long).cpu().numpy()
+
+    def _plan_fill(
+        self, ids_np: np.ndarray, vocab_start: int, vocab_end: int
+    ) -> tuple[list[int], list[int]]:
+        """Zero out-of-range slots now and return the (slots, rows) read
+        plan. Runs on the caller thread, before any background fill starts."""
+        local = ids_np - vocab_start
+        valid = (local >= 0) & (local < self.table.shard_rows) & (ids_np < vocab_end)
+        invalid_t = torch.from_numpy((~valid).nonzero()[0])
+        if invalid_t.numel():
+            self.buffer.index_fill_(0, invalid_t, 0)
+        return valid.nonzero()[0].tolist(), local[valid].tolist()
+
+    def _wait_pending(self) -> None:
+        """Block until the outstanding ``stage_async`` fill (if any) completes
+        and record its id set as the staged one."""
+        pending = self._pending
+        if pending is None:
+            return
+        ids_np, futures = pending
+        self._pending = None
+        exc = None
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception as e:  # noqa: BLE001 - re-raise first failure
+                exc = exc or e
+        if exc is not None:
+            raise exc
+        self._staged_ids = ids_np
+
+    def stage_async(self, ids: torch.Tensor, vocab_start: int, vocab_end: int) -> None:
+        """Start filling staging for ``ids`` in the background.
+
+        Compute-ahead prefill (§11.9.4): the caller stages every PLE layer's
+        rows right after batch prep, overlapping the preads with early-layer
+        compute. The gather that consumes this staging must first call
+        ``fill_pending`` or ``stage`` — the buffer is only readable once the
+        pending fill completed."""
         n = int(ids.numel())
         if n > self.max_rows:
             raise ValueError(
                 f"gather of {n} rows exceeds staging capacity {self.max_rows} "
                 "(raise SGLANG_QWEN4_PLE_STAGED_MAX_ROWS)"
             )
-        if ids.dtype == torch.long and ids.is_cpu:
-            ids_np = ids.numpy()
-        else:
-            ids_np = ids.detach().to(torch.long).cpu().numpy()
-        local = ids_np - vocab_start
-        valid = (local >= 0) & (local < self.table.shard_rows) & (ids_np < vocab_end)
+        ids_np = self._to_ids_np(ids)
+        self._wait_pending()
+        slots, rows = self._plan_fill(ids_np, vocab_start, vocab_end)
+        if self._pool is None or len(rows) <= 32:
+            # Small fills (eager decode, tiny verifies) stay synchronous:
+            # page-cache-warm rows are a few us each, while a round of thread
+            # dispatch shows up directly on the decode step.
+            fd = self.table._ensure_open()
+            self._read_slice(fd, slots, rows)
+            self._staged_ids = ids_np
+            return
+        fd = self.table._ensure_open()
+        chunks = min(
+            self._io_threads,
+            (len(rows) + self._ASYNC_CHUNK_ROWS - 1) // self._ASYNC_CHUNK_ROWS,
+        )
+        step = (len(rows) + chunks - 1) // chunks
+        futures = [
+            self._pool.submit(
+                self._read_slice, fd, slots[i : i + step], rows[i : i + step]
+            )
+            for i in range(0, len(rows), step)
+        ]
+        self._pending = (ids_np, futures)
 
-        invalid_t = torch.from_numpy((~valid).nonzero()[0])
-        if invalid_t.numel():
-            self.buffer.index_fill_(0, invalid_t, 0)
+    def fill_pending(self, expect_n: int) -> bool:
+        """Wait for the outstanding async fill, if any. Returns True only when
+        that fill staged exactly ``expect_n`` rows, so the caller may gather
+        directly without its own id D2H: the pending fill was computed from
+        this forward's own batch, and one staging is only ever pending for its
+        own layer's ids. A previously cached (non-pending) id set never
+        counts — a same-width gather from an earlier step would otherwise be
+        served stale rows."""
+        pending = self._pending
+        if pending is None:
+            return False
+        ids_np, _ = pending
+        self._wait_pending()
+        return ids_np.shape[0] == expect_n
 
-        rows = local[valid].tolist()
+    def debug_verify_ids(self, ids: torch.Tensor) -> bool:
+        """PREP_DEBUG helper: compare the staged id set against a device id
+        tensor (one D2H; debug builds only)."""
+        staged = self._staged_ids
+        if staged is None:
+            return False
+        cpu = ids.detach().to(torch.long).cpu()
+        return cpu.numel() == staged.shape[0] and np.array_equal(cpu.numpy(), staged)
+
+    def stage(self, ids: torch.Tensor, vocab_start: int, vocab_end: int) -> int:
+        """Fill staging for ``ids`` (1D global ids). Returns the slot count.
+
+        Blocks until any outstanding async fill is done before touching the
+        buffer, then skips the refill entirely when ``ids`` match the staged
+        set."""
+        n = int(ids.numel())
+        if n > self.max_rows:
+            raise ValueError(
+                f"gather of {n} rows exceeds staging capacity {self.max_rows} "
+                "(raise SGLANG_QWEN4_PLE_STAGED_MAX_ROWS)"
+            )
+        ids_np = self._to_ids_np(ids)
+        self._wait_pending()
+        staged = self._staged_ids
+        if (
+            staged is not None
+            and staged.shape[0] == n
+            and np.array_equal(ids_np, staged)
+        ):
+            return n
+
+        slots, rows = self._plan_fill(ids_np, vocab_start, vocab_end)
         if rows:
             fd = self.table._ensure_open()
-            slots = valid.nonzero()[0].tolist()
-            # Small gathers (the decode gate fills 1-16 rows per step) go
-            # through the caller thread: page-cache-warm rows are a few us
-            # each, while a round of thread-pool dispatch + result() costs
-            # ~1 ms and shows up directly on the decode step.
             if self._pool is None or len(rows) <= 32:
-                for slot, row in zip(slots, rows):
-                    self._read_into_slot(fd, slot, row)
+                self._read_slice(fd, slots, rows)
             else:
                 futures = [
-                    self._pool.submit(self._read_into_slot, fd, slot, row)
-                    for slot, row in zip(slots, rows)
+                    self._pool.submit(
+                        self._read_slice,
+                        fd,
+                        slots[i : i + self._ASYNC_CHUNK_ROWS],
+                        rows[i : i + self._ASYNC_CHUNK_ROWS],
+                    )
+                    for i in range(0, len(rows), self._ASYNC_CHUNK_ROWS)
                 ]
                 exc = None
                 for fut in futures:
@@ -307,4 +434,5 @@ class PleRowStaging:
                         exc = exc or e
                 if exc is not None:
                     raise exc
+        self._staged_ids = ids_np
         return n

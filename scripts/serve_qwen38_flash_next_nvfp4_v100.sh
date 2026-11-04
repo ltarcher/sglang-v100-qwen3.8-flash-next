@@ -291,6 +291,15 @@ args=(
   # memory. Without offload it is created on GPU and OOMs at ~31.5 GiB/rank
   # during create_weights.
   --ple-offload-embedding
+  # NVMe tier for the offloaded table (docs/v100/PLE_NVME_TIER_DESIGN.md):
+  # the loading copy is released after materializing 12.8 GiB/rank shard
+  # files (Shmem 67.9G -> 0.78G, MemAvailable 39.5G -> 107.6G), gathers stage
+  # rows through a pinned staging buffer (decode via the compute-ahead prep
+  # gate, prefill via stage_async/fill_pending double buffering). Bit-exact
+  # vs pinned: ORACLE_MTP=1 296-token oracle passed. Prefill pays ~200 ms of
+  # NVMe random-row IOPS per 4096-token chunk (-16% TTFT @64k, -10% @262k);
+  # warm decode within a few % of pinned (see §11.9.4 for the accepted A/B).
+  --ple-offload-backend staged
   # Builds FlashInfer's sampling kernels before serving (JIT, ~90 s when cold).
   --warmups sampling
 )

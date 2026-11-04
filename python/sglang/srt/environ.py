@@ -377,6 +377,12 @@ class Envs:
     # compares them against the ids it staged for the previous step (section
     # 11.8). Adds one D2H per layer per step; never enable in production.
     SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG = EnvBool(False)
+    # Phase 2 prefill double buffering (design doc sections 4.2/11.9.4): stage
+    # every PLE layer's rows once at extend-forward start so the fills overlap
+    # early-layer compute instead of blocking the host between layers. The
+    # per-layer gather then reads the pre-staged rows without its own D2H.
+    # Kill switch for A/B; off restores the per-layer synchronous stage().
+    SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH = EnvBool(True)
     # Qwen4-Exp PLE and HiCache host slabs of at least 1 GiB prefer the
     # boot-reserved 1 GiB hugetlb pool, on the GPU's NUMA node when that node
     # has enough free pages. Machines without the pool, or with too few free

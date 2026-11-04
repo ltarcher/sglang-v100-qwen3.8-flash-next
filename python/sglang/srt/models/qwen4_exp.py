@@ -2,6 +2,7 @@
 
 import gc
 import math
+import time
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
@@ -80,6 +81,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.mem_cache.host_hugepage import set_qwen_host_hugepage_preference
+from sglang.srt.models.qwen4_exp_ple_prep import prefetch_staged_ple_prefill
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
@@ -1008,6 +1010,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # decode-prep builder allocates it; every staged gather records the
         # flat ids it was called with, eager or captured alike.
         self._staged_debug_ids = None
+        # Set once the prefill prefetch debug check confirmed ids positively.
+        self._staged_prefill_verify_logged = False
+        # Eager staging timing (logged every 64 gathers in _gather_staged).
+        self._staged_stage_ms = 0.0
+        self._staged_stage_n = 0
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -1139,11 +1146,33 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # compares against the previous replay's in-graph ids.
             self._staged_debug_ids[:n].copy_(flat_ids)
         if not capturing:
-            staging.stage(
-                flat_ids.cpu(),
-                vocab_start=self.shard_indices.org_vocab_start_index,
-                vocab_end=self.shard_indices.org_vocab_end_index,
-            )
+            t0 = time.perf_counter()
+            pending = staging.fill_pending(n)
+            if pending:
+                # Compute-ahead prefill staging (§11.9.4): the pending fill
+                # was computed from this forward's own ple_batch, so the
+                # widths matching is enough to gather directly — no second
+                # D2H (which would block until the GPU drains the layers
+                # queued ahead of the hash kernels).
+                if envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get():
+                    self._debug_verify_prefill_ids(staging, flat_ids, n)
+            else:
+                staging.stage(
+                    flat_ids.cpu(),
+                    vocab_start=self.shard_indices.org_vocab_start_index,
+                    vocab_end=self.shard_indices.org_vocab_end_index,
+                )
+            self._staged_stage_ms += (time.perf_counter() - t0) * 1e3
+            self._staged_stage_n += 1
+            if self._staged_stage_n % 64 == 0:
+                logger.info(
+                    "PLE staged eager staging: n=%d pending=%s "
+                    "mean fill wait %.2f ms over %d gathers",
+                    n,
+                    pending,
+                    self._staged_stage_ms / self._staged_stage_n,
+                    self._staged_stage_n,
+                )
         slots = staging.slot_arange(flat_ids.device)[:n]
         _gather_ple_embedding_from_pinned_kernel[(n,)](
             staging.buffer.data_ptr(),
@@ -1157,6 +1186,28 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             BLOCK_D=self._block_d,
         )
         return output
+
+    def _debug_verify_prefill_ids(
+        self, staging, flat_ids: torch.Tensor, n: int
+    ) -> None:
+        """PREP_DEBUG oracle for the prefill compute-ahead path: the gather
+        skipped its own D2H on the pending-fill width match, so prove the
+        staged ids really are this gather's ids (one extra D2H per gather;
+        debug builds only)."""
+        if staging.debug_verify_ids(flat_ids):
+            if not self._staged_prefill_verify_logged:
+                self._staged_prefill_verify_logged = True
+                logger.info(
+                    "PLE staged prefill prefetch: gather ids == pre-staged ids "
+                    "(n=%d, first positive confirmation)",
+                    n,
+                )
+        else:
+            logger.error(
+                "PLE staged prefill prefetch: gather ids != pre-staged ids "
+                "(n=%d) — the gather would read stale staging rows",
+                n,
+            )
 
     def materialize_staged_table(self) -> None:
         """Dump the loaded host table into the per-shard staged file, then
@@ -2062,6 +2113,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None
         )
+        # Phase 2 prefill compute-ahead staging (§11.9.4): PlePrepEntry list
+        # discovered once by prefetch_staged_ple_prefill; [] = wired, not staged.
+        self._ple_staged_prefill_entries = None
         if hasattr(self, "norm"):
             delattr(self, "norm")
         hc_config = HyperConnectionConfig(
@@ -2124,6 +2178,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
+        if (
+            self.has_ple
+            and not breakable_ple
+            and forward_batch.forward_mode.is_extend()
+        ):
+            # Phase 2 prefill double buffering: stage every PLE layer's rows
+            # now (batch prep is the only stream work queued) so the fills
+            # overlap early-layer compute; no-op unless the staged backend is
+            # in use (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.4).
+            prefetch_staged_ple_prefill(self, ple_batch)
         aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]

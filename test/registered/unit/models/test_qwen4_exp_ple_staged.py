@@ -10,7 +10,9 @@ Boundary scenarios covered (high-risk areas per the streaming-KV lessons):
 - slot reuse across gathers (a slot valid in one gather must be zeroed when
   it becomes invalid in the next),
 - thread-count invariance (io_threads=1 vs 8 must produce identical bytes),
-- shard-range edges (row 0, last row, one past the end).
+- shard-range edges (row 0, last row, one past the end),
+- the stage() id cache (identical repeat ids must skip the refill; any
+  different id set — including a prefix of the cached one — must refill).
 """
 
 import os
@@ -223,6 +225,202 @@ class TestRowStaging:
         )
         assert torch.all(staging.buffer[2] == 0)
         assert torch.all(staging.buffer[3] == 0)
+
+
+class TestStageIdCache:
+    """stage() caches the last staged id set: the fill is a pure function of
+    the ids (the vocab range is fixed per staging instance), so an identical
+    repeat call must skip the refill while any different id set — including a
+    prefix of the cached one — must refill. The decode-prep gate shares this
+    same stage() API, and fill_pending never trusts the cache for its
+    D2H-skip decision (only genuine pending async fills count)."""
+
+    def _make(self, tmp_path, rows=300, max_rows=64):
+        table = _make_table(rows, seed=17)
+        staged = _make_staged(rows, ROW_BYTES, str(tmp_path), "cache")
+        staged.materialize(table, reuse=False)
+        staging = PleRowStaging(table=staged, max_rows=max_rows, io_threads=4)
+        return staging, table
+
+    def _count_reads(self, staging):
+        calls = []
+        orig = staging._read_into_slot
+
+        def counting(fd, slot, row):
+            calls.append((slot, row))
+            return orig(fd, slot, row)
+
+        staging._read_into_slot = counting
+        return calls
+
+    def test_repeated_ids_skip_refill(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        ids = torch.tensor([5, 250, 299, 7], dtype=torch.long)
+        staging.stage(ids, 0, 300)
+        calls = self._count_reads(staging)
+
+        n = staging.stage(ids, 0, 300)
+        assert n == ids.numel()
+        assert calls == [], "identical repeat ids must not re-read the shard file"
+        for slot, gid in enumerate(ids.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+    def test_changed_ids_refill(self, tmp_path):
+        staging, _ = self._make(tmp_path)
+        staging.stage(torch.tensor([5, 250, 299, 7]), 0, 300)
+        calls = self._count_reads(staging)
+
+        other = torch.tensor([5, 250, 299, 8], dtype=torch.long)
+        staging.stage(other, 0, 300)
+        assert len(calls) == 4, "a different id set must refill every slot"
+        # Stale slot content must not survive: slot 3 changed 7 -> 8.
+        rows = 300
+        gen = torch.Generator().manual_seed(17)
+        table = torch.randint(
+            0, 255, (rows, ROW_BYTES), dtype=torch.uint8, generator=gen
+        )
+        assert torch.equal(staging.buffer[3], table[8].view(torch.uint8))
+
+    def test_prefix_ids_refill(self, tmp_path):
+        # A strict prefix of the cached ids is a different gather. Skipping
+        # would actually be safe here (the leading slots already hold the
+        # right rows), but the cache is deliberately conservative: any byte
+        # difference in the id arrays refills. Lock that behavior in.
+        staging, _ = self._make(tmp_path)
+        ids = torch.tensor([5, 250, 299, 7], dtype=torch.long)
+        staging.stage(ids, 0, 300)
+        calls = self._count_reads(staging)
+
+        n = staging.stage(ids[:3], 0, 300)
+        assert n == 3
+        assert len(calls) == 3, "a shorter gather with same leading ids must refill"
+
+    def test_a_b_a_refills_last(self, tmp_path):
+        # Decode gate fills ids B between two eager prefill gathers of ids A:
+        # the second A must refill (B overwrote the staging).
+        staging, table = self._make(tmp_path)
+        a = torch.tensor([5, 250, 299, 7], dtype=torch.long)
+        b = torch.tensor([11, 12, 13], dtype=torch.long)
+        staging.stage(a, 0, 300)
+        staging.stage(b, 0, 300)
+        calls = self._count_reads(staging)
+
+        staging.stage(a, 0, 300)
+        assert len(calls) == 4
+        for slot, gid in enumerate(a.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+    def test_capacity_check_before_cache(self, tmp_path):
+        staging, _ = self._make(tmp_path, max_rows=4)
+        ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+        staging.stage(ids[:4], 0, 300)
+        try:
+            staging.stage(ids, 0, 300)
+            raise AssertionError("expected capacity ValueError")
+        except ValueError:
+            pass
+
+
+class TestStageAsyncPrefillPrefetch:
+    """Phase 2 prefill compute-ahead staging (§11.9.4): stage_async starts a
+    background fill; the gather consumes it via fill_pending (no second D2H)
+    or stage() (which waits, then refills on mismatch)."""
+
+    def _make(self, tmp_path, rows=300, max_rows=64, io_threads=4):
+        table = _make_table(rows, seed=19)
+        staged = _make_staged(rows, ROW_BYTES, str(tmp_path), "async")
+        staged.materialize(table, reuse=False)
+        staging = PleRowStaging(table=staged, max_rows=max_rows, io_threads=io_threads)
+        return staging, table
+
+    def test_fill_pending_consumes_async_fill(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        ids = torch.arange(0, 64, dtype=torch.long)
+        staging.stage_async(ids, 0, 300)
+
+        assert staging.fill_pending(ids.numel()) is True
+        for slot, gid in enumerate(ids.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+        # Consumed: a second fill_pending finds nothing pending.
+        assert staging.fill_pending(3) is False
+
+    def test_fill_pending_width_mismatch(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        ids = torch.arange(0, 64, dtype=torch.long)
+        staging.stage_async(ids, 0, 300)
+        # Width mismatch: the fill still lands (buffer is correct), but the
+        # caller is told not to trust it and must stage its own ids.
+        assert staging.fill_pending(3) is False
+        for slot, gid in enumerate(ids.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+    def test_stage_waits_pending_then_refills_on_mismatch(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        a = torch.arange(0, 64, dtype=torch.long)
+        b = torch.arange(100, 164, dtype=torch.long)
+        staging.stage_async(a, 0, 300)
+        # stage() with different ids must not race the pending fill: it waits
+        # for it, then refills every slot.
+        staging.stage(b, 0, 300)
+        for slot, gid in enumerate(b.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+        # Slot 63 held row 63 from the async fill; ids 100..163 refill it, so
+        # prove the refill landed by a shorter gather: the kernel only reads
+        # slots[:n], and stage() zeroes invalid slots within 0..n-1 (slots at
+        # or beyond n may keep stale bytes — they are never gathered).
+        staging.stage(torch.arange(0, 32, dtype=torch.long), 0, 300)
+        for slot in range(32):
+            assert torch.equal(staging.buffer[slot], table[slot].view(torch.uint8))
+
+    def test_stage_matches_pending_ids_without_refill(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        ids = torch.arange(0, 64, dtype=torch.long)
+        staging.stage_async(ids, 0, 300)
+        assert staging.fill_pending(ids.numel()) is True
+
+        calls = []
+        orig = staging._read_into_slot
+
+        def counting(fd, slot, row):
+            calls.append((slot, row))
+            return orig(fd, slot, row)
+
+        staging._read_into_slot = counting
+        n = staging.stage(ids, 0, 300)
+        assert n == ids.numel()
+        assert calls == [], "stage() on the consumed pending ids must not re-read"
+        for slot, gid in enumerate(ids.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+    def test_overlapping_stage_async_serializes(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        a = torch.arange(0, 64, dtype=torch.long)
+        b = torch.arange(100, 164, dtype=torch.long)
+        staging.stage_async(a, 0, 300)
+        staging.stage_async(b, 0, 300)  # must wait for the first fill
+        assert staging.fill_pending(b.numel()) is True
+        for slot, gid in enumerate(b.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+    def test_small_fill_stays_synchronous(self, tmp_path):
+        staging, table = self._make(tmp_path)
+        ids = torch.tensor([5, 250, 299], dtype=torch.long)
+        staging.stage_async(ids, 0, 300)
+        # Small fills complete inline: no pending fill is left outstanding.
+        assert staging._pending is None
+        assert staging.fill_pending(3) is False  # nothing pending...
+        for slot, gid in enumerate(ids.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+    def test_single_thread_fills_synchronously(self, tmp_path):
+        # io_threads=1 has no pool: stage_async must still fill correctly
+        # (inline), with nothing left pending for fill_pending to consume.
+        staging, table = self._make(tmp_path, io_threads=1)
+        ids = torch.arange(0, 40, dtype=torch.long)
+        staging.stage_async(ids, 0, 300)
+        assert staging.fill_pending(40) is False
+        for slot, gid in enumerate(ids.tolist()):
+            assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
 
 
 class TestEnvDefaults:

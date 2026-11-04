@@ -252,6 +252,11 @@ check_server_log() { # $1 = backend; gate self-check
       grep "gate ids != in-graph ids" "$logfile" | head -5 >&2
       return 1
     fi
+    if grep -q "gather ids != pre-staged ids" "$logfile"; then
+      log "FAIL: staged boot logged PLE prefill pre-staged ids mismatch"
+      grep "gather ids != pre-staged ids" "$logfile" | head -5 >&2
+      return 1
+    fi
     local hits
     hits=$(grep -c "gate ids == in-graph ids" "$logfile" || true)
     log "staged gate self-check: $hits matching steps, 0 mismatches"

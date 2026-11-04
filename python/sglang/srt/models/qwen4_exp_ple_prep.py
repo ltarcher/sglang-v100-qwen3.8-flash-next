@@ -180,24 +180,10 @@ class PleDecodePrep:
         self._debug_step += 1
 
 
-def build_qwen4_exp_ple_decode_prep(model):
-    """Wire the compute-ahead decode gate for a staged-PLE Qwen4-Exp model.
-
-    Called by the decode CUDA graph runner before capture (production wiring;
-    no-op for every other model or backend). The runner gates both plain-DECODE
-    and MTP TARGET_VERIFY replays through this prep — the MTP draft model
-    carries no PLE layers (``ple_layer_ids=[]``) so the draft needs nothing:
-      - one shared ``PleRowStaging`` per staged embedding, assigned to
-        ``_staged_staging`` so the in-graph capture-safe gather reads the very
-        buffer the gate fills (zero-filled first so capture warmup sees
-        deterministic content, with the slot arange pre-created on device);
-      - ``_prepare_ple_batch`` (the exact callable the captured graph runs)
-        bound as the gate's ``batch_builder`` — its TARGET_VERIFY branch
-        reproduces the captured verify layout when the runner passes the
-        static buffers plus ``extend_seq_lens=None``.
-
-    Returns None when the model carries no staged PLE table.
-    """
+def _discover_staged_ple_entries(model) -> list:
+    """Walk the model's decoder layers and return one ``PlePrepEntry`` per
+    staged PLE embedding (creating its staging lazily). Shared by the decode
+    prep gate and the prefill compute-ahead prefetch."""
     from sglang.srt.models.qwen4_exp import (
         Qwen4ExpAttentionDecoderLayer,
         Qwen4ExpForConditionalGeneration,
@@ -205,7 +191,6 @@ def build_qwen4_exp_ple_decode_prep(model):
         Qwen4ExpModel,
         Qwen4ExpPLELayer,
         Qwen4ExpPinnedHostEmbedding,
-        _prepare_ple_batch,
     )
 
     # The served instance is the VL wrapper (EntryClass); the PLE layers and
@@ -213,8 +198,7 @@ def build_qwen4_exp_ple_decode_prep(model):
     if isinstance(model, Qwen4ExpForConditionalGeneration):
         model = model.model
     if not isinstance(model, Qwen4ExpModel) or not model.has_ple:
-        return None
-
+        return []
     entries = []
     for layer in model.layers:
         if not isinstance(
@@ -238,16 +222,6 @@ def build_qwen4_exp_ple_decode_prep(model):
                 max_rows=envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
             )
             host_embedding._staged_staging = staging
-        staging.buffer.zero_()
-        staging.slot_arange(torch.device("cuda", torch.cuda.current_device()))
-        if envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get():
-            # Allocated before capture so the captured debug write does not
-            # land in the graph's private memory pool.
-            host_embedding._staged_debug_ids = torch.zeros(
-                envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
-                dtype=torch.int64,
-                device=torch.device("cuda", torch.cuda.current_device()),
-            )
         entries.append(
             PlePrepEntry(
                 embedding=ngram_embedding,
@@ -256,8 +230,88 @@ def build_qwen4_exp_ple_decode_prep(model):
                 vocab_end=host_embedding.shard_indices.org_vocab_end_index,
             )
         )
+    return entries
+
+
+def prefetch_staged_ple_prefill(model, ple_batch) -> None:
+    """Phase 2 prefill double buffering (docs/v100/PLE_NVME_TIER_DESIGN.md
+    §4.2/§11.9.4): stage every PLE layer's rows once at extend-forward start.
+
+    At this point the current stream holds only batch-prep kernels, so the
+    per-layer ids D2H is cheap; the background fills then overlap early-layer
+    compute instead of blocking the host between layers (each fill would
+    otherwise sit on the critical path right where the next layer's launch is
+    due). Each layer's gather later finds its staging pending via
+    ``fill_pending`` and skips its own D2H and refill entirely.
+
+    No-op for other backends, non-extend batches, capture (captured decode /
+    verify graphs are filled by the launch gate), and when disabled via
+    ``SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH=0``."""
+    if ple_batch is None or not envs.SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH.get():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    entries = model._ple_staged_prefill_entries
+    if entries is None:
+        entries = _discover_staged_ple_entries(model)
+        model._ple_staged_prefill_entries = entries
+        if entries:
+            logger.info(
+                "PLE staged prefill prefetch wired: %d PLE layers", len(entries)
+            )
     if not entries:
+        return
+    for entry in entries:
+        ids = entry.embedding.compute_ngram_ids(ple_batch)
+        entry.staging.stage_async(
+            ids.detach().reshape(-1),
+            vocab_start=entry.vocab_start,
+            vocab_end=entry.vocab_end,
+        )
+
+
+def build_qwen4_exp_ple_decode_prep(model):
+    """Wire the compute-ahead decode gate for a staged-PLE Qwen4-Exp model.
+
+    Called by the decode CUDA graph runner before capture (production wiring;
+    no-op for every other model or backend). The runner gates both plain-DECODE
+    and MTP TARGET_VERIFY replays through this prep — the MTP draft model
+    carries no PLE layers (``ple_layer_ids=[]``) so the draft needs nothing:
+      - one shared ``PleRowStaging`` per staged embedding, assigned to
+        ``_staged_staging`` so the in-graph capture-safe gather reads the very
+        buffer the gate fills (zero-filled first so capture warmup sees
+        deterministic content, with the slot arange pre-created on device);
+      - ``_prepare_ple_batch`` (the exact callable the captured graph runs)
+        bound as the gate's ``batch_builder`` — its TARGET_VERIFY branch
+        reproduces the captured verify layout when the runner passes the
+        static buffers plus ``extend_seq_lens=None``.
+
+    Returns None when the model carries no staged PLE table.
+    """
+    from sglang.srt.models.qwen4_exp import (
+        Qwen4ExpForConditionalGeneration,
+        Qwen4ExpModel,
+        _prepare_ple_batch,
+    )
+
+    if isinstance(model, Qwen4ExpForConditionalGeneration):
+        model = model.model
+    entries = _discover_staged_ple_entries(model)
+    if not entries or not isinstance(model, Qwen4ExpModel):
         return None
+    for entry in entries:
+        staging = entry.staging
+        staging.buffer.zero_()
+        staging.slot_arange(torch.device("cuda", torch.cuda.current_device()))
+        if envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get():
+            # Allocated before capture so the captured debug write does not
+            # land in the graph's private memory pool.
+            debug_ids = torch.zeros(
+                envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
+                dtype=torch.int64,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            entry.embedding.ngram_embedding._staged_debug_ids = debug_ids
     logger.info(
         "PLE staged decode prep gate wired: %d PLE layers, max_rows=%d",
         len(entries),

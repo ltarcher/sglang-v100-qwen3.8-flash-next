@@ -560,6 +560,57 @@ ORACLE_MTP=1 复跑见 §11.9.2 结论行)。prefill 侦察仍回退
 无双缓冲(§11.9 步骤 5 的 prefill 双缓冲尚未实施),为 Phase 2 剩余项,
 不阻塞 decode 验收门,但生产切换前必须补。
 
+## 11.9.4 第 6 步实施记录:prefill 双缓冲(2026-11-05,4×V100 真机)
+
+§11.9 第 5 步的 prefill 双缓冲在本步实施并验收,生产(8110 compose)已切
+staged 后端。实现要点:
+
+- `PleRowStaging.stage_async` / `fill_pending`(`qwen4_exp_ple_staged.py`):
+  extend-forward 起点由 `prefetch_staged_ple_prefill`
+  (`qwen4_exp_ple_prep.py`,模型循环对每个 extend 前向调用)对各 PLE 层
+  `stage_async`(透传本轮 ngram ids,单次 D2H),fill 按 512 行分片提交
+  16 线程池与早层计算重叠;gather 处 `fill_pending(n)` 只信任 pending
+  宽度(不信任 id-cache——decode 同宽不同 ids 会读 stale 行),命中则
+  免二次 D2H 与重填。`stage()` 增加 id-cache(`np.array_equal`,同 ids
+  重放直接返回);capture 期 `is_current_stream_capturing()` 守卫
+  (captured verify/decode 图仍走 §11.2 的 prep gate)。开关
+  `SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH`(默认开,A/B kill switch)。
+- 单测:s9-pytest 容器 CPU 25/25(新增 `TestStageIdCache` 5 例 +
+  `TestStageAsyncPrefillPrefetch` 7 例);ruff 干净。
+- oracle:ORACLE_MTP=1 逐位 PASS(296 token + 296 logprob;prep gate
+  自检 1216 步 0 mismatch;prefill ids D2H 比对 0 mismatch;oracle 脚本
+  新增 "gather ids != pre-staged ids" 失败扫描)。
+
+干净窗口 A/B(`bench_ple_staged_ab_v100.sh`,pass 2,同 §11.9.3 口径):
+
+| 点 | pinned | staged | delta |
+| --- | --- | --- | --- |
+| prefill 64k | 2492 | 2103 | **-15.6%** |
+| prefill 262k | 2947 | 2650 | **-10.1%** |
+| decode 250k C=1 | 37.8 | 36.6 | -3.2% |
+| decode 131k C=2 | 46.0 | 41.8 | -9.1% |
+| decode 64k C=2 | 49.0 | 46.1 | -5.9% |
+
+解读(2026-11-05 裁决接受现状,生产切换):
+
+1. prefill 从 -29%/-18% 收敛到 -15.6%/-10.1%。残余已定量:eager 计时
+   (`n=65536`,即 4096 token × 16 hash 头)显示 `fill_pending` 尾部等待
+   ~198ms/chunk(16384 有效随机行/rank,NVMe IOPS 受限)。当前预取从
+   本 chunk forward 起点发起,只遮盖前段;§4.2 原意的**跨 chunk 双缓冲**
+   (算 chunk i 时预取 chunk i+1)是下一个明确杠杆,未实施。
+2. decode 三点未稳定过 -3% 门,但机制排查未发现新代码路径的 decode
+   开销:prep 分段计时与第 5 步逐段一致(build ~0.7ms / ids+D2H sync
+   17-24ms / fill ~1ms),按 500 步区间的步速率剖面两轮逐段吻合,
+   decode 窗口 eager staging 零触发。A/B 比值 run-to-run 摆动 ±2-4%
+   (第 5 步第 1 轮 250k -4.2% / 131k -3.5% 同样越门,"验收"实为第 2 轮
+   结果);后两轮 131k C2 staged 绝对值偏低(41.8-42.0 vs 43.7-44.6)
+   伴随 pinned 基线同期偏高(46.0/49.0 vs 45.3/47.8,主机重启后
+   machine-state 差异),未能归因到代码。列为遗留观察项。
+
+生产配置:`/home/bso/vllm-Qwen3.8/docker-compose-sglang-v100-mtp-8110.yaml`
+(镜像 `sglang-v100-unified:ple-nvme-20261105`,`--ple-offload-backend
+staged`,shard 目录挂 `/data/sglang-ple-staged` + `REUSE=1`)。
+
 ## 11.10 风险清单
 
 | # | 风险 | 缓解 |
