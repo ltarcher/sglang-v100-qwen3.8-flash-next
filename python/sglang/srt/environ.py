@@ -395,6 +395,13 @@ class Envs:
     # In seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
     # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
+    # In seconds. Timeout of the post-load `dist.monitored_barrier` that catches
+    # ranks failing to finish model loading. The default 480 s assumes rank
+    # post-processing is roughly balanced; heavy per-rank post-load work (e.g.
+    # the Qwen PLE staged backend materializing ~12 GiB/rank to disk on first
+    # boot) can exceed it on the straggler and crash the whole server
+    # (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.2). Raise it for those boots.
+    SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT = EnvFloat(480)
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")

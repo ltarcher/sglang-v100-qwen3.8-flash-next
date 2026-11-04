@@ -442,7 +442,65 @@ decoder 文本全部逐位一致**。首跑曾 FAIL 于并发同时 burst——�
 的 prefill 批组成存在准入竞态,跨 boot 不可比,已改为错峰发送消除
 (见 §11.7)。配套单测 `test_qwen4_exp_ple_prep.py` 9/9 通过。
 
-### 11.10 风险清单
+### 11.9.2 第 4 步实施记录:MTP draft/verify prep 接入 + mismatch 自检(2026-11-04)
+
+代码考古定论(实施前完成,证据见文件引用):
+
+| # | 问题 | 结论 |
+| --- | --- | --- |
+| 1 | MTP draft 是否含 PLE 层 | **否**:`Qwen4ExpForCausalLMMTP` 深拷贝 config 后设 `ple_layer_ids=[]`(`qwen4_exp_mtp.py`),draft 的 `Qwen4ExpModel` 无 PLE 层;且 draft worker 用独立 `FrozenKVMTPCudaGraphRunner`(`TpModelWorker.init_cuda_graphs(capture_decode_cuda_graph=False)`),根本不创建 `DecodeCudaGraphRunner`。**第 4 步只需覆盖 target verify 图** |
+| 2 | verify 图 capture 语义 | capture ForwardBatch 无 `extend_seq_lens` → `_prepare_ple_batch` verify 分支走 `lengths=full(draft_token_num)`、valid_tokens 全真(图 verify 行永远是完整 draft stride);req_indices/token_offsets/hash 链按 capture 批形状烘焙。gate 在 replay 侧传 `extend_seq_lens=None` 即与图内逐位同构(同函数 `_prepare_ple_batch`、同静态缓冲、同 pool history) |
+| 3 | 宽度与守卫 | 生产 verify 行宽 = 4 draft tokens,每层 flat 宽度 = bs×4×16(heads_per_ngram=8×2),远小于 MAX_ROWS=262144;ragged verify 仅 DSPARK 适用(`supports_ragged_verify`),MTP(EAGLE 族)不经过 token-bucket 路径;新增 fail-loud:`draft_token_num != captured_req_width` 启动 RuntimeError(图内 verify 布局按 capture 宽度烘焙,live 宽度分叉必须炸) |
+| 4 | mismatch 自检 | §11.5 修订 2 机制原样适用:PREP_DEBUG 下图内 hash 链每 replay 重算 ids 写入 debug 缓冲,gate 每步比对(verify 与 decode 同一代码路径,宽度自适应);oracle 脚本对 staged boot 扫描 `gate ids != in-graph ids`,任何一条即 FAIL |
+
+实现(最小改动,3 文件):
+
+- `decode_cuda_graph_runner.py`:`_build_ple_decode_prep` 放行
+  `capture_forward_mode ∈ {DECODE, TARGET_VERIFY}`(pdmux/MLP-sync 仍
+  raise;报错文案写明 draft 无 PLE 不经此 runner);`_prep_ple_staged_decode`
+  增加 `extend_seq_lens=None`(复刻 capture 语义)+ verify 宽度守卫;
+  `execute()` gate 触发条件从 `is_decode()` 扩为 `is_decode() or
+  is_target_verify()`。
+- `qwen4_exp.py`:staged 后端启动告警更新(plain-DECODE + MTP
+  TARGET_VERIFY 图均支持)。
+- `qwen4_exp_ple_prep.py`:builder 文档串说明 verify 接线方式。
+
+oracle 扩展(`scripts/oracle_ple_staged_v100.sh`):
+
+- `ORACLE_MTP=1`:生产 MTP 配置(EAGLE 3 steps / topk 1 / 4 draft
+  tokens)双 boot A/B;请求序列与非 MTP 模式相同(错峰防准入竞态,
+  decode 重叠走 verify padded bucket 1→2→3→2→1);
+- 断点续跑:`outputs_pinned.json` 已存在则复用(两 boot 请求序列相同);
+- staged boot 自动带 `SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG=1` 并扫描
+  mismatch 日志;accept 长度取自响应 `meta_info.spec_accept_length`
+  (paper 口径,含 bonus),pinned vs staged 必然一致(逐位输出的推论);
+- 修复:`docker run -d` 的 stdout 重定向只捕获容器 ID,服务器日志改经
+  `docker logs -f` 流入文件(此前故障诊断 tail 的是空壳文件)。
+
+oracle 结论(2026-11-04,4×V100 真机,`ORACLE_MTP=1` 生产 MTP 配置,
+输出目录 `/data/ple_staged_oracle_mtp`):**ORACLE PASS**——7 条响应、
+296 个输出 token、296 个逐 token logprob 与 decoder 文本在 pinned 与
+staged 双 boot 间全部逐位一致;staged gate mismatch 自检 564 步
+matching / 0 mismatch;MTP accept 长度均值 2.465(逐位一致输出的直接
+推论:双 boot accept 必然相同)。verify prep 与 plain decode 共用同一
+gate 路径,且每轮 decode 都流经 verify 图 → MTP 路径验收完成。
+
+运维教训(同日两次环境事故,记录防复发):
+
+- **barrier 失衡 hung task**:首次 staged boot 无 REUSE,每 rank 物化
+  11.2GiB 顺序写约 5.5 分钟,远超默认 480s 的 unbalanced-loading
+  barrier(`load_model_utils.py` 的 `UNBALANCED_MODEL_LOADING_TIMEOUT_S`,
+  新增 `SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT` 覆盖,oracle 置
+  1800);先行 rank 报错后,迟到的 TP3 卡 D 态 hung task,只能重启主机。
+  启动期慢加载必须先抬 barrier 再 boot。
+- **kill 后 D 态残留**:强杀残留进程仍持 GPU 显存,新 boot 表现为
+  资源不足/NVML 异常;确认无进程后再 `nvidia-smi` 复查。
+- **REUSE 语义**:oracle 的 staged 文件来自上一次 boot 物化的确定性
+  checkpoint 拷贝(`materialize()` 输出只依赖 checkpoint 字节与 header,
+  与 boot 无关),header 校验匹配才跳写;数据正确性由逐位 oracle 本身
+  兜底,不依赖 REUSE 路径。
+
+## 11.10 风险清单
 
 | # | 风险 | 缓解 |
 | --- | --- | --- |
@@ -451,4 +509,4 @@ decoder 文本全部逐位一致**。首跑曾 FAIL 于并发同时 burst——�
 | 3 | gate 的 sync 造成的每步 GPU 空窗超预算 | 空窗 = host fill 时间,稳态页缓存全热 10~50μs(§11.3 修订 2 核算);A/B 门(≥基线 -3%)实测裁决 |
 | 4 | staging 未就位时图已启动(调度竞态) | **结构性消解**:replay 在 gate 的 fill 完成后才 launch(同函数内顺序执行,无竞态窗口) |
 | 5 | prep 放大 decode 关键路径 | `_PLEBatch` 每 step 构建一次;ids D2H 仅 KB 级;`_hash_contexts` 与图内同源,无额外内核 |
-| 6 | MTP verify 布局对齐(draft stride) | verify 走 eager(生产 prefill 图已禁)→ Phase 1 路径天然覆盖;draft 若含 PLE 层,§11.9 第 4 步独立评估 |
+| 6 | MTP verify 布局对齐(draft stride) | **已消解并验收(§11.9.2)**:verify 图 prep 同构接入(`extend_seq_lens=None` 复刻 capture 语义)+ `draft_token_num != captured_req_width` fail-loud 守卫;ORACLE_MTP=1 逐位一致 + 0 mismatch + accept 2.465。draft 已考古确认无 PLE(表见 §11.9.2) |

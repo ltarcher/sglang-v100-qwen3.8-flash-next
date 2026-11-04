@@ -985,10 +985,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             logger.warning(
                 "PLE staged backend: the full %d-row table will be dumped to "
                 "%s after weight loading and the pinned copy released. "
-                "Plain-DECODE CUDA graphs are supported via the Phase 2 "
-                "compute-ahead prep gate (SGLANG_QWEN4_PLE_STAGED_DECODE_PREP"
-                "=1, default); MTP/speculative capture is not yet "
-                "(docs/v100/PLE_NVME_TIER_DESIGN.md §11.9).",
+                "Plain-DECODE and MTP TARGET_VERIFY CUDA graphs are supported "
+                "via the Phase 2 compute-ahead prep gate "
+                "(SGLANG_QWEN4_PLE_STAGED_DECODE_PREP=1, default; the MTP "
+                "draft model carries no PLE layers).",
                 staged_table.shard_rows,
                 staged_table.path,
             )

@@ -49,7 +49,12 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+# leave more time for post data processing; overridable for boots with heavy
+# per-rank post-load work (e.g. Qwen PLE staged backend materializing
+# ~12 GiB/rank on first boot, docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.2)
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = max(
+    envs.SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT.get(), 60.0
+)
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:

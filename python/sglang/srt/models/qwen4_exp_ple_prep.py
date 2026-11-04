@@ -156,13 +156,17 @@ def build_qwen4_exp_ple_decode_prep(model):
     """Wire the compute-ahead decode gate for a staged-PLE Qwen4-Exp model.
 
     Called by the decode CUDA graph runner before capture (production wiring;
-    no-op for every other model or backend):
+    no-op for every other model or backend). The runner gates both plain-DECODE
+    and MTP TARGET_VERIFY replays through this prep — the MTP draft model
+    carries no PLE layers (``ple_layer_ids=[]``) so the draft needs nothing:
       - one shared ``PleRowStaging`` per staged embedding, assigned to
         ``_staged_staging`` so the in-graph capture-safe gather reads the very
         buffer the gate fills (zero-filled first so capture warmup sees
         deterministic content, with the slot arange pre-created on device);
       - ``_prepare_ple_batch`` (the exact callable the captured graph runs)
-        bound as the gate's ``batch_builder``.
+        bound as the gate's ``batch_builder`` — its TARGET_VERIFY branch
+        reproduces the captured verify layout when the runner passes the
+        static buffers plus ``extend_seq_lens=None``.
 
     Returns None when the model carries no staged PLE table.
     """

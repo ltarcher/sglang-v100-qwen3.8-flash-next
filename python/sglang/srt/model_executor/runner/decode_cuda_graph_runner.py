@@ -1589,21 +1589,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self._ple_decode_prep = build_qwen4_exp_ple_decode_prep(self.model_runner.model)
         if self._ple_decode_prep is not None and (
-            self.capture_forward_mode != ForwardMode.DECODE
+            self.capture_forward_mode
+            not in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
             or self.enable_pdmux
             or self.require_mlp_sync
         ):
             raise NotImplementedError(
-                "PLE staged decode prep covers plain-DECODE graphs only "
-                f"(this runner captures {self.capture_forward_mode.name}, "
+                "PLE staged decode prep covers plain-DECODE and TARGET_VERIFY "
+                f"graphs only (this runner captures {self.capture_forward_mode.name}, "
                 f"pdmux={self.enable_pdmux}, dp/gather={self.require_mlp_sync}); "
-                "MTP draft/verify prep is Phase 2 step 4 "
-                "(docs/v100/PLE_NVME_TIER_DESIGN.md §11.9)."
+                "see docs/v100/PLE_NVME_TIER_DESIGN.md §11.9. The MTP draft model "
+                "carries no PLE layers (ple_layer_ids=[]) and never reaches this "
+                "runner (the draft worker captures its own FrozenKVMTP graphs)."
             )
 
     def _prep_ple_staged_decode(self, forward_batch: ForwardBatch) -> None:
         """Compute-ahead launch gate: fill every PLE layer's pinned staging
-        for the batch about to replay.
+        for the batch about to replay (plain DECODE or TARGET_VERIFY).
 
         Re-runs the captured graph's exact ``_prepare_ple_batch`` on the same
         static buffers (padded input_ids / req_pool_indices / out_cache_loc,
@@ -1611,7 +1613,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         previous replay's in-graph commit wrote (stream-ordered). The single
         ``ids.cpu()`` sync inside also retires the previous step's sample;
         ``backend.replay`` launches only after the fill completes.
+
+        TARGET_VERIFY: the captured graph baked the capture-batch semantics —
+        ``extend_seq_lens`` absent → ``lengths = full(draft_token_num)`` and
+        all-true valid tokens (graph verify rows are always complete draft
+        strides); the gate passes ``extend_seq_lens=None`` to reproduce it
+        exactly, and fails loud if the live draft width ever diverges from
+        the captured one.
         """
+        if self.capture_forward_mode == ForwardMode.TARGET_VERIFY and (
+            forward_batch.spec_info is None
+            or forward_batch.spec_info.draft_token_num != self.captured_req_width
+        ):
+            raise RuntimeError(
+                "PLE staged verify prep: live draft_token_num "
+                f"{getattr(forward_batch.spec_info, 'draft_token_num', None)} != "
+                f"captured width {self.captured_req_width}; the in-graph verify "
+                "layout is baked to the captured width"
+            )
         num_tokens = self.bs * self.captured_req_width
         registry = self.buffer_registry
         prep_input = SimpleNamespace(
@@ -1627,6 +1646,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             global_num_token_non_padded_cpu=None,
             extend_seq_lens_cpu=None,
+            extend_seq_lens=None,
         )
         self._ple_decode_prep.prep_and_fill(prep_input.input_ids, prep_input)
 
@@ -1645,6 +1665,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if self._ple_decode_prep is not None and (
                 forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
             ):
                 self._prep_ple_staged_decode(forward_batch)
             if envs.SGLANG_DSV41_PREFILL_SYNC.get():

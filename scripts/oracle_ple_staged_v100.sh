@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Bit-exact oracle: pinned vs staged PLE backend through the Phase 2
-# compute-ahead decode gate (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9 step 3).
+# compute-ahead decode gate (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9 steps 3-4).
 #
-# Runs the SAME Qwen3.8-Flash-Next-NVFP4 engine twice (4x V100, TP4, plain
-# decode, no MTP, no hicache) inside the sglang-v100-unified image with the
-# working tree mounted at /w (PYTHONPATH=/w/python), sending an identical
-# request sequence to both:
+# Runs the SAME Qwen3.8-Flash-Next-NVFP4 engine twice (4x V100, TP4, no
+# hicache) inside the sglang-v100-unified image with the working tree mounted
+# at /w (PYTHONPATH=/w/python), sending an identical request sequence to both:
 #   warmup 1 req -> 3 sequential reqs (decode bs=1 bucket)
 #                  -> 3 staggered reqs (0.6 s apart: each prefill runs solo so
 #                     prefill batching is admission-race-free, while decode
@@ -17,6 +16,14 @@
 # (pinned table vs gate-filled pinned staging), so any token/logprob delta
 # means the staged decode-gate path changed numerics.
 #
+# ORACLE_MTP=1 runs the production MTP config instead (EAGLE 3 steps / topk 1
+# / 4 draft tokens): the decode graphs capture TARGET_VERIFY and every decode
+# round flows through the gate's verify prep (§11.9 step 4). The staged boot
+# additionally runs with SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG=1, and both boots
+# are scanned: any "gate ids != in-graph ids" line fails the oracle, and the
+# per-boot mean MTP accept length is reported (staged must equal pinned —
+# bit-exact outputs already imply it).
+#
 # Usage (repo root, target machine, GPUs idle):
 #   bash scripts/oracle_ple_staged_v100.sh [MODEL_DIR] [OUT_DIR]
 # Env overrides:
@@ -24,6 +31,7 @@
 #   ORACLE_PORT    (default 11436; NOT the production 11435/8110)
 #   ORACLE_PLE_DIR (default /data/sglang-ple-staged; staged table dump,
 #                  ~51 GB, first staged boot materializes it)
+#   ORACLE_MTP     (default 0; 1 = production MTP TARGET_VERIFY oracle)
 # Stop the production engine first: one engine per machine, and the oracle
 # binds all 4 GPUs.
 set -euo pipefail
@@ -34,6 +42,7 @@ OUT="${2:-/tmp/ple_staged_oracle_$(date +%m%d%H%M%S)}"
 IMAGE="${ORACLE_IMAGE:-sglang-v100-unified:latest}"
 PORT="${ORACLE_PORT:-11436}"
 PLE_DIR="${ORACLE_PLE_DIR:-/data/sglang-ple-staged}"
+MTP="${ORACLE_MTP:-0}"
 [[ -f "$MODEL/config.json" ]] || { echo "no config.json at $MODEL" >&2; exit 1; }
 mkdir -p "$OUT" "$PLE_DIR"
 
@@ -44,7 +53,35 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
   local name="oracle-ple-$backend"
   local -a extra=()
   [[ "$backend" == staged ]] && extra=(--ple-offload-backend staged)
+  if [[ "$MTP" == 1 ]]; then
+    # Production MTP config (docker-compose-sglang-v100-mtp-8110.yaml):
+    # verify graphs capture TARGET_VERIFY at req width 4.
+    extra+=(
+      --speculative-algorithm EAGLE
+      --speculative-draft-model-path /data/models/nvfp4
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+    )
+  fi
   docker rm -f "$name" >/dev/null 2>&1 || true
+  local -a extra_env=()
+  if [[ "$backend" == staged ]]; then
+    # Mismatch self-check on the staged boot only: the gate compares its own
+    # ids against the in-graph ids each replay (needs the debug buffer, so
+    # only wired when the gate exists). Any mismatch line fails the oracle.
+    # REUSE=1 skips the 11.9 GiB/rank table rewrite when the on-disk header
+    # matches (files persist across boots on /data) — without it the 4-rank
+    # write takes ~5.5 min and trips the 480 s unbalanced-loading barrier
+    # (UNBALANCED_MODEL_LOADING_TIMEOUT_S, load_model_utils.py). First boot
+    # (no on-disk files) must write, so also raise that barrier via the
+    # env override added in §11.9.2.
+    extra_env=(
+      -e SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG=1
+      -e SGLANG_QWEN4_PLE_STAGED_REUSE=1
+      -e SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT=1800
+    )
+  fi
   log "starting $backend server on :$PORT (logs: $OUT/server_$backend.log)"
   docker run -d --name "$name" --gpus all --ipc host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -72,6 +109,7 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
     -e SGLANG_V100_NVFP4_MOE_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_nvfp4_moe \
     -e SGLANG_JIT_CACHE_DIR=/root/sglang-v100-jit/jit \
     -e PYTHONPATH=/w/python \
+    "${extra_env[@]}" \
     "$IMAGE" /opt/venv/bin/python -m sglang.launch_server \
       --trust-remote-code \
       --model-path /data/models/nvfp4 \
@@ -98,10 +136,14 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
       --ple-offload-embedding \
       --warmups sampling \
       --sleep-on-idle \
-      "${extra[@]}" >"$OUT/server_$backend.log" 2>&1 || {
-        tail -40 "$OUT/server_$backend.log" >&2
+      "${extra[@]}" >/dev/null 2>&1 || {
+        log "docker run failed for $backend" >&2
         return 1
       }
+  # `docker run -d` detaches, so the container's stdout never reaches the
+  # redirect above; stream the real server log via `docker logs -f` instead.
+  docker logs -f "$name" >"$OUT/server_$backend.log" 2>&1 &
+  LOGS_PID=$!
   log "waiting for $backend /health (weight load + graph capture + \
 staged materialization can take a while)..."
   for _ in $(seq 1 720); do
@@ -111,11 +153,13 @@ staged materialization can take a while)..."
     fi
     if ! docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null | grep -q true; then
       log "$backend container died; last log lines:" >&2
+      sleep 2; kill "$LOGS_PID" 2>/dev/null || true
       tail -40 "$OUT/server_$backend.log" >&2
       return 1
     fi
     sleep 10
   done
+  kill "$LOGS_PID" 2>/dev/null || true
   log "timed out waiting for $backend /health" >&2
   return 1
 }
@@ -184,6 +228,9 @@ def canon(r):
     lp = mi.get("output_token_logprobs")
     if lp is not None:
         out["logprobs"] = [[x[0], x[1]] for x in lp]
+    for k in ("spec_accept_length", "spec_verify_ct", "spec_accept_rate"):
+        if mi.get(k) is not None:
+            out[k] = mi[k]
     return out
 
 with open(out_path, "w") as f:
@@ -192,25 +239,53 @@ print(f"wrote {out_path}")
 PYEOF
 }
 
+check_server_log() { # $1 = backend; gate self-check
+  local backend="$1"
+  local logfile="$OUT/server_$backend.log"
+  if [[ "$backend" == staged ]]; then
+    if ! grep -q "gate wired" "$logfile"; then
+      log "FAIL: staged boot has no 'gate wired' line — prep gate never built"
+      return 1
+    fi
+    if grep -q "gate ids != in-graph ids" "$logfile"; then
+      log "FAIL: staged boot logged PLE prep mismatch (gate ids vs in-graph ids)"
+      grep "gate ids != in-graph ids" "$logfile" | head -5 >&2
+      return 1
+    fi
+    local hits
+    hits=$(grep -c "gate ids == in-graph ids" "$logfile" || true)
+    log "staged gate self-check: $hits matching steps, 0 mismatches"
+  fi
+}
+
 stop_server() {
   docker rm -f "oracle-ple-$1" >/dev/null 2>&1 || true
 }
 
 trap 'stop_server pinned; stop_server staged' EXIT
 
-run_server pinned
-collect pinned "$OUT/outputs_pinned.json"
-stop_server pinned
+# Resume support: a completed pinned collection is reused as-is (both boots
+# send the identical request sequence, so pinning the first half is safe).
+if [[ -s "$OUT/outputs_pinned.json" ]]; then
+  log "reusing existing pinned outputs at $OUT/outputs_pinned.json"
+else
+  run_server pinned
+  collect pinned "$OUT/outputs_pinned.json"
+  check_server_log pinned
+  stop_server pinned
+fi
 
 run_server staged
 collect staged "$OUT/outputs_staged.json"
+check_server_log staged
 stop_server staged
 
-python3 - "$OUT/outputs_pinned.json" "$OUT/outputs_staged.json" <<'PYEOF'
+python3 - "$OUT/outputs_pinned.json" "$OUT/outputs_staged.json" "$MTP" <<'PYEOF'
 import json, sys
 
 a = json.load(open(sys.argv[1]))
 b = json.load(open(sys.argv[2]))
+MTP = sys.argv[3] == "1"
 assert a.keys() == b.keys(), (list(a), list(b))
 bad = []
 for k in a:
@@ -230,4 +305,10 @@ n = sum(len(a[k]["token_ids"]) for k in a)
 lp = sum(len(a[k].get("logprobs", [])) for k in a)
 print(f"ORACLE PASS: {len(a)} responses, {n} output tokens and {lp} "
       "logprob values bit-identical between pinned and staged backends")
+if MTP:
+    vals = [a[k]["spec_accept_length"] for k in a if "spec_accept_length" in a[k]]
+    if vals:
+        print(f"MTP accept length: mean {sum(vals)/len(vals):.3f} over "
+              f"{len(vals)} responses (production baseline ~2.1; identical "
+              "bit-exact outputs imply pinned and staged accept agree)")
 PYEOF
