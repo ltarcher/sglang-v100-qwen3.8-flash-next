@@ -2475,6 +2475,7 @@ def kill_process_tree(
     include_parent: bool = True,
     skip_pid: int = None,
     wait_timeout: Optional[float] = 60,
+    term_timeout: Optional[float] = 120,
 ):
     """Kill the process and all its child processes.
 
@@ -2485,6 +2486,11 @@ def kill_process_tree(
     unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
     calls `sys.exit(0)` and cannot wait for itself -- use
     `include_parent=False` if child reap must finish first.
+
+    `term_timeout` (seconds) sends SIGTERM first and waits up to that long for
+    children to run their teardown (e.g. cudaHostUnregister of pinned host
+    memory) before the SIGKILL phase; pass None to keep the old immediate-kill
+    behaviour.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2502,14 +2508,45 @@ def kill_process_tree(
         return
 
     killed = []
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-            killed.append(child)
-        except psutil.NoSuchProcess:
-            pass
+    targets = [c for c in children if c.pid != skip_pid]
+
+    if term_timeout is not None and term_timeout > 0:
+        # Graceful phase: SIGTERM lets a healthy child run its cleanup,
+        # including cudaHostUnregister of the pinned host tier. SIGKILL skips
+        # that teardown and orphans the pages as unowned shmem that only a
+        # reboot reclaims.
+        for child in targets:
+            try:
+                child.terminate()
+                killed.append(child)
+            except psutil.NoSuchProcess:
+                pass
+
+        deadline = time.monotonic() + float(term_timeout)
+        while time.monotonic() < deadline:
+            alive = [
+                p
+                for p in killed
+                if p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+            ]
+            if not alive:
+                break
+            time.sleep(1)
+
+        # Force phase: SIGKILL whatever ignored SIGTERM.
+        for proc in killed:
+            try:
+                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                    proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+    else:
+        for child in targets:
+            try:
+                child.kill()
+                killed.append(child)
+            except psutil.NoSuchProcess:
+                pass
 
     if include_parent:
         try:
