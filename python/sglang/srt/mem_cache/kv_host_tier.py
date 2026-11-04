@@ -1189,8 +1189,18 @@ class KVHostTier:
             # selects the local or the imported peer base pointer from the
             # bit.
             gp = page % self.pair_pages
-            owner_bit = ((gp // self.pair_block) & 1) << _PAIR_OWNER_SHIFT
-            owner_row = (gp // (2 * self.pair_block)) * self.pair_block + gp % self.pair_block
+            # The bit must read "this entry's bytes live in the pair member's
+            # buffers" FROM THIS RANK's perspective: parity != pair_rank_bit
+            # means the peer owns it. An absolute-parity bit is only correct
+            # on even ranks -- on TP1/TP3 it inverts the whole table and every
+            # page reads its parity neighbor (the corruption the acceptance
+            # probes caught as 4/6 with one wrong answer).
+            owner_bit = (((gp // self.pair_block) & 1) != self.pair_rank_bit).to(
+                torch.int32
+            ) << _PAIR_OWNER_SHIFT
+            owner_row = (
+                gp // (2 * self.pair_block)
+            ) * self.pair_block + gp % self.pair_block
             phys = owner_bit + owner_row * self.page_size + off
         else:
             phys = (page % self.phys_pages) * self.page_size + off

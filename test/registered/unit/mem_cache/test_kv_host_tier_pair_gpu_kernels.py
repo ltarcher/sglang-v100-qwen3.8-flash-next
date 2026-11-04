@@ -31,9 +31,7 @@ from sglang.srt.mem_cache.kv_host_tier import (
 )
 from sglang.srt.mem_cache.pair_split_ipc import ImportedDeviceBuffer
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs a GPU"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 DEV = "cuda:0"
 PAGE = 8
@@ -42,25 +40,47 @@ LOGICAL_TOKENS = PAIR_PAGES * PAGE
 PAD_BASE = LOCAL_PAGES * PAGE + 64
 OWNER_MASK = (1 << 30) - 1
 
+# Production shape (acceptance boot): page 64, PHYS=663040 -> 10360 pair
+# pages, 5180 local rows per rank. The boundary values below are the ones
+# the acceptance corruption probes exercise (needle page ~195 = peer-owned
+# odd half for even ranks) plus the edges of the owner-row bijection.
+PROD_PAGE = 64
+PROD_PAIR_PAGES = 10360
+PROD_LOCAL_PAGES = 5180
 
-def _pair_tier() -> KVHostTier:
+
+def _prod_tier(pair_block: int = 1, rank_bit: int = 0) -> KVHostTier:
+    t = object.__new__(KVHostTier)
+    t.page_size = PROD_PAGE
+    t._page_shift = PROD_PAGE.bit_length() - 1
+    t.pair_pages = PROD_PAIR_PAGES
+    t.phys_pages = PROD_LOCAL_PAGES
+    t.pair_block = pair_block
+    t.pair_rank_bit = rank_bit
+    t.logical_tokens = PROD_PAIR_PAGES * PROD_PAGE
+    t.phys_slot_base = PROD_LOCAL_PAGES * PROD_PAGE + 64
+    t.pair_split = True
+    return t
+
+
+def _pair_tier(rank_bit: int = 0) -> KVHostTier:
     t = object.__new__(KVHostTier)
     t.page_size = PAGE
     t._page_shift = PAGE.bit_length() - 1
     t.pair_pages = PAIR_PAGES
     t.phys_pages = LOCAL_PAGES
     t.pair_block = 1
-    t.pair_rank_bit = 0
+    t.pair_rank_bit = rank_bit
     t.logical_tokens = LOGICAL_TOKENS
     t.phys_slot_base = PAD_BASE
     t.pair_split = True
     return t
 
 
-def _pair_phys_table() -> torch.Tensor:
+def _pair_phys_table(rank_bit: int = 0) -> torch.Tensor:
     logical = torch.arange(LOGICAL_TOKENS, dtype=torch.int64)
     logical[:PAGE] = PAD_BASE + torch.arange(PAGE)
-    return _pair_tier().map_slot_table(logical.to(torch.int32)).to(DEV)
+    return _pair_tier(rank_bit).map_slot_table(logical.to(torch.int32)).to(DEV)
 
 
 class TestP3GatherPair:
@@ -190,10 +210,10 @@ class TestP3GatherPair:
 class TestCompactKvPair:
     HEADS, DIM, BATCH, TOPK = 2, 16, 3, 6
 
-    def _run(self, pair: bool):
+    def _run(self, pair: bool, rank_bit: int = 0):
         heads, dim, batch, topk = self.HEADS, self.DIM, self.BATCH, self.TOPK
         if pair:
-            t = _pair_tier()
+            t = _pair_tier(rank_bit)
             dev_k = torch.zeros(
                 (LOCAL_PAGES + 1) * PAGE, heads, dim, dtype=torch.float16, device=DEV
             )
@@ -203,13 +223,10 @@ class TestCompactKvPair:
             for gp in range(1, PAIR_PAGES):
                 row = gp // 2
                 val = 100.0 + gp if gp % 2 == 0 else 200.0 + gp
-                (dev_k if gp % 2 == 0 else peer_k)[
-                    row * PAGE : (row + 1) * PAGE
-                ] = val
-                (dev_v if gp % 2 == 0 else peer_v)[
-                    row * PAGE : (row + 1) * PAGE
-                ] = val + 0.5
-            phys = _pair_phys_table()
+                local = gp % 2 == rank_bit
+                (dev_k if local else peer_k)[row * PAGE : (row + 1) * PAGE] = val
+                (dev_v if local else peer_v)[row * PAGE : (row + 1) * PAGE] = val + 0.5
+            phys = _pair_phys_table(rank_bit)
             extra = (_PAIR_OWNER_MASK, peer_k, peer_v)
         else:
             t = object.__new__(KVHostTier)
@@ -219,29 +236,25 @@ class TestCompactKvPair:
             t.logical_tokens = LOGICAL_TOKENS
             t.phys_slot_base = 4 * PAGE + 64
             t.pair_split = False
-            dev_k = torch.zeros(
-                5 * PAGE, heads, dim, dtype=torch.float16, device=DEV
-            )
+            dev_k = torch.zeros(5 * PAGE, heads, dim, dtype=torch.float16, device=DEV)
             peer_k = peer_v = None
             for p in range(4):
                 dev_k[p * PAGE : (p + 1) * PAGE] = 50.0 + p
             full_slots = torch.arange(LOGICAL_TOKENS, dtype=torch.int32)
-            full_slots[:PAGE] = t.phys_slot_base + torch.arange(
-                PAGE, dtype=torch.int32
-            )
+            full_slots[:PAGE] = t.phys_slot_base + torch.arange(PAGE, dtype=torch.int32)
             phys = t.map_slot_table(full_slots).to(DEV)
             extra = None
             dev_v = dev_k + 0.5
         table = phys[None, :].repeat(batch, 1).contiguous()
         req_indices = torch.arange(batch, dtype=torch.int32, device=DEV)
         indices = (
-            (torch.arange(1, topk + 1, dtype=torch.int64, device=DEV) * PAGE)[
-                None, :
-            ]
+            (torch.arange(1, topk + 1, dtype=torch.int64, device=DEV) * PAGE)[None, :]
             .repeat(batch, 1)
             .contiguous()
         )
-        seq_lens = torch.full((batch,), (topk + 1) * PAGE, dtype=torch.int32, device=DEV)
+        seq_lens = torch.full(
+            (batch,), (topk + 1) * PAGE, dtype=torch.int32, device=DEV
+        )
         total = batch * topk
         out_k = torch.empty(total, heads, dim, dtype=torch.float16, device=DEV)
         out_v = torch.empty_like(out_k)
@@ -265,6 +278,18 @@ class TestCompactKvPair:
 
     def test_pair_owner_bit_extraction(self):
         out_k, out_v = self._run(pair=True)
+        for b in range(self.BATCH):
+            for j in range(self.TOPK):
+                lp = 1 + j
+                want = (100.0 + lp) if lp % 2 == 0 else (200.0 + lp)
+                assert out_k[b * self.TOPK + j, 0, 0].item() == want, (b, j)
+                assert out_v[b * self.TOPK + j, 1, self.DIM - 1].item() == want + 0.5
+
+    def test_pair_owner_bit_extraction_rank1(self):
+        # Odd-rank (TP1/TP3) perspective: the table's owner bit is relative
+        # to the reading rank, so the extraction must still land on the same
+        # storage rows (polarity regression, gather-side twin).
+        out_k, out_v = self._run(pair=True, rank_bit=1)
         for b in range(self.BATCH):
             for j in range(self.TOPK):
                 lp = 1 + j
@@ -358,12 +383,12 @@ class TestSm70DecodePair:
         full_v = torch.zeros_like(full_k)
         for p in range(4):
             gen = torch.Generator(device="cpu").manual_seed(200 + p)
-            full_k[p * PAGE : (p + 1) * PAGE] = torch.randn(
-                PAGE, 1, self.DIM, generator=gen
-            ).half().to(DEV)
-            full_v[p * PAGE : (p + 1) * PAGE] = torch.randn(
-                PAGE, 1, self.DIM, generator=gen
-            ).half().to(DEV)
+            full_k[p * PAGE : (p + 1) * PAGE] = (
+                torch.randn(PAGE, 1, self.DIM, generator=gen).half().to(DEV)
+            )
+            full_v[p * PAGE : (p + 1) * PAGE] = (
+                torch.randn(PAGE, 1, self.DIM, generator=gen).half().to(DEV)
+            )
         full_table = t2.map_slot_table(
             torch.arange(LOGICAL_TOKENS, dtype=torch.int32)
         ).to(DEV)[None, :]
@@ -384,3 +409,196 @@ class TestSm70DecodePair:
         ref = (probs @ vv.float()).half()
         diff = (out[0].float() - ref.float()).abs().max().item()
         assert diff < 0.05, diff
+
+
+class TestPairMappingProductionBoundaries:
+    """Owner routing at production shape (page 64, 10360 pair pages).
+
+    The acceptance corruption (needle at page ~195) suspects the owner-bit
+    routing table at page/parity boundaries; these checks pin the mapping
+    itself, independently of any kernel. Expected values are derived from
+    the docs/v100/KV_HOST_TIER_DESIGN.md §6.1 bijection by hand:
+    owner_bit = (gp // block) & 1, owner_row = (gp // (2*block)) * block
+    + gp % block, entry = owner_bit << 30 | owner_row * 64 + off.
+    """
+
+    def _entry(self, rank_bit, token, pair_block=1):
+        t = _prod_tier(pair_block=pair_block, rank_bit=rank_bit)
+        table = torch.tensor([token], dtype=torch.int32)
+        return int(t.map_slot_table(table)[0])
+
+    def test_owner_routing_parity_pages(self):
+        BIT = 1 << 30
+        # Even ranks own even groups: page 195 (odd group, the probe page)
+        # belongs to the peer, owner row 97; gp 1 -> peer row 0.
+        assert self._entry(0, 195 * 64) == BIT + 97 * 64
+        assert self._entry(0, 195 * 64 + 63) == BIT + 97 * 64 + 63
+        assert self._entry(0, 194 * 64 + 31) == 97 * 64 + 31
+        assert self._entry(0, 1 * 64 + 5) == BIT + 5
+        # Odd ranks mirror it (token < 64 is the reserved page: padding
+        # branch, parity-independent).
+        assert self._entry(1, 195 * 64 + 31) == 97 * 64 + 31
+        assert self._entry(1, 194 * 64) == BIT + 97 * 64
+        assert self._entry(1, 1 * 64 + 5) == 5
+        assert self._entry(0, 5) == _prod_tier().phys_slot_base + 5
+
+    def test_owner_routing_local_pool_edges(self):
+        BIT = 1 << 30
+        # gp 5179 (odd, peer for even ranks) -> owner row 2589;
+        # gp 5180 (even) -> row 2590: the bijection crosses the local pool
+        # midpoint without shifting.
+        assert self._entry(0, 5179 * 64) == BIT + 2589 * 64
+        assert self._entry(0, 5180 * 64 + 63) == 2590 * 64 + 63
+        # Last pair page gp 10359 (odd): owned by odd ranks (bit 0, row
+        # 5179 -> slot 331519, exactly one below the kernel validity bound
+        # phys_pages * PAGE_SIZE = 331520); peer-owned for even ranks.
+        assert self._entry(1, 10359 * 64 + 63) == 5179 * 64 + 63
+        assert self._entry(0, 10359 * 64 + 63) == BIT + 5179 * 64 + 63
+        assert self._entry(1, 10359 * 64 + 63) & ((1 << 30) - 1) == 331519
+
+    def test_owner_routing_block_boundary(self):
+        BIT = 1 << 30
+        # block=256: gp 255 ends even group 0 (local rows 0..255), gp 256
+        # starts odd group 1 (peer rows 0..255) -- the group boundary must
+        # switch parity without moving the row base.
+        assert self._entry(0, 255 * 64, 256) == 255 * 64
+        assert self._entry(0, 256 * 64 + 63, 256) == BIT + 0 * 64 + 63
+        assert self._entry(0, 511 * 64, 256) == BIT + 255 * 64
+        assert self._entry(0, 512 * 64 + 1, 256) == 256 * 64 + 1
+
+    def test_write_side_padding_routing(self):
+        # map_slots (write side): peer-owned pages must land on the padding
+        # row (phys_pages) so the store kernel's skip index discards them;
+        # non-real slots keep the reserved padding base.
+        t = _prod_tier()
+        slots = torch.tensor(
+            [0 * 64 + 3, 195 * 64 + 7, 5, 5180 * 64 + 63], dtype=torch.int32
+        )
+        out = t.map_slots(slots).tolist()
+        assert out[0] == t.phys_slot_base + 3, "page-0 tokens are non-real: padding"
+        assert out[1] == 5180 * 64 + 7, "peer page 195 -> padding row"
+        assert out[2] == t.phys_slot_base + 5, "reserved slot stays padding"
+        assert out[3] == 2590 * 64 + 63, "even gp 5180 -> local row 2590"
+
+
+class TestPairGatherPageBoundary:
+    """Gather kernel (PAIR=1) across page boundaries at production page
+    size 64, including the probe page 195 and the last-page validity edge.
+    Scaled to 1024 pair pages (512 local rows) to keep buffers small.
+    """
+
+    GPAGES, LPAGES = 1024, 512
+
+    def _run(self, tokens, rank_bit: int = 0):
+        gpages, lpages = self.GPAGES, self.LPAGES
+        t = object.__new__(KVHostTier)
+        t.page_size = 64
+        t._page_shift = 6
+        t.pair_pages = gpages
+        t.phys_pages = lpages
+        t.pair_block = 1
+        t.pair_rank_bit = rank_bit
+        t.logical_tokens = gpages * 64
+        t.phys_slot_base = lpages * 64 + 64
+        t.pair_split = True
+
+        dev_buf = torch.zeros(lpages * 64 + 64, 4, dtype=torch.float32, device=DEV)
+        peer_buf = torch.zeros_like(dev_buf)
+        for gp in range(1, gpages):
+            row = gp // 2
+            val = 1000.0 + gp if gp % 2 == 0 else 2000.0 + gp
+            (dev_buf if gp % 2 == rank_bit else peer_buf)[row * 64 : (row + 1) * 64] = (
+                val
+            )
+        phys = t.map_slot_table(
+            torch.arange(gpages * 64, dtype=torch.int64).to(torch.int32)
+        ).to(DEV)
+        slots_rows = phys[torch.tensor(tokens, dtype=torch.int64, device=DEV)]
+        out = torch.empty(len(tokens), 4, dtype=torch.float32, device=DEV)
+        gen = torch.zeros(1, dtype=torch.int32, device=DEV)
+        counters = [torch.zeros(1, dtype=torch.int32, device=DEV) for _ in range(4)]
+        tags = torch.full((lpages + 1,), -1, dtype=torch.int32, device=DEV)
+        hvalid = torch.zeros(gpages + 1, dtype=torch.int32, device=DEV)
+        owner = torch.full((lpages + 1,), -1, dtype=torch.int32, device=DEV)
+        _p3_gather_kernel[((len(tokens) + 15) // 16,)](
+            dev_buf.reshape(-1),
+            torch.zeros(gpages * 64 + 64, 4, dtype=torch.float32, device=DEV).reshape(
+                -1
+            ),
+            tags,
+            hvalid,
+            owner,
+            slots_rows,
+            out,
+            len(tokens),
+            lpages,
+            gpages * 64,
+            gen,
+            counters[0],
+            counters[1],
+            counters[2],
+            counters[3],
+            FORCE_HOST=0,
+            CHECK=0,
+            LOGICAL_SHIFT=6,
+            PAGE_SIZE=64,
+            ROW_ELEMS=4,
+            PAGE_ELEMS=64 * 4,
+            BLOCK_ROWS=16,
+            PAIR=1,
+            peer_ptr=peer_buf.reshape(-1),
+        )
+        torch.cuda.synchronize()
+        assert int(counters[0]) == 0, "no row may fall back to the host mirror"
+        return out
+
+    def test_boundary_pages_read_owner_half(self):
+        tokens = [
+            193 * 64 + 63,  # tail of odd gp -> peer row 96
+            194 * 64,  # head of even gp -> local
+            194 * 64 + 63,  # page edge inside one owner
+            195 * 64,  # head of odd gp -> peer row 97 (probe page)
+            195 * 64 + 63,  # tail of the probe page -> peer
+            196 * 64 + 5,  # back to local
+            511 * 64 + 63,  # odd gp near local-pool edge -> peer row 255
+            1022 * 64 + 31,  # second-to-last even gp -> local row 511
+            1023 * 64 + 63,  # last gp, slot 32767 = validity bound - 1
+        ]
+        out = self._run(tokens)
+        for i, tok in enumerate(tokens):
+            gp = tok // 64
+            want = 0.0 if gp == 0 else (1000.0 + gp if gp % 2 == 0 else 2000.0 + gp)
+            assert torch.all(out[i] == want), (i, tok, gp, out[i].tolist())
+
+    def test_rank1_table_reads_the_same_owner_rows(self):
+        # The TP1/TP3 polarity regression (map_slot_table owner bit must be
+        # rank-relative): rank1's table has local/peer swapped versus rank0,
+        # yet every row must still resolve to the same storage bytes. The old
+        # absolute-parity bit inverted the whole table on odd ranks and each
+        # page read its parity neighbor -- "mostly correct, occasionally
+        # corrupt" (acceptance 4/6 with one wrong answer).
+        tokens = [
+            193 * 64 + 63,
+            194 * 64,
+            195 * 64 + 63,
+            511 * 64 + 63,
+            1022 * 64 + 31,
+            1023 * 64 + 63,
+        ]
+        out = self._run(tokens, rank_bit=1)
+        for i, tok in enumerate(tokens):
+            gp = tok // 64
+            want = 1000.0 + gp if gp % 2 == 0 else 2000.0 + gp
+            assert torch.all(out[i] == want), (i, tok, gp, out[i].tolist())
+
+    def test_gather_multiple_programs_and_padding_rows(self):
+        # 19 rows -> grid ceil(19/16) = 2: the BLOCK_ROWS tiling must not
+        # drop or garble the tail program, and a padding-page row (token 5,
+        # non-real) yields zeros through the invalid mask.
+        tokens = [gp * 64 + 17 for gp in range(1, 17)] + [1023 * 64 + 63, 5]
+        out = self._run(tokens)
+        assert out.shape[0] == 18
+        for i, tok in enumerate(tokens):
+            gp = tok // 64
+            want = 0.0 if gp == 0 else (1000.0 + gp if gp % 2 == 0 else 2000.0 + gp)
+            assert torch.all(out[i] == want), (i, tok, gp, out[i].tolist())

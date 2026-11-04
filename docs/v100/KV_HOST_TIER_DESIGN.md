@@ -170,6 +170,12 @@ host RAM 预算:120G − 系统/tokenizer ~10-12G − hicache host 层(缩至 4-
 (rope_scaling 配置覆盖)+ 质量验证(§7)。BFLA 选择器为 training-free
 均值池化点积,无习得范围限制,外推风险低于习得 indexer,但仍未验证。
 
+**优先级定案(2026-11-04,生产)**:第一阶段目标为**原生 262K rope 下的
+256K×2 并发**(不启用 YaRN)。现状:0.90 mf + MTP-on 时 KV 池 426,240
+tokens/rank,2×256K=524,288 装不下(实测 2×224K 即强制串行)——PAIR
+pair-split(§6.1,PHYS=663,040)+ tier 正是为此路径服务;YaRN 512K 扩展
+场景降级为第二阶段。
+
 ## 3. 架构设计
 
 ### 3.1 现状与差距
@@ -328,7 +334,7 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 | 32 KiB 页拷贝延迟 | 23.6 µs | 1000 次小拷贝实测 |
 | decode P2P 读 | 2048 选页半数 × 1024 B × 12 层 = 12.6 MiB/步/rank → **0.96 ms/步(~2%)** | @13.1 GB/s |
 | prefill P2P 读 | 全前缀半数重读,63 chunk 合计 ~51 GiB → **+3.9 s(~+3.5%)** | @13.1 GB/s,memcpy 引擎不占 SM |
-| 容量 | PHYS=663,104(256K×2 唯一 tokens,页对齐)@ 6,144 B/tok/rank = **3.88 GiB/rank(+0.12 vs s8)**,激活余量 4.05 GB | s8 available_gpu_mem 4.17 GB |
+| 容量 | PHYS=663,040(256K×2 唯一 tokens;PAIR 总页数 10,360 必须为偶数,见下勘误)@ 6,144 B/tok/rank = **3.87 GiB/rank(+0.12 vs s8)**,激活余量 4.05 GB | s8 available_gpu_mem 4.17 GB |
 
 实现面(收在 QSA 池 + QSA backend + kv_host_tier 三文件;2026-11-03 修订):
 
@@ -358,8 +364,43 @@ decode/gather kernel 按位选基指针(本地池或 IPC 导入的对家池)。�
 
 质量门:去复制后字节内容与全副本逐位一致(只是换了物理位置),needle
 梯度 + CHECK(host_dev_mismatch 必须保持 0,新增 peer 源失配计数)+ 262k
-锚点数字不回退。对照验收:256K×2(PHYS=663,104)unwrap 区全过、
+锚点数字不回退。对照验收:256K×2(PHYS=663,040)unwrap 区全过、
 decode/prefill 吞吐对 s8 基线 −3% 内。
+
+**勘误(2026-11-04,boot 实测)**:原稿 PHYS=663,104 无法启动——
+663,104/64 = 10,361 页为奇数,PAIR 奇偶对拆要求 pair 总页数能被
+2×`KV_HEAD_LAYOUT_BLOCK` 整除(boot guard 正确拒绝)。修正为
+PHYS=663,040(10,360 偶数页,−1 页 vs 原值);原 663,104 作为 token
+推导值保留在上方字节下限计算中。
+
+**勘误 2(2026-11-04,map_slot_table 极性 bug)**:owner 位实现成了
+绝对奇偶位(`(gp//block) & 1`),但它的语义必须是「从当前 rank 视角,
+本表项字节在对家缓冲里」——即 `(gp//block) & 1 != pair_rank_bit`。
+绝对位只在偶数 rank(持 parity-0 半)碰巧正确;TP1/TP3 整表取反,
+每页都读到奇偶邻居的字节(验收深针 4/6 单错误答案暴露)。修复 1 行
+(`kv_host_tier.py` `map_slot_table`),并钉死三处回归防护:
+`test_kv_host_tier_pair_mapping.py`(真实映射公式 vs 协议 spec,
+rank_bit∈{0,1} 全交叉)、`test_kv_host_tier_pair_gpu_kernels.py`
+(gather/extraction 的 rank_bit=1 视角 + 多 program grid)、
+`test_kv_host_tier_p3_gpu.py`(FULL 布局写路径 3 内核 + 端到端
+claim/restore 链,48/48 过)。
+
+**验收记录(2026-11-04,4×V100,pair-accept@PHYS=663,040 vs 同款
+FULL 基线,双臂 249,643 tok 探针)**:
+
+- lp 逐 token 偏差(全量 input logprob,`logprob_start_len=0`;
+  注意 /generate 默认 -1 时 input_token_logprobs 为空):front 针
+  (页 0 奇半)PAIR vs FULL >1nat 仅 2-3 个且全部落在序列尾部
+  prefill 末块边界(FULL/PAIR 自噪声同位 0.9-1.3);mid 针(页 ~195
+  奇半)PAIR vs FULL 偏差(43/36 个 >1nat,max 7.4/8.9)完全落在
+  FULL 自身两次独立运行的包络内(48 个 >1nat,max 8.9)——该区是
+  fp16 分块 prefill 固有非确定区,与 PAIR 无关。
+- phase3 计数器全程全零:saves/peer_miss/host_dev_mismatch/
+  gather_unvalid 均为 0。
+- gen 深针 6/6×2 臂 hit=True,finish 类型逐项对应。
+- 吞吐:gen 波次聚合 +2.4%、lp e2e +1.5%;稳态 prefill
+  ~1890 vs ~1960 tok/s(−3.6%,略超 −3% 门,为 host 镜像 DMA +
+  PAIR 读路径的 prefill 固定开销;decode accept 2.98 vs 2.88 无回退)。
 
 ### 6.2 fp8 KV 对照(判死备胎,记录防重扫)
 
