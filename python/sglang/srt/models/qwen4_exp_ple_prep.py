@@ -23,6 +23,7 @@ hardware by the Phase 2 bit-exact oracle.
 
 import functools
 import logging
+import time
 
 import torch
 
@@ -77,6 +78,12 @@ class PleDecodePrep:
         self._debug_last_flat: list = [None] * len(self.entries)
         self._debug_last_reqs: list = [None] * len(self.entries)
         self._debug_step = 0
+        # Per-phase wall time accumulation (seconds): build, ids+D2H sync,
+        # staging fill. Logged as a per-step mean every _TIMING_LOG_STEPS.
+        self._timing = [0.0, 0.0, 0.0]
+        self._timing_steps = 0
+
+    _TIMING_LOG_STEPS = 500
 
     def prep_and_fill(self, input_ids: torch.Tensor, forward_batch) -> int:
         """Fill staging for all layers; returns the per-layer flat id count.
@@ -85,12 +92,16 @@ class PleDecodePrep:
         the previous step's sample and this step's replay enqueue, where the
         D2H sync is already accounted for by the design doc's cost model.
         """
+        t0 = time.perf_counter()
         batch = self.batch_builder(input_ids, forward_batch)
+        build_s = time.perf_counter() - t0
+        cursor = t0 + build_s
         n = -1
         flats = []
         for entry in self.entries:
             ids = entry.embedding.compute_ngram_ids(batch)
             flat = ids.detach().reshape(-1).to(torch.long).cpu()
+            ta = time.perf_counter()
             flats.append(flat)
             if n < 0:
                 n = int(flat.numel())
@@ -101,7 +112,24 @@ class PleDecodePrep:
                     f"{int(flat.numel())} — check per-layer embedding wiring"
                 )
             entry.staging.stage(flat, entry.vocab_start, entry.vocab_end)
+            tb = time.perf_counter()
+            self._timing[1] += ta - cursor
+            self._timing[2] += tb - ta
+            cursor = tb
         self._debug_compare(forward_batch, flats)
+        self._timing[0] += build_s
+        self._timing_steps += 1
+        if self._timing_steps % self._TIMING_LOG_STEPS == 0:
+            steps = self._timing_steps
+            build, sync, fill = (v / steps * 1e6 for v in self._timing)
+            logger.info(
+                "PLE prep timing over %d steps (per step): build %.0fus, "
+                "ids+D2H sync %.0fus, staging fill %.0fus",
+                steps,
+                build,
+                sync,
+                fill,
+            )
         return n
 
     def _debug_compare(self, forward_batch, flats: list) -> None:

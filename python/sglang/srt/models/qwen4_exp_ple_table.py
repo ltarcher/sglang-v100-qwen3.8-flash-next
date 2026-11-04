@@ -44,7 +44,10 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.host_hugepage import try_alloc_pinned_1g_hugepage
+from sglang.srt.mem_cache.host_hugepage import (
+    try_alloc_pinned_1g_hugepage,
+    try_alloc_pinned_mmap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,11 +248,15 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
-        huge = try_alloc_pinned_1g_hugepage(
-            tuple(shape), dtype, purpose="PLE table"
-        )
+        huge = try_alloc_pinned_1g_hugepage(tuple(shape), dtype, purpose="PLE table")
         if huge is not None:
             return huge
+        # Prefer an owned anonymous mapping over torch pin_memory: the pinned
+        # caching allocator never returns freed blocks to the OS, which would
+        # keep the staged backend's released loading table resident forever.
+        mm = try_alloc_pinned_mmap(tuple(shape), dtype, purpose="PLE table")
+        if mm is not None:
+            return mm
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1

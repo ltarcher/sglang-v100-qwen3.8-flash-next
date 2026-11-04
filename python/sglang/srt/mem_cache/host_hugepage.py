@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import math
+import mmap
 import os
 import weakref
 
@@ -191,6 +192,75 @@ def try_alloc_pinned_1g_hugepage(
         n_bytes / GIB,
         node,
         need,
+    )
+    return tensor
+
+
+def try_alloc_pinned_mmap(
+    dims: tuple,
+    dtype: torch.dtype,
+    *,
+    purpose: str,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor | None:
+    """A device-readable tensor from an owned anonymous mapping, or ``None``.
+
+    torch's pinned caching allocator never returns freed blocks to the OS (its
+    2 GiB test block survives ``del`` + ``gc.collect()`` + ``empty_cache()``
+    untouched, and there is no host empty-cache API), so a released loading
+    table would stay resident for the process lifetime. An anonymous
+    ``MAP_POPULATE`` mapping the tensor owns is munmapped deterministically at
+    free instead; ``cudaHostRegister(MAPPED)`` makes the pages device-readable
+    and pinned, matching what ``pin_memory`` provides for the gather kernels.
+    """
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_register
+    from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
+
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    mapped_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+    tensor = None
+    try:
+        tensor = alloc_mmap(tuple(dims), dtype)
+        _cuda_host_register(
+            tensor,
+            registration_granularity_bytes,
+            flags=_CUDA_HOST_REGISTER_MAPPED,
+            nbytes=mapped_bytes,
+        )
+    except Exception as exc:
+        from sglang.srt.mem_cache.pool_host.common import (
+            _CUDA_HOST_REGISTERED_RANGES_ATTR,
+        )
+
+        ranges = getattr(tensor, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
+        if ranges:
+            # Registration rollback left pages registered; keep the mapping
+            # alive rather than munmap under a live registration.
+            _retained_after_failed_unregister.append(tensor)
+            logger.warning(
+                "Qwen %s: cudaHostRegister rollback left memory registered; "
+                "keeping the mmap alive",
+                purpose,
+            )
+        else:
+            logger.info(
+                "Qwen %s: anonymous-mmap pinned allocation failed (%s); "
+                "falling back to torch pin_memory",
+                purpose,
+                exc,
+            )
+        return None
+    ranges = getattr(tensor, "_sglang_cuda_host_registered_ranges", None)
+    if isinstance(ranges, list):
+        weakref.finalize(tensor, _unregister_registered_ranges, ranges)
+    # The caller wraps this tensor into an nn.Parameter, which shares storage
+    # without keeping the object alive; the marker makes it hold the owner
+    # reference so the unregister finalizer cannot fire while the weight lives.
+    tensor._sglang_pinned_mmap = True  # type: ignore[attr-defined]
+    logger.info(
+        "Qwen %s: %.2f GiB via anonymous mmap + cudaHostRegister (munmap at free)",
+        purpose,
+        n_bytes / GIB,
     )
     return tensor
 

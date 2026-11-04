@@ -485,6 +485,11 @@ matching / 0 mismatch;MTP accept 长度均值 2.465(逐位一致输出的直接
 推论:双 boot accept 必然相同)。verify prep 与 plain decode 共用同一
 gate 路径,且每轮 decode 都流经 verify 图 → MTP 路径验收完成。
 
+复跑结论(mmap 分配 + 同步 fill 落地后,`/data/ple_staged_oracle_mtp2`,
+pinned 侧复用):**ORACLE PASS**——7/296/296 再次逐位一致,gate 自检
+1220 步 matching / 0 mismatch。mmap+register 分配路径与 stage() 优化
+不改数值的推论闭环。
+
 运维教训(同日两次环境事故,记录防复发):
 
 - **barrier 失衡 hung task**:首次 staged boot 无 REUSE,每 rank 物化
@@ -495,10 +500,65 @@ gate 路径,且每轮 decode 都流经 verify 图 → MTP 路径验收完成。
   启动期慢加载必须先抬 barrier 再 boot。
 - **kill 后 D 态残留**:强杀残留进程仍持 GPU 显存,新 boot 表现为
   资源不足/NVML 异常;确认无进程后再 `nvidia-smi` 复查。
+- **MTP 引擎拆除 wedge(第三次事故,规律确认)**:`docker rm -f` 一个
+  idle 的 MTP 引擎容器时,runc 在内核态 GPU 设备拆除上卡 D 态(约 80 个
+  runc 叠积,`nv_queue` 卡住),docker daemon 半瘫,只能重启主机;同日
+  两次 MTP boot 拆除均 wedge,非 MTP boot 拆除全部秒过。规律:**杀
+  MTP 引擎前先接受可能需要重启,或避免直接 rm -f;运维脚本目前无规避
+  手段,只能事后重启恢复**。
 - **REUSE 语义**:oracle 的 staged 文件来自上一次 boot 物化的确定性
   checkpoint 拷贝(`materialize()` 输出只依赖 checkpoint 字节与 header,
   与 boot 无关),header 校验匹配才跳写;数据正确性由逐位 oracle 本身
   兜底,不依赖 REUSE 路径。
+
+## 11.9.3 第 5 步实施记录:同机 A/B 吞吐门(2026-11-04,4×V100 真机)
+
+工具:`scripts/bench_ple_staged_ab_v100.sh`(双 boot pinned→staged,prefill
+侦察 + padding-decode 阶梯,各点两轮:第 1 轮暖 radix/页缓存,第 2 轮计门)。
+ladder 定档受三重约束(MTP 请求校验 `input + 4 draft 槽 + completion ≤
+262144`;本 boot `max_total_num_tokens=323072`;两侧行为一致):C=1 @250k、
+C=2 @128k、C=2 @64k。坑:请求校验会拒 `262148` token(MTP 计入 draft 余量)
+与 `max_new_tokens=10M`(input+completion 总量校验),且 server_args dump
+含字段名 `…retraction_backup`,retract 扫描须排除。
+
+**第 1 轮 BENCH FAIL**(-4.2%/-3.5%/-2.9%),定位出两个真 bug 并修复:
+
+1. **staged 释放根本不还 OS(内存收益为零的根因)**:加载表走
+   `torch.empty(pin_memory=True)` → torch pinned caching allocator 释放的
+   块只回缓存池(2GiB 实验:`del + gc.collect() + empty_cache()` 后
+   MemAvailable 纹丝不动,且无 host empty-cache API)→ `_release_loading_table`
+   换 dummy 参数后 47.7G 仍常驻。修复:新增
+   `try_alloc_pinned_mmap`(`host_hugepage.py`,匿名 mmap + MAP_POPULATE +
+   `cudaHostRegister(MAPPED)`,tensor 持有映射,GC 即 munmap 确定性还 OS),
+   分配链 hugepage → mmap+register → pin_memory 兜底;`nn.Parameter` 不持有
+   原对象引用,镜像 hugepage 的 `_sglang_hugepage_owner` 模式防 finalizer
+   提前触发;`_release_loading_table` 加 `gc.collect()`。修复后单 boot 验证:
+   healthy 时 **Shmem 67.9G → 0.78G,MemAvailable 39.5G → 107.6G**(§1 的
+   "40G→~90G 弹性"兑现)。
+2. **fill 段 ~1.2ms/步**:gate 每步 1-16 行走线程池,一轮 dispatch+result
+   约 1ms。修复:`stage()` 小批量(≤32 行)直接调用线程同步 fill(页缓存热
+   行 ~μs 级),CPU-long 张量跳过冗余 dtype/设备搬运;大批量(prefill
+   4096 行)仍走线程池。
+
+prep 分段计时(`qwen4_exp_ple_prep.py`,每 500 步 INFO 汇总):build ~0.7ms、
+ids+D2H sync 18-26ms(**非新增**——该同步点本就等 GPU 排空,pinned 采样路径
+同样要等)、fill 1.0-1.3ms → 优化后 ~0.1ms。
+
+**第 2 轮 BENCH PASS**(warm pass 2,30s padding,agg tok/s 为流式 chunk 计数,
+双臂同口径,用于 A/B 比值):
+
+| 点 | pinned | staged | delta |
+| --- | --- | --- | --- |
+| decode 250k C=1 | 37.8 | 36.8 | **-2.6%** |
+| decode 128k C=2 | 45.3 | 44.6 | **-1.5%** |
+| decode 64k C=2 | 47.8 | 46.6 | **-2.5%** |
+
+零 retract;§11.1 验收门 1(decode ≥ -3%)通过。门 3(accept 不回退)由
+逐位 oracle 兜底(mmap/同步 fill 仅改 IO 来源,不改数值;改动后的
+ORACLE_MTP=1 复跑见 §11.9.2 结论行)。prefill 侦察仍回退
+(64k 2576→1839,-29%;262k 2952→2354,-18%):prefill 走 eager stage、
+无双缓冲(§11.9 步骤 5 的 prefill 双缓冲尚未实施),为 Phase 2 剩余项,
+不阻塞 decode 验收门,但生产切换前必须补。
 
 ## 11.10 风险清单
 
@@ -506,7 +566,7 @@ gate 路径,且每轮 decode 都流经 verify 图 → MTP 路径验收完成。
 | --- | --- | --- |
 | 1 | gate 与图内 gather 的输入不一致(静态缓冲 pad 区、forward_batch 字段切片) | 二者为同一函数同一输入(§11.3 修订 2);**已验收(§11.9.1)**:逐位 oracle 296 token 一致(padded bucket 1→2→3→2→1 全覆盖);跨层宽度一致性检查兜底;另:builder 因模型外层 wrapper 解包失败会静默不接线,已加 `gate wired` 日志 + wrapper 解包 |
 | 2 | captured D2H 在 multi-stream capture 下不合法 | **已消解(§11.6.1)**:prep 图外化后无 captured memcpy |
-| 3 | gate 的 sync 造成的每步 GPU 空窗超预算 | 空窗 = host fill 时间,稳态页缓存全热 10~50μs(§11.3 修订 2 核算);A/B 门(≥基线 -3%)实测裁决 |
+| 3 | gate 的 sync 造成的每步 GPU 空窗超预算 | **已实测消解(§11.9.3)**:A/B 第 2 轮 decode -1.5%~-2.6%(门限 -3%);prep 计时显示 D2H sync 与既有采样同步重叠、净增仅 build+fill |
 | 4 | staging 未就位时图已启动(调度竞态) | **结构性消解**:replay 在 gate 的 fill 完成后才 launch(同函数内顺序执行,无竞态窗口) |
 | 5 | prep 放大 decode 关键路径 | `_PLEBatch` 每 step 构建一次;ids D2H 仅 KB 级;`_hash_contexts` 与图内同源,无额外内核 |
 | 6 | MTP verify 布局对齐(draft stride) | **已消解并验收(§11.9.2)**:verify 图 prep 同构接入(`extend_seq_lens=None` 复刻 capture 语义)+ `draft_token_num != captured_req_width` fail-loud 守卫;ORACLE_MTP=1 逐位一致 + 0 mismatch + accept 2.465。draft 已考古确认无 PLE(表见 §11.9.2) |

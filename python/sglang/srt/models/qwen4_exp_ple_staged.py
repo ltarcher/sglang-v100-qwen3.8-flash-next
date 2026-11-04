@@ -272,7 +272,10 @@ class PleRowStaging:
                 f"gather of {n} rows exceeds staging capacity {self.max_rows} "
                 "(raise SGLANG_QWEN4_PLE_STAGED_MAX_ROWS)"
             )
-        ids_np = ids.detach().to(torch.long).cpu().numpy()
+        if ids.dtype == torch.long and ids.is_cpu:
+            ids_np = ids.numpy()
+        else:
+            ids_np = ids.detach().to(torch.long).cpu().numpy()
         local = ids_np - vocab_start
         valid = (local >= 0) & (local < self.table.shard_rows) & (ids_np < vocab_end)
 
@@ -284,7 +287,11 @@ class PleRowStaging:
         if rows:
             fd = self.table._ensure_open()
             slots = valid.nonzero()[0].tolist()
-            if self._pool is None:
+            # Small gathers (the decode gate fills 1-16 rows per step) go
+            # through the caller thread: page-cache-warm rows are a few us
+            # each, while a round of thread-pool dispatch + result() costs
+            # ~1 ms and shows up directly on the decode step.
+            if self._pool is None or len(rows) <= 32:
                 for slot, row in zip(slots, rows):
                     self._read_into_slot(fd, slot, row)
             else:

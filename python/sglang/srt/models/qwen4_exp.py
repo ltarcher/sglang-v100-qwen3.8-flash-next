@@ -1,5 +1,6 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import gc
 import math
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple, Union
@@ -1016,9 +1017,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
-        # Parameter is a new object sharing the storage. Hugepage unregister is
-        # tied to host_table, so that object has to live as long as the weight.
-        if getattr(host_table, "_sglang_hugetlb_node", None) is not None:
+        # Parameter is a new object sharing the storage. Hugepage/mmap
+        # unregister finalizers are tied to host_table, so that object has to
+        # live as long as the weight.
+        if getattr(host_table, "_sglang_hugetlb_node", None) is not None or getattr(
+            host_table, "_sglang_pinned_mmap", False
+        ):
             cpu_weight._sglang_hugepage_owner = host_table
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
@@ -1182,14 +1186,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if self._staged_table is None:
             return
         # Swap the 12+ GiB loading table for a 1-row placeholder that keeps
-        # the dtype (the kernel's is_fp8 flag reads it). The hugepage/pinned
+        # the dtype (the kernel's is_fp8 flag reads it). The mmap/hugepage/pinned
         # storage is dropped with the old Parameter object (its owner tensor
-        # unregisters via the allocator's finalizer).
+        # unregisters via the allocator's finalizer). mmap and hugepage
+        # allocations munmap at free; a torch pin_memory fallback would only
+        # return the block to the pinned caching allocator (which never hands
+        # it back to the OS).
         dtype = self.weight.dtype
         dummy = nn.Parameter(
             torch.empty((1, self.embedding_dim), dtype=dtype), requires_grad=False
         )
         self.register_parameter("weight", dummy)
+        # Collect now so the finalizer (cudaHostUnregister + munmap) runs
+        # deterministically and boot-time memory accounting sees the freed
+        # pages before CUDA graph capture and the unbalanced-loading barrier.
+        gc.collect()
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
