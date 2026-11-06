@@ -411,6 +411,11 @@ class Envs:
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+    # Drop multimodal placeholder tokens in the prompt that have no matching data
+    # item (e.g. an agent client echoing `<image>` in text without attaching the
+    # image) instead of failing the whole request with a 500. Off by default to
+    # keep the upstream strict "more tokens than data" error.
+    SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP = EnvBool(False)
 
     # ===================================================================
     # HTTP server and health

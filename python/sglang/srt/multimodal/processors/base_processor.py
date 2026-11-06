@@ -1462,12 +1462,16 @@ class BaseMultimodalProcessor(ABC):
         text_parts = re.split(multimodal_tokens_pattern, prompt)
         # collect all data
         data_iterators = {}
-        if multimodal_tokens.image_token and image_data:
-            data_iterators[Modality.IMAGE] = iter(image_data)
-        if multimodal_tokens.video_token and video_data:
-            data_iterators[Modality.VIDEO] = iter(video_data)
-        if multimodal_tokens.audio_token and audio_data:
-            data_iterators[Modality.AUDIO] = iter(audio_data)
+        # With SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP, build iterators even for
+        # empty data so unmatched tokens flow through the drop path below
+        # instead of failing with "No data iterator found".
+        drop_unmatched = envs.SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP.get()
+        if multimodal_tokens.image_token and (image_data or drop_unmatched):
+            data_iterators[Modality.IMAGE] = iter(image_data or [])
+        if multimodal_tokens.video_token and (video_data or drop_unmatched):
+            data_iterators[Modality.VIDEO] = iter(video_data or [])
+        if multimodal_tokens.audio_token and (audio_data or drop_unmatched):
+            data_iterators[Modality.AUDIO] = iter(audio_data or [])
 
         # futures: the futures of loaded data
         # task_info: modality, raw_data, and other metadata of each data
@@ -1533,6 +1537,17 @@ class BaseMultimodalProcessor(ABC):
                 # when precomputed_input is presented with multi-images, StopIteration is expected
                 if has_precomputed_input:
                     new_text_parts += [text_part]
+                    continue
+                if envs.SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP.get():
+                    # Agent clients sometimes echo placeholder tokens (e.g.
+                    # `<image>`) in text without attaching the corresponding
+                    # data; drop the unmatched token instead of failing the
+                    # whole request.
+                    logger.warning(
+                        "Dropping unmatched multimodal token in prompt "
+                        "(SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP=1): %r",
+                        text_part,
+                    )
                     continue
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
