@@ -409,6 +409,33 @@ FULL 基线,双臂 249,643 tok 探针)**:
 (记忆:1M 线「fp8 KV 池仍差 1.4 GB/rank」),质量门另有量化损失;
 pair-split 零精度损失、实测成本更低,维持 fp8 判死。
 
+### 6.3 YaRN ×3 并发判死(2026-11-05,四次 boot 实测)
+
+PAIR + MTP(steps 3 / draft 4)+ 3 并发形态下,YaRN 外推无内存空间,
+已回退 factor 1.0(原生 262144)。关键标定值与死亡数据:
+
+| 标定项 | 实测值 |
+| --- | --- |
+| device KV 单价(PAIR) | 11.44 KB/tok/rank(池 = logical/2) |
+| draft(QSA 单层)单价 | ~1.0 KB/tok/rank |
+| host mirror 单价 | 12.6 KB/tok/rank ×4 |
+| 图捕获后余量(3×256K,健康组) | 3.23 GB |
+| **warmup 惰性 triton 加载真实需求** | **~2.1–2.4 GB**(多内核 JIT + 前向激活) |
+| factor 1.35(L=1,068,032) | 图后 1.06 GB → warmup OOM(死) |
+| factor 1.2(L=943,872) | 图后 2.08 GB → triton 压到 0.09 GB,silu 80 MB OOM(死) |
+
+结论:warmup 需求吃掉图后余量的大半,过 warmup 需图后 ≥3.0 GB,
+对应 L ≤ ~800K → 单流 ≤ ~266K ≈ factor 1.0。300K(省 0.15 GB)不够。
+
+未来若需 >256K 单流,可行路径(均付代价):
+去 MTP(省 ~1.0 GB draft 池+图,decode 减半);改 FULL 布局(省 ~1.6 GB,
+device 池可缩,但长文 decode 撞 host page-in spill 悬崖)。
+
+另记录:图捕获(bs [1,2,3] / verify 12-token)开销 ~0.2 GB;4×256K 的
+失败(bs=4 图 + 4 路缓冲 ~1.4 GB 非线性)与池无关。--rope-scaling 参数
+不存在,须用 --json-model-override-args(mrope/partial_rotary 字段原样
+保留,仅改 factor 与 max_position_embeddings)。
+
 ## 7. 验证矩阵与验收门
 
 质量(全部 fp16,链路无量化,目标零精度损失):
