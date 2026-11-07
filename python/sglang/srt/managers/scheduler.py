@@ -269,6 +269,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.mixed_prefill_budget import (
+    MixedPrefillBudgetControl,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -687,6 +690,7 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
         self.maybe_init_dynamic_chunk_sizer()
+        self.maybe_init_mixed_prefill_budget()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1444,6 +1448,33 @@ class Scheduler(
         )
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
+
+    def maybe_init_mixed_prefill_budget(self) -> None:
+        """Cap mixed-prefill chunks at a learned latency budget (L3-1).
+
+        Requires the overlap scheduler (the timing samples ride its result
+        pipeline) and mixed chunked prefill; 0 target_ms disables.
+        """
+        self.mixed_prefill_budget: Optional[MixedPrefillBudgetControl] = None
+        target_ms = envs.SGLANG_MIXED_PREFILL_STEP_LATENCY_MS.get()
+        if (
+            target_ms <= 0
+            or not self.enable_overlap
+            or not self.is_mixed_chunk
+            or self.chunked_prefill_size is None
+        ):
+            return
+        self.mixed_prefill_budget = MixedPrefillBudgetControl(
+            chunked_prefill_size=self.chunked_prefill_size,
+            target_ms=target_ms,
+            min_tokens=envs.SGLANG_MIXED_PREFILL_MIN_TOKENS.get(),
+        )
+        logger.info(
+            "Mixed prefill budget controller on: target=%.0fms, seed=%d, max=%d tokens",
+            target_ms,
+            self.mixed_prefill_budget.budget.tokens,
+            self.chunked_prefill_size,
+        )
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -4074,6 +4105,20 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # Mixed-prefill budget (L3-1): with resident decoders, cap the chunk so
+        # the mixed step stays near the latency target instead of stalling the
+        # residents for a whole chunked_prefill_size chunk.
+        if self.mixed_prefill_budget is not None:
+            capped = self.mixed_prefill_budget.maybe_cap_chunked_prefill_size(
+                chunked_prefill_size,
+                running_batch,
+                self.waiting_queue,
+                self.chunked_reqs,
+                self.is_mixed_chunk,
+            )
+            if capped is not None:
+                chunked_prefill_size = capped
+
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
         attn_backend = self.tp_worker.model_runner.attn_backend
@@ -4624,10 +4669,19 @@ class Scheduler(
                                     self._advance_pending_grammar
                                 )
 
+                        # Time a controlled mixed step for the adaptive
+                        # prefill budget; events ride the forward stream.
+                        mixed_prefill_step = (
+                            self.mixed_prefill_budget.begin_step(batch)
+                            if self.mixed_prefill_budget is not None
+                            else None
+                        )
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if self.mixed_prefill_budget is not None:
+                            self.mixed_prefill_budget.end_step(mixed_prefill_step)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4981,6 +5035,10 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
+        # Feed the adaptive mixed-prefill budget with this step's timing
+        # sample, if its events are ready (never blocks).
+        if self.mixed_prefill_budget is not None:
+            self.mixed_prefill_budget.process_batch_result(batch)
         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.

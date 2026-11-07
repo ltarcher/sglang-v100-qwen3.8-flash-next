@@ -1,0 +1,336 @@
+"""Adaptive mixed-prefill budget: learn a prefill token budget from completed
+GPU steps so a mixed step (prefill chunks + resident decode tails) stays near
+a latency target instead of stalling the residents for a whole chunk.
+
+Port of 1Cat vLLM v1.5.2 (Apache-2.0), PR #860:
+``vllm/v1/core/sched/mixed_prefill.py`` (controller) and
+``vllm/v1/worker/mixed_prefill.py`` (nonblocking GPU timing). The algorithm is
+kept as-is; the timing plumbing is sglang-shaped: the overlap scheduler records
+the two CUDA events around ``forward_batch_generation`` on the forward stream
+and resolves them non-blockingly when the batch result is processed one
+iteration later. A sample that is not ready yet is dropped from the fit —
+never synchronized on.
+
+Two 1Cat simplifications apply here:
+- sglang mixed steps always run eager (no extend CUDA graphs in this fork), so
+  the graph/eager split fit collapses to the eager fit only;
+- the scheduler caps ``chunked_prefill_size`` before ``PrefillAdder``, and the
+  adder already deducts the mixed decode rows from that budget, so the cap is
+  handed over as ``budget.tokens + num_mixed_decode`` to keep the prefill part
+  at ``budget.tokens``.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections import deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MixedPrefillStep:
+    """One controlled mixed step, timed with two CUDA events on the forward
+    stream. ``try_resolve`` never blocks; an unresolved sample is discarded."""
+
+    prefill_tokens: int
+    decode_tokens: int
+    budget_tokens: int
+    start_event: Optional[object] = None
+    end_event: Optional[object] = None
+    elapsed_ms: Optional[float] = None
+
+    def try_resolve(self) -> bool:
+        if self.elapsed_ms is not None:
+            return True
+        if self.start_event is None or self.end_event is None:
+            return False
+        if not (self.start_event.query() and self.end_event.query()):
+            return False
+        self.elapsed_ms = self.start_event.elapsed_time(self.end_event)
+        return True
+
+
+class MixedPrefillBudget:
+    """Learn a token budget from completed GPU steps, without host-side waits.
+
+    The first mixed step uses a conservative seed. Subsequent samples adapt to
+    the actual model, device, TP size and context. This is a latency target,
+    not a hard deadline: even a decode-only step can exceed the target.
+    """
+
+    # Weight of earlier samples in the step-cost fit.
+    DECAY = 0.75
+
+    def __init__(self, max_tokens: int, target_ms: float, min_tokens: int = 0) -> None:
+        self.max_tokens = max_tokens
+        self.target_ms = target_ms
+        self.min_tokens = min(min_tokens, max_tokens)
+        self.tokens = max(min(512, max_tokens), self.min_tokens)
+        self.ms_per_token: Optional[float] = None
+        # Steps whose prefill part is below this contribute no fit sample: at
+        # that size the step cost is the per-step fixed overhead (kernel
+        # launches, the sparse-attention per-step floor, decode rows), which
+        # would only teach the fit that tokens are more expensive than they are.
+        self.min_sample_tokens = 2 * min(16, max_tokens)
+        # Decayed sums for the fit elapsed = fixed + per_token * tokens:
+        # weight, x, y, x*x and x*y.
+        self._fit = [0.0] * 5
+        # Unreachable-target detection: see update().
+        self.gave_up = False
+        self._full_over_target = 0
+
+    def _affine_budget(self) -> Optional[float]:
+        """Budget from the fixed-plus-linear step cost, once chunks differ.
+
+        A mixed step pays a fixed cost (the decode rows plus any launches
+        that do not scale with prefill) on top of the prefill work. Charging
+        all of it to prefill tokens shrinks the budget whenever the fixed
+        part alone reaches the target, and the smaller chunks then make each
+        token look even more expensive. Fitting both terms removes that
+        feedback. A chunk smaller than the prefill that costs as much as the
+        fixed part spends most of its step on overhead and only multiplies the
+        number of mixed steps, so the budget never drops below that amount.
+        Without this floor a fixed cost just under the target would leave a
+        budget of a few tokens.
+        """
+        w, sx, sy, sxx, sxy = self._fit
+        spread = w * sxx - sx * sx
+        # Require a relative spread of the chunk sizes of about 10%.
+        if w < 2 or spread <= 0.01 * sx * sx:
+            return None
+        per_token = (w * sxy - sx * sy) / spread
+        fixed = max(0.0, (sy - per_token * sx) / w)
+        if per_token <= 0:
+            return float(self.max_tokens)
+        return max(self.target_ms - fixed, fixed) / per_token
+
+    def update(
+        self,
+        prefill_tokens: int,
+        decode_tokens: int,
+        budget_tokens: int,
+        elapsed_ms: float,
+    ) -> None:
+        if (
+            self.target_ms <= 0
+            or prefill_tokens <= 0
+            or decode_tokens <= 0
+            or not math.isfinite(elapsed_ms)
+            or elapsed_ms <= 0
+        ):
+            return
+        if self.gave_up:
+            return
+        # A tiny boundary/tail chunk is dominated by fixed decode overhead.
+        # It must not teach the controller that a full chunk is equally costly.
+        if prefill_tokens < budget_tokens * 0.75:
+            return
+        if prefill_tokens < self.min_sample_tokens:
+            return
+        # Unreachable-target guard: with the budget already clamped to a small
+        # fraction of max_tokens, a full-budget step that still blows past the
+        # target means the per-step fixed cost alone exceeds it — no chunk size
+        # can meet the target, and further shrinking only destroys TTFT.
+        # Give up and leave the chunk uncapped.
+        if elapsed_ms > self.target_ms and budget_tokens <= max(
+            self.max_tokens // 8, self.min_sample_tokens
+        ):
+            self._full_over_target += 1
+            if self._full_over_target >= 8:
+                self.gave_up = True
+                self.tokens = self.max_tokens
+                return
+        else:
+            self._full_over_target = 0
+        x, y = float(prefill_tokens), float(elapsed_ms)
+        w, sx, sy, sxx, sxy = (v * self.DECAY for v in self._fit)
+        self._fit = [w + 1, sx + x, sy + y, sxx + x * x, sxy + x * y]
+        cost = elapsed_ms / prefill_tokens
+        self.ms_per_token = (
+            cost if self.ms_per_token is None else 0.5 * self.ms_per_token + 0.5 * cost
+        )
+        affine = self._affine_budget()
+        if affine is not None:
+            desired = affine
+        elif self.ms_per_token is None:
+            return
+        else:
+            desired = self.target_ms / self.ms_per_token
+        quantum = min(16, self.max_tokens)
+        # Grow gradually, by at least one quantum so that a budget at the
+        # quantum can recover. React promptly to a long-context stall.
+        growth = 2.0
+        # Proportional damping: how much the budget may grow is bounded by
+        # how far under target the last full step actually ran. Step cost on
+        # this hardware is noisy (dense prefill routing vs the sparse
+        # per-step floor); without this, a run of cheap-looking small chunks
+        # catapults the budget into multi-second stalls. A 2x margin is
+        # required for a 2x jump, so the budget tracks evidence.
+        if elapsed_ms < self.target_ms:
+            growth = min(growth, self.target_ms / elapsed_ms)
+        desired = min(desired, max(self.tokens * growth, self.tokens + quantum))
+        self.tokens = max(
+            quantum,
+            self.min_tokens,
+            min(self.max_tokens, int(desired) // quantum * quantum),
+        )
+
+
+class MixedPrefillBudgetControl:
+    """Scheduler-facing collaborator: cap the prefill chunk, time the mixed
+    step on the forward stream, and feed resolved samples to the budget.
+
+    Keyed by ``batch.forward_iter`` because the overlap loop hands
+    ``process_batch_result`` a snapshot copy of the batch; the sample object
+    must not travel on it.
+    """
+
+    # Samples whose events are not ready at result-processing time wait here
+    # (bounded) and are retried on later results, like 1Cat's pending deque.
+    MAX_PENDING_STEPS = 8
+    MAX_INFLIGHT_STEPS = 16
+
+    def __init__(self, *, chunked_prefill_size: int, target_ms: float, min_tokens: int):
+        self.budget = MixedPrefillBudget(
+            max_tokens=chunked_prefill_size,
+            target_ms=target_ms,
+            min_tokens=min_tokens,
+        )
+        self._inflight: dict = {}
+        self._pending: deque = deque()
+        self._num_samples = 0
+        self._logged_give_up = False
+
+    def maybe_cap_chunked_prefill_size(
+        self,
+        chunked_prefill_size: Optional[int],
+        running_batch: ScheduleBatch,
+        waiting_queue: list,
+        chunked_reqs: list,
+        is_mixed_chunk: bool,
+    ) -> Optional[int]:
+        """Cap the pass chunk so the prefill part of a mixed step fits the
+        budget. Returns the (possibly unchanged) size, or None to keep the
+        caller's value untouched.
+
+        The gate mirrors the mix conditions in Scheduler.get_new_batch_prefill:
+        a pass that will not actually mix (logprob / beam / input-embeds
+        requests) must not inherit a capped chunk, because it would pay the
+        TTFT cost without producing a timing sample for the budget.
+        """
+        if (
+            chunked_prefill_size is None
+            or not is_mixed_chunk
+            or running_batch is None
+            or running_batch.is_empty()
+            or running_batch.return_logprob
+        ):
+            return None
+
+        def _unmixable(req: Req) -> bool:
+            return (
+                req.return_logprob
+                or req.beam_group is not None
+                or req.input_embeds is not None
+            )
+
+        if any(_unmixable(r) for r in running_batch.reqs):
+            return None
+        if any(_unmixable(r) for r in waiting_queue):
+            return None
+        if any(_unmixable(r) for r in chunked_reqs):
+            return None
+
+        num_mixed_decode = len(running_batch.reqs)
+        # PrefillAdder deducts the decode rows from rem_chunk_tokens; add them
+        # back so the prefill part lands on budget.tokens.
+        return min(chunked_prefill_size, self.budget.tokens + num_mixed_decode)
+
+    def begin_step(self, batch: ScheduleBatch) -> Optional[MixedPrefillStep]:
+        """Record the start event for a controlled mixed step. Must run on the
+        forward stream, right before the forward is enqueued."""
+        if not batch.forward_mode.is_mixed():
+            return None
+        decode_tokens = len(batch.decoding_reqs or ())
+        if decode_tokens <= 0:
+            return None
+        if len(self._inflight) >= self.MAX_INFLIGHT_STEPS:
+            self._inflight.clear()
+        step = MixedPrefillStep(
+            prefill_tokens=batch.extend_num_tokens - decode_tokens,
+            decode_tokens=decode_tokens,
+            budget_tokens=self.budget.tokens,
+            start_event=torch.cuda.Event(enable_timing=True),
+        )
+        step.start_event.record()
+        self._inflight[batch.forward_iter] = step
+        return step
+
+    def end_step(self, step: Optional[MixedPrefillStep]) -> None:
+        """Record the end event after the forward is enqueued."""
+        if step is not None:
+            step.end_event = torch.cuda.Event(enable_timing=True)
+            step.end_event.record()
+
+    def process_batch_result(self, batch: ScheduleBatch) -> None:
+        """Hand the step's sample to the budget once its events are ready."""
+        step = self._inflight.pop(batch.forward_iter, None)
+        if step is not None:
+            self._pending.append(step)
+            if len(self._pending) > self.MAX_PENDING_STEPS:
+                self._pending.popleft()
+        while self._pending and self._pending[0].try_resolve():
+            self._feed(self._pending.popleft())
+
+    def _feed(self, step: MixedPrefillStep) -> None:
+        before = self.budget.tokens
+        self.budget.update(
+            prefill_tokens=step.prefill_tokens,
+            decode_tokens=step.decode_tokens,
+            budget_tokens=step.budget_tokens,
+            elapsed_ms=step.elapsed_ms,
+        )
+        self._num_samples += 1
+        if self.budget.gave_up and not self._logged_give_up:
+            self._logged_give_up = True
+            logger.warning(
+                "Mixed prefill budget: target %.0fms is below the per-step "
+                "fixed cost (full-budget steps still take %.1fms at %d "
+                "tokens). Giving up; mixed steps run uncapped.",
+                self.budget.target_ms,
+                step.elapsed_ms,
+                step.prefill_tokens,
+            )
+            return
+        if self._num_samples <= 3 or self._num_samples % 50 == 0:
+            logger.info(
+                "Mixed prefill budget sample #%d: prefill=%d decode=%d "
+                "elapsed=%.1fms budget %d -> %d tokens (target=%.0fms)",
+                self._num_samples,
+                step.prefill_tokens,
+                step.decode_tokens,
+                step.elapsed_ms,
+                before,
+                self.budget.tokens,
+                self.budget.target_ms,
+            )
+        else:
+            logger.debug(
+                "Mixed prefill budget sample #%d: prefill=%d decode=%d "
+                "elapsed=%.1fms budget %d -> %d tokens",
+                self._num_samples,
+                step.prefill_tokens,
+                step.decode_tokens,
+                step.elapsed_ms,
+                before,
+                self.budget.tokens,
+            )

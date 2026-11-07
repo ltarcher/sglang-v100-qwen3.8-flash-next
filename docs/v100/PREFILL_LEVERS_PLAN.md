@@ -197,6 +197,64 @@ qwen_sparse_attn_backend.py:740(`end_blocks*ratio <= token_slot_table.shape[1]`)
 - QPN fragment 预排 decode GEMV(认命发射地板、打 DRAM 饱和):#37 账本
   wmma skinny dense 仅 20% 份额,低于 L2/L3,继续挂账。
 
+---
+
+## L4 立项:tier 卷绕区 prefill 分窗 staging + 双流预取
+
+立项 2026-11-08。打击面:KV host tier(Phase 3 直映射)开启时,"prefix 超出
+device 驻留窗"的 prefill 批次——516K 单流(S3 已验收形态)与未来 256K×2
+PAIR+tier(生产目标形态,PAIR 把 device 池砍半、卷绕更早发生)。原生 262k
+冷 prefill 全驻留(tier 仅 −2%),不在打击面内。
+
+### L4.1 现状病灶(Phase 3 读路径的三个结构弱点)
+
+S3 读 host 走 `_p3_gather_kernel` 逐行 UVA 直读(扩展 metadata 构建期),
+对照 1Cat `vllm/models/qwen4_exp/nvidia/qsa.py:1059-1237` + `host_kv.py:762,943`
+的窗式 staging:
+
+| | 我们 Phase 3 | 1Cat 窗式 staging |
+| --- | --- | --- |
+| DMA 粒度 | kernel 内逐行散读(延迟受限,跑不满 pinned 带宽) | 整窗连续 DMA(stage_plan 一次规划) |
+| 与计算关系 | H2D 等待串在 attention 关键路径 | side-stream 双缓冲预取下一窗藏进上一窗计算(stage_slots=2) |
+| 重复读 | 同一 host 页被多行选中则多次 UVA | 窗内每页至多搬一次,attention 读 device 副本 |
+| 规划 | 每层每步各自为政 | 每步每几何一次 host sync,全层共享计划 |
+
+1Cat 配套细节(移植时要一起看的):`write_staged` 让本步新写页直接进 stage
+buffer 不回读 host;超窗则分窗 online-softmax merge;计数器每 CTA 私有。
+
+### L4.2 收益与量级(诚实账)
+
+- 已知锚点:tier 关闭 262k 冷 prefill ≈1.8s/4k 批(2,238-2,301 tok/s);
+  S3 516K 卷绕区 ~3s/批(tier 开启后 +40%)——TTFT ~5 分钟里约 1 分钟量级
+  是 host 读税。窗式 staging+预取**上限**回收该罚金(516K TTFT −10~15%),
+  **下限**接近零(若那 1.2s/批主要是 mirror D2H 或调度空转)。
+- 收益口径:**只买 TTFT,不买 decode**(decode 本就 context-flat,
+  qwen38-pr6 记忆;1Cat 同理,其 "250K 仅慢 18%" 说法树内无出处,其 16GB
+  文档只证 262K 能完成不 OOM,TPOT 归因于 36 GDN O(1)+12 QSA O(2051)
+  的模型结构,不归因 host KV)。
+- 数值风险:零(同样字节先搬 device,attention 数学不变,验收退化为
+  位等价检查);新内核:零(纯 Python + copy 流调度)。
+
+### L4-0 前置测量(判据门,半天)
+
+独占机 boot,`torch.cuda.Event` 级探针测 `_p3_gather_kernel` 在卷绕区批次
+的时长占比(计数器 host_gather_rows/mirror_skips 已在,只缺计时):
+- **gather 占卷绕区批次 ≥25%** → L4-1 立项实现;
+- 否则封存本条(税不在 gather),工程量让给 L2/L3。
+
+### L4-1 实现(过 L4-0 后)
+
+改 `kv_host_tier.py`/后端调度层(fork 拥有区):每步每几何一次 host sync
+出窗计划 → 整窗 DMA 进定长 stage buffer → attention 读 device 副本 →
+side-stream 预取下一窗。stage buffer 预算见 §6.3 显存敏感环境(YaRN 判死
+记录:图后余量 3.23GB、warmup 需 2.1-2.4GB,新分配必须入账)。
+
+### L4.3 验收
+
+S2 矩阵全 rung 逐字命中(位级判据沿用 Phase 2/3)+ S3 516K 计时 A/B
+(TTFT 与卷绕区批次时长);生产形态 256K×2 PAIR+tier 落地时复测。
+开关走 `SGLANG_V100_KV_TIER_*` 现有命名族(environ.py 约定)。
+
 ## 6. 封存记录:L3-0(混批毒批修复,2026-11-07/08)
 
 **结论:`--enable-mixed-chunk` 在 Qwen3.8-Flash-Next(12×QSA + 36×GDN)上
@@ -238,3 +296,75 @@ chunk 全部混入 decode 尾行,0 scheduler 异常)。**
 - **遗留**:生产启用需在 compose/serve 注册 `--enable-mixed-chunk`(L3-1
   预算控制器落地时一并定参);`_original_forward_mode` 的 DSV4 paged 路径
   回退仅在有混批流量的 DSV4.1 部署里生效,当前 DSV4.1 生产未开混批,无影响。
+
+## 7. 封存记录:L3-1(自适应 mixed-prefill 预算控制器,2026-11-08)
+
+**结论:1Cat #860 的 `MixedPrefillBudget` 已移植进 sglang scheduler
+(`--enable-mixed-chunk` + `SGLANG_MIXED_PREFILL_STEP_LATENCY_MS=750`,
+均默认关闭)。混批 ladder(2 常驻 decode + 32k 入场,4×V100-SXM2 实测):
+resident 最长间隙 1.988 s → 1.080 s(−46%),代价入场 TTFT 19.5 → 22.5 s
+(+15%)、resident 流 18.5 → 16.3 tok/s;三臂回归全部带内。**
+
+- **交付物(4 文件)**:
+  - `python/sglang/srt/managers/scheduler_components/mixed_prefill_budget.py`
+    (新建,~330 行):`MixedPrefillStep`(CUDA event 对 + 非阻塞
+    `try_resolve`)与 1Cat 控制器(DECAY=0.75 衰减和拟合
+    `elapsed = fixed + per_token×tokens`,affine 预算
+    `max(target−fixed, fixed)/per_token`,固定成本地板、16-token 量化、
+    尾 chunk <75% 预算不入拟合);`MixedPrefillBudgetControl` 为
+    scheduler-facing collaborator(large-class-style,调度器只 wire +
+    delegate,零域逻辑进 Scheduler 本体)。
+  - `python/sglang/srt/environ.py`:`SGLANG_MIXED_PREFILL_STEP_LATENCY_MS`
+    (0 禁用)与 `SGLANG_MIXED_PREFILL_MIN_TOKENS`,按 env-var-conventions
+    登记;专家开关不设 CLI flag。
+  - `python/sglang/srt/managers/scheduler.py`:5 处最小接线(import、
+    `maybe_init_mixed_prefill_budget()`、`get_new_batch_prefill` 限幅、
+    `run_batch` 前后 event 记录、`process_batch_result` 回传)。
+  - `test/registered/unit/managers/test_mixed_prefill_budget.py`:21 例
+    CPU 单测(register_cpu_ci,base-a-test-cpu),覆盖种子/尾过滤/钳制/
+    阻尼/affine 拟合/give-up/生命周期 fake events。
+- **对 1Cat 原版的三处实质修正**(都是 V100 实测逼出来的,原版没有):
+  1. **小样本过滤** `min_sample_tokens = 2×min(16, max_tokens)`:V100
+     mixed 步固定成本 ~350-650 ms(QSA 稀疏 prefill 12 层×29.5 ms 地板
+     ≈354 ms),小于 ~32 token 的混合步 elapsed 全是噪声,拟合会把
+     per_token 拉向 0,预算塌缩(500ms 目标实测塌到 48-256 token/步,
+     prefill 200 tok/s)。
+  2. **不可达目标 give-up 安全阀**:目标低于固定成本地板时(连续 8 个
+     满预算样本超时且 budget ≤ max/8)放弃限幅并 WARNING。1Cat 的
+     250ms 在 V100 上不可达(地板 350ms+);750ms 是本机合理档。
+  3. **headroom 比例阻尼** `growth = min(2.0, target/elapsed)`:原版
+     无条件 `min(2×tokens, tokens+16)` 增长,在步成本高方差(同 512
+     token 实测 788 ms vs 353 ms)下小样本显得便宜 → 预算 192↔3840
+     弹射(resident gap_max 1.577 s),比不开限幅还差。阻尼后稳定在
+     ~1500-1600 token/步。
+- **timing 回传管道(本项目主要新工程量,§2.2 预判正确)**:sglang 无
+  worker→scheduler timing 通道,改为 scheduler 侧在 `run_batch` 的
+  forward enqueue 前后各 record 一个 CUDA event(forward stream 上,
+  elapsed 精确度量 forward 步);`process_batch_result` 收到的是
+  `batch.copy()`,样本不能挂 batch,`MixedPrefillBudgetControl._inflight`
+  按 `batch.forward_iter` 键存,MAX_INFLIGHT=16 / MAX_PENDING=8,
+  event 未 ready 的样本丢弃(非阻塞,调度器零等待)。
+- **预算语义**:限幅返回 `min(chunked_prefill_size, budget.tokens +
+  running_bs)`——`PrefillAdder.__init__` 会把混批 decode 行从
+  rem_chunk_tokens 扣掉,加回 running_bs 才能让 prefill 部分落在
+  budget.tokens。无 resident decode / 不可混合(logprob、beam、
+  input_embeds)时返回 None,常规大 chunk prefill 不受影响。
+- **验收门(§3)实测**(docker `sglang-v100-unified:latest`,TP4,
+  mixed-chunk on,预算 750 ms):
+  - smoke_v100 过。
+  - target 引擎:prefill 8k 2,766-2,780 tok/s(带 2,687-2,798);质量臂
+    3/3(数数 1-100 完整、链表反转、前缀缓存解释)不劣化。
+  - MTP 引擎(EAGLE 3/4):decode 95.4-113.9 tok/s(带 95-114);
+    prefill 8k 2,683-2,700 tok/s(带内);accept len 2.92(纯 decode 窗)/
+    2.98(混批 ladder 窗),均 ≥ 带 2.70-3.15,混批+预算对 accept 无回归。
+  - 混批 ladder:见结论行;混批步 ~2,000-2,100 tok/s,预算稳定
+    ~1500 token/步(MTP 窗 ~1470)。
+- **未决(不阻塞封存)**:复验期间出现一次 Scheduler watchdog timeout
+  300 s(上一轮 750ms 复验:最后一个 prefill chunk 完成后引擎静默,
+  5 min 后 watchdog 击杀全树)。同代码同负载复现 3 轮(target ladder ×2、
+  MTP ladder ×1)全部完整通过,py-spy 现场抓取能力已备好(容器需
+  `--cap-add=SYS_PTRACE` + 注入静态 py-spy)。按 1/4 发生率记为偶发
+  infra 疑点挂账;若复现,第一现场抓 TP0-TP3 py-spy dump。
+- **遗留**:生产默认仍关闭(mixed-chunk 与预算都 opt-in);启用即在
+  serve/compose 设 `SGLANG_MIXED_PREFILL_STEP_LATENCY_MS`(>0 自动附带
+  `--enable-mixed-chunk`,见 serve 脚本注释)。DSV4.1 未开混批,不适用。

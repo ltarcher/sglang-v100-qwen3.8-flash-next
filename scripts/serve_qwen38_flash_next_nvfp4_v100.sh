@@ -122,6 +122,17 @@ export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${SGLANG_HICACHE_FILE_BACKEND_ST
 # A file removed behind its back ends that prefetch early (the rest is
 # recomputed); it never yields wrong data.
 export SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE="${SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE:-1}"
+# Mixed-prefill budget (L3-1, docs/v100/PREFILL_LEVERS_PLAN.md §7, opt-in).
+# >0 enables mixed-chunk scheduling with an adaptive per-step prefill budget
+# targeting this many milliseconds per mixed step (auto-appends
+# --enable-mixed-chunk below). Trade on this box (2 resident decodes + 32k
+# entry, 2026-11-08): resident max gap 1.988 s -> 1.080 s (-46%), cost = entry
+# TTFT 19.5 -> 22.5 s (+15%) and resident streams 18.5 -> 16.3 tok/s. Floor:
+# a V100 mixed step has a ~350-650 ms fixed cost, so targets below that are
+# refused by the controller (it warns and runs uncapped); 750 ms is the
+# measured sweet spot. Default 0 = off (plain chunked prefill, longest
+# resident stalls during long prefills).
+export SGLANG_MIXED_PREFILL_STEP_LATENCY_MS="${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-0}"
 
 # Docker-v2 tested sizing (README: 4 live requests, full 262K context)
 args=(
@@ -330,6 +341,14 @@ if [[ "$MODE" == mtp ]]; then
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
   )
+fi
+
+# Mixed-chunk scheduling rides on the budget env (see the export block above):
+# setting SGLANG_MIXED_PREFILL_STEP_LATENCY_MS>0 is the single switch. The
+# scheduler's budget controller only arms when mixed chunk is on and overlap
+# is on, so the two are always paired here.
+if [[ "${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-0}" != 0 ]]; then
+  args+=(--enable-mixed-chunk)
 fi
 
 # Extra launch args appended at the end (space-separated); empty by default.

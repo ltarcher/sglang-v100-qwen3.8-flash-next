@@ -744,6 +744,17 @@ class Envs:
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
     SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    # Adaptive mixed-prefill budget (see
+    # managers/scheduler_components/mixed_prefill_budget.py). With
+    # --enable-mixed-chunk, a resident decode batch shares its forward step
+    # with prefill chunks; a full chunked_prefill_size chunk stalls the
+    # residents for the whole chunk. This target (in ms) caps the prefill
+    # chunk so a mixed step stays near it: the controller learns the token
+    # budget from completed GPU steps (CUDA events, no host sync). 0 disables.
+    # Port of 1Cat vLLM v1.5.2 mixed_prefill (Apache-2.0).
+    SGLANG_MIXED_PREFILL_STEP_LATENCY_MS = EnvFloat(0.0)
+    # Lower bound of the learned prefill token budget (0 = controller default).
+    SGLANG_MIXED_PREFILL_MIN_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
