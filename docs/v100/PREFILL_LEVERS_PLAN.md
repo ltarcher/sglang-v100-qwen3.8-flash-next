@@ -255,6 +255,95 @@ S2 矩阵全 rung 逐字命中(位级判据沿用 Phase 2/3)+ S3 516K 计时 A/B
 (TTFT 与卷绕区批次时长);生产形态 256K×2 PAIR+tier 落地时复测。
 开关走 `SGLANG_V100_KV_TIER_*` 现有命名族(environ.py 约定)。
 
+## L5 立项:retract → host page-out → 按页恢复(请求级 tier 转出)
+
+立项 2026-11-08。提高并发的第三条路(前两条:PAIR 去复制已落地;L3 让
+"装下了但不互相拖"已立项)。打击面:**max-running-requests 容量上限本身**——
+第 4/5 路入场时,现有 retract 把被逐请求的 KV 直接丢弃、恢复=整段重 prefill
+(128K ≈ 1 分钟);本杠杆把 retract 改造成"先 D2H 转出到 host、恢复按页 H2D"
+(128K ≈ 10-15s,PCIe 13.1 GB/s 实测带宽),并解除并发上限对"全驻留"的依赖。
+
+### L5.1 设计参照(ninfer HEAD 77c2e5e2 = github/master)
+
+借鉴其**活着的三件套**,不抄其已弃公式(历史教训记录在案):
+
+1. **请求级 snapshot/replay 恢复分级**(`engine_schedule.inl` preemption
+   victim;`context_cache/resource_manager.h:1500` paused snapshot):压力下
+   转出整个请求,恢复走 replay(少量重放)> snapshot(H2D 搬回)> root
+   prefill,按恢复成本选路。**纪律:只 page-out 恢复便宜的**。
+2. **可审计性**:每请求记录 pause/restore/recovery transitions 与 route
+   (snapshot vs replay vs null),决策质量可离线复盘(对照我们 tier Phase 3
+   只有 miss 阈值粗规则、无事后审计)。
+3. **预占 victim 选择**:scheduler 侧独立 `preemption_victim` 入口,策略可换。
+
+**明确不抄**:ninfer 重型 portfolio 估价(`Saving=Rebuild−Recovery` +
+LiveSession/RecentPrivate/Disposable 权重)——其作者在 b9114396(2026-10-04
+"replace context cache",删 5,408 行)已亲手弃用,现行只剩 `last_demand`
+128 请求窗口 + 增量 reclaim;不要按我方 2026-11-08 早先误引的 §8.3 公式立项。
+
+### L5.2 与现有设施的映射(零新基础设施)
+
+| ninfer 概念 | 我们已有的对应物 | L5 要做的 |
+| --- | --- | --- |
+| snapshot(转出) | Phase 1 镜像管道(`_host_final`,页级 fp16 host 权威) | retract 前 flush 镜像即完成(镜像本就 keeps-up,S3 已证) |
+| replay(重放) | radix 前缀缓存 + hicache host/disk 层 | 已有,恢复路径接回即用 |
+| snapshot 恢复(H2D) | Phase 2/3 页入(`_page_in_kernel`/P3 restore) | 从"活跃请求卷绕"扩到"被 retract 请求" |
+| StateImage(状态) | mamba 池 extra_buffer 策略 | GDN 态随 KV 同转出(需验证 mamba host 池支持) |
+| per-request 审计 | 无 | 加 pause/restore/route 计数器与 JSONL 事件 |
+
+### L5-0 前置判据(不开工条件,硬门)
+
+- **触发条件(满足其一)**:实测 4 并发下 retract 频率 >0(按 qwen38-pr6
+  记忆,现负载 retract=0,当前是空转杠杆);或业务目标并发 ≥5(l3budget
+  FULL 布局 4 并发为现形态上限,8110 compose PAIR 锁 3);或多会话切换负载
+  实测恢复等待占比显著。
+- **不触发则封存本条**——tier Phase 3 的"准入按常驻工作集"与 L3 已覆盖
+  现有 3-4 路的实际约束面。
+
+### L5-1 实现(过 L5-0 后)
+
+改 scheduler retract 路径 + `kv_host_tier.py`(fork 拥有区):retract 分级
+(先 page-out 后真丢)、恢复按页 H2D、GDN 态转出验证。scheduler 是冻结
+核心类,**开工前必读 large-class-style**;开关 `SGLANG_V100_KV_TIER_RETRACT_*`
+命名族;验收延用 S2 位级判据 + 新增 retract/restore 计数器审计。
+
+### L5.3 风险
+
+- mamba 线性注意力态的 host 转出/恢复位一致性(GDN 态非 KV,走 mamba 池
+  语义,extra_buffer 策略下行为需单独验证)。
+- MTP draft KV 与 target KV 的恢复原子性(半恢复请求不可进 decode)。
+- 恢复与 L3 混合 prefill 的调度交互:恢复期请求占不占混合预算,需定约。
+
+### L5.4 与 PAIR 约束的交互(2026-11-08 补,决定 L5 能买到多少并发)
+
+PAIR 硬约束分两层,常被混为一谈:
+
+- **物理层(不可消除)**:`device 池 ≥ logical/2`——PAIR 对拆后对家页靠
+  P2P 读**对家 device**,不是读 host;全局字节下限 = 逻辑 token 的一半 ×
+  12,288 B/tok/rank,任何调度层手段绕不开。
+- **准入层(可调度)**:4×256K 失败真因(compose 8110 :191-193)是 logical
+  524,288 tok 要求 device 池 ≥262,144 tok/rank = 6.0 GiB,激活余量 20 MiB
+  warmup OOM——"4 个请求的瞬时峰值都要满足约束"的问题,非约束本身不可满足。
+
+L5 的作用 = 把约束从"对 max-total-tokens 全体成立"弱化为**"对任一时刻的
+活跃请求集合成立"**:空闲会话(等工具结果/排队)page-out 后赎回其 device
+半池,新请求入场;恢复时按页 H2D 搬回、重新占住半池。等价表述:**并发能力
+= device 池能同时装的活跃请求 + host 镜像能装的所有请求**。按现有账
+(PAIR+tier 池 4.5 GB/rank @3 并发),4×256K 变为"3 活跃 + 1 转出等待"的
+可行形态;**纯 4 活跃仍不可行**。
+
+边界(诚实账):
+
+1. 单请求约束分文未减:任一活跃请求自己的 token 仍要求其 device 半池驻留
+   (对家页是 P2P 读 device)。256K×1 的最小 device 需求不变——L5 不帮
+   "单个请求更大"(那是 YaRN 判死记录 §6.3 的权衡组)。
+2. **恢复峰值双份问题**:恢复是只增不减的字节流,峰值容量 = 活跃请求 +
+   正在恢复的请求;若批量同时唤醒,峰值约束瞬间回到 4×。**L5-1 必须定
+   恢复限流/逐个唤醒策略**(恢复请求与活跃请求合计 ≤ device 池可容的
+   活跃数),并登记恢复完成事件供审计。
+3. 它赎回的只是"空闲会话"的占用:agent 形态(主会话等工具、子代理排队)
+   收益真实;4 个请求同时连续 decode 的吞吐型负载无处借力,4×256K 仍不可行。
+
 ## 6. 封存记录:L3-0(混批毒批修复,2026-11-07/08)
 
 **结论:`--enable-mixed-chunk` 在 Qwen3.8-Flash-Next(12×QSA + 36×GDN)上
@@ -359,12 +448,26 @@ resident 最长间隙 1.988 s → 1.080 s(−46%),代价入场 TTFT 19.5 → 22.
     2.98(混批 ladder 窗),均 ≥ 带 2.70-3.15,混批+预算对 accept 无回归。
   - 混批 ladder:见结论行;混批步 ~2,000-2,100 tok/s,预算稳定
     ~1500 token/步(MTP 窗 ~1470)。
-- **未决(不阻塞封存)**:复验期间出现一次 Scheduler watchdog timeout
-  300 s(上一轮 750ms 复验:最后一个 prefill chunk 完成后引擎静默,
-  5 min 后 watchdog 击杀全树)。同代码同负载复现 3 轮(target ladder ×2、
-  MTP ladder ×1)全部完整通过,py-spy 现场抓取能力已备好(容器需
-  `--cap-add=SYS_PTRACE` + 注入静态 py-spy)。按 1/4 发生率记为偶发
-  infra 疑点挂账;若复现,第一现场抓 TP0-TP3 py-spy dump。
+- **未决 → 已定位并修复(2026-11-08 深夜)**:复验期间两次 Scheduler/
+  NCCL watchdog 击杀,py-spy + NCCL flight-recorder 现场定位为**预算控制器
+  破坏了 TP 调度确定性**:sglang 每个 rank 独立跑 Scheduler,锁步依赖所有
+  调度输入跨 rank 位相同;原移植把本 rank CUDA event 计时喂进各 rank 自己
+  的控制器,微秒级计时差经 EWMA/affine 拟合放大成不同 rank 的 chunk cap
+  走向不同量化值 → 各 rank 调度出不同的 forward(decode verify vs
+  prefill)→ allreduce 形状不匹配 → 4 rank 全部 enqueue 同一 SeqNum 后
+  集体挂死。修复照抄本 fork `DynamicChunkSizer` 的既有先例:计时只在
+  leader(world rank 0)做,每个混合步完成时把 elapsed 经 CPU group
+  `broadcast_pyobj` 广播,所有 rank 用同一样本更新控制器(每个 ~750ms
+  混合步一次微广播,成本可忽略);leader 头部样本经 32 轮仍不 ready 则
+  全 rank 一致丢弃。单测新增 leader/follower 收敛与丢弃一致性 2 例
+  (共 23 绿)。
+- **完整 ladder 协议(§3.2,8k/32k/64k × flush 冷/warm 两轮 × 2 常驻,
+  MTP 引擎,修复后代码)**:两臂各跑完整 ladder 无死锁无分叉;resident
+  最长间隙 OFF 2.143 s → ON 0.822 s(−62%),gap_mean 0.335 → 0.322
+  (混合步节奏不变),warm 轮入场 TTFT 两者 1.3-3.7 s 带内,accept
+  OFF 2.805 / ON 2.92-2.98(带 2.70-3.15,不回退)。控制台 EMPTY 流为
+  客户端对 32-token 短生成 + MTP 的度量伪影(受控探针验证流式正常),
+  引擎侧全部请求正常完成。
 - **遗留**:生产默认仍关闭(mixed-chunk 与预算都 opt-in);启用即在
   serve/compose 设 `SGLANG_MIXED_PREFILL_STEP_LATENCY_MS`(>0 自动附带
   `--enable-mixed-chunk`,见 serve 脚本注释)。DSV4.1 未开混批,不适用。

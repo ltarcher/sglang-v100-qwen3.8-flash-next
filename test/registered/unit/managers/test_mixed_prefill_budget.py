@@ -383,5 +383,122 @@ class TestMixedPrefillBudgetControl(CustomTestCase):
         self.assertIsNone(control.begin_step(mixed_no_decode))
 
 
+class _FakeCpuGroup:
+    """One-slot mailbox shared by fake ranks, modeling the CPU-group
+    broadcast: src writes first, everyone else reads."""
+
+    def __init__(self):
+        self.box = {}
+
+
+def _fake_broadcast_pyobj(obj, rank, group, src=0):
+    if rank == src:
+        group.box["msg"] = obj
+        return obj
+    return group.box["msg"]
+
+
+class TestMixedPrefillBudgetControlRankSync(CustomTestCase):
+    """The controller must be rank-deterministic: a leader and a follower fed
+    the same batch sequence must converge to identical budgets, with the
+    sample measured once on the leader and shipped over the CPU group."""
+
+    def make_pair(self, target_ms=250.0):
+        group = _FakeCpuGroup()
+        leader = MixedPrefillBudgetControl(
+            chunked_prefill_size=4096,
+            target_ms=target_ms,
+            min_tokens=0,
+            world_group=SimpleNamespace(rank=0, cpu_group=group),
+        )
+        follower = MixedPrefillBudgetControl(
+            chunked_prefill_size=4096,
+            target_ms=target_ms,
+            min_tokens=0,
+            world_group=SimpleNamespace(rank=1, cpu_group=group),
+        )
+        return leader, follower
+
+    @staticmethod
+    def make_mixed_batch(forward_iter, extend_tokens):
+        return SimpleNamespace(
+            forward_mode=SimpleNamespace(is_mixed=lambda: True),
+            decoding_reqs=[object(), object()],
+            extend_num_tokens=extend_tokens,
+            forward_iter=forward_iter,
+        )
+
+    def drive_step(self, leader, follower, forward_iter, elapsed_ms, ready_after=0):
+        """Run one mixed step through both controllers, mirrored. When
+        elapsed_ms is None the leader's events stay unresolved for the call."""
+        event_cls = (
+            (lambda **kw: _FakeEvent(ready_after=10**9, **kw))
+            if elapsed_ms is None
+            else _FakeEvent
+        )
+        with patch("torch.cuda.Event", event_cls):
+            lstep = leader.begin_step(self.make_mixed_batch(forward_iter, 514))
+            fstep = follower.begin_step(self.make_mixed_batch(forward_iter, 514))
+            self.assertIsNotNone(lstep.start_event)
+            self.assertIsNone(fstep.start_event)  # followers never time
+            if elapsed_ms is not None:
+                lstep.start_event = _FakeEvent(
+                    ready_after=ready_after, elapsed_ms=elapsed_ms
+                )
+                lstep.end_event = _FakeEvent(
+                    ready_after=ready_after, elapsed_ms=elapsed_ms
+                )
+            leader.end_step(lstep)
+            follower.end_step(fstep)
+        leader.process_batch_result(SimpleNamespace(forward_iter=forward_iter))
+        follower.process_batch_result(SimpleNamespace(forward_iter=forward_iter))
+
+    def test_follower_converges_to_leader_budget(self):
+        leader, follower = self.make_pair()
+        with patch(
+            "sglang.srt.managers.scheduler_components.mixed_prefill_budget."
+            "broadcast_pyobj",
+            _fake_broadcast_pyobj,
+        ):
+            # Slow step shrinks both budgets, fast step grows them again.
+            self.drive_step(leader, follower, 1, elapsed_ms=1600.0)
+            self.drive_step(leader, follower, 2, elapsed_ms=80.0)
+            # Leader's events are not ready yet: both ranks keep the sample
+            # pending and stay in lockstep.
+            self.drive_step(leader, follower, 3, elapsed_ms=None)
+        self.assertEqual(leader.budget.tokens, follower.budget.tokens)
+        self.assertEqual(leader.budget._fit, follower.budget._fit)
+        self.assertLess(leader.budget.tokens, 512)
+        self.assertEqual(len(leader._pending), 1)
+        self.assertEqual(len(follower._pending), 1)
+
+    def test_unresolvable_head_is_discarded_identically(self):
+        leader, follower = self.make_pair()
+        with (
+            patch("torch.cuda.Event", _FakeEvent),
+            patch(
+                "sglang.srt.managers.scheduler_components.mixed_prefill_budget."
+                "broadcast_pyobj",
+                _fake_broadcast_pyobj,
+            ),
+        ):
+
+            def never_ready(ready_after=10**9, elapsed_ms=100.0, **kwargs):
+                return _FakeEvent(ready_after=ready_after, elapsed_ms=elapsed_ms)
+
+            with patch("torch.cuda.Event", never_ready):
+                lstep = leader.begin_step(self.make_mixed_batch(1, 514))
+                follower.begin_step(self.make_mixed_batch(1, 514))
+                leader.end_step(lstep)
+            for _ in range(leader.MAX_RESOLVE_ATTEMPTS):
+                leader.process_batch_result(SimpleNamespace(forward_iter=99))
+                follower.process_batch_result(SimpleNamespace(forward_iter=99))
+        # The stuck head is dropped on both ranks without feeding the fit.
+        self.assertEqual(len(leader._pending), 0)
+        self.assertEqual(len(follower._pending), 0)
+        self.assertEqual(leader.budget._fit, [0.0] * 5)
+        self.assertEqual(follower.budget._fit, [0.0] * 5)
+
+
 if __name__ == "__main__":
     unittest.main()

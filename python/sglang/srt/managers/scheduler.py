@@ -1468,6 +1468,7 @@ class Scheduler(
             chunked_prefill_size=self.chunked_prefill_size,
             target_ms=target_ms,
             min_tokens=envs.SGLANG_MIXED_PREFILL_MIN_TOKENS.get(),
+            world_group=get_parallel().world_group,
         )
         logger.info(
             "Mixed prefill budget controller on: target=%.0fms, seed=%d, max=%d tokens",

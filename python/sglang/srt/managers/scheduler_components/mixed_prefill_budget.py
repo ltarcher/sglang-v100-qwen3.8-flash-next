@@ -5,11 +5,17 @@ a latency target instead of stalling the residents for a whole chunk.
 Port of 1Cat vLLM v1.5.2 (Apache-2.0), PR #860:
 ``vllm/v1/core/sched/mixed_prefill.py`` (controller) and
 ``vllm/v1/worker/mixed_prefill.py`` (nonblocking GPU timing). The algorithm is
-kept as-is; the timing plumbing is sglang-shaped: the overlap scheduler records
-the two CUDA events around ``forward_batch_generation`` on the forward stream
-and resolves them non-blockingly when the batch result is processed one
-iteration later. A sample that is not ready yet is dropped from the fit —
-never synchronized on.
+kept as-is; the timing plumbing is sglang-shaped — and sglang-shaped means
+*rank-deterministic*: every TP/PP rank runs its own scheduler and they only
+stay in lockstep while every scheduling input is bit-identical across ranks.
+A per-rank CUDA-event timing is not (GPUs resolve events microseconds apart,
+and the quantized budget map amplifies that into divergent chunk caps —
+observed as TP ranks scheduling different forwards and hanging in allreduce).
+So exactly like DynamicChunkSizer, the timing is measured once on the leader
+(world rank 0) with two CUDA events around ``forward_batch_generation`` and
+broadcast over the CPU group; every rank feeds its local budget with the same
+sample, so all ranks converge to identical budgets. One tiny broadcast per
+completed mixed step (~750 ms apart) is free next to the step itself.
 
 Two 1Cat simplifications apply here:
 - sglang mixed steps always run eager (no extend CUDA graphs in this fork), so
@@ -25,21 +31,29 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
+# Broadcast protocol on the CPU group, one message per pending-head attempt:
+# None = head events not ready yet (retry later), float = resolved elapsed,
+# negative float = give up on this sample (do not feed it to the fit).
+_BROADCAST_DISCARD = -1.0
+
 
 @dataclass
 class MixedPrefillStep:
-    """One controlled mixed step, timed with two CUDA events on the forward
-    stream. ``try_resolve`` never blocks; an unresolved sample is discarded."""
+    """One controlled mixed step. On the leader it carries two CUDA events on
+    the forward stream; ``try_resolve`` never blocks. Followers create the
+    sample event-free and learn the elapsed from the leader's broadcast."""
 
     prefill_tokens: int
     decode_tokens: int
@@ -47,6 +61,7 @@ class MixedPrefillStep:
     start_event: Optional[object] = None
     end_event: Optional[object] = None
     elapsed_ms: Optional[float] = None
+    resolve_attempts: int = field(default=0)
 
     def try_resolve(self) -> bool:
         if self.elapsed_ms is not None:
@@ -187,28 +202,85 @@ class MixedPrefillBudget:
 
 class MixedPrefillBudgetControl:
     """Scheduler-facing collaborator: cap the prefill chunk, time the mixed
-    step on the forward stream, and feed resolved samples to the budget.
+    step on the forward stream (leader only), and feed the same resolved
+    sample to every rank's budget over the CPU group.
 
     Keyed by ``batch.forward_iter`` because the overlap loop hands
     ``process_batch_result`` a snapshot copy of the batch; the sample object
     must not travel on it.
+
+    Rank-determinism: every rank runs an identical controller driven by an
+    identical sample stream. The leader resolves the head-of-line sample from
+    its CUDA events; each ``process_batch_result`` call with a non-empty
+    pending queue exchanges exactly one broadcast (value, "not ready", or
+    "discard"), so followers pop/feed in lockstep with the leader. All other
+    state mutations (inflight eviction, pending overflow) are pure functions
+    of the identical batch sequence.
     """
 
     # Samples whose events are not ready at result-processing time wait here
     # (bounded) and are retried on later results, like 1Cat's pending deque.
     MAX_PENDING_STEPS = 8
     MAX_INFLIGHT_STEPS = 16
+    # Head-of-line guard: if the leader cannot resolve the oldest sample's
+    # events after this many result-processing rounds, drop it (identically
+    # on every rank) instead of stalling the sample stream forever.
+    MAX_RESOLVE_ATTEMPTS = 32
 
-    def __init__(self, *, chunked_prefill_size: int, target_ms: float, min_tokens: int):
+    def __init__(
+        self,
+        *,
+        chunked_prefill_size: int,
+        target_ms: float,
+        min_tokens: int,
+        world_group=None,
+    ):
         self.budget = MixedPrefillBudget(
             max_tokens=chunked_prefill_size,
             target_ms=target_ms,
             min_tokens=min_tokens,
         )
+        self._world_group = world_group
+        self._is_leader = world_group is None or world_group.rank == 0
         self._inflight: dict = {}
         self._pending: deque = deque()
         self._num_samples = 0
         self._logged_give_up = False
+
+    def _exchange_head_sample(self) -> Optional[float]:
+        """Resolve the pending head, leader-measured; return the elapsed the
+        rank must feed (None = keep the head pending, DISCARD = drop it).
+
+        The leader broadcasts its decision so every rank takes the same one;
+        callers on every rank either pop or keep the head alike.
+        """
+        head = self._pending[0]
+        if self._is_leader:
+            resolved = head.elapsed_ms if head.try_resolve() else None
+            if resolved is None:
+                head.resolve_attempts += 1
+                if head.resolve_attempts < self.MAX_RESOLVE_ATTEMPTS:
+                    decision = None
+                else:
+                    decision = _BROADCAST_DISCARD
+            else:
+                decision = resolved
+            if self._world_group is not None:
+                broadcast_pyobj(
+                    [decision],
+                    self._world_group.rank,
+                    self._world_group.cpu_group,
+                    src=0,
+                )
+        else:
+            (decision,) = broadcast_pyobj(
+                [None], self._world_group.rank, self._world_group.cpu_group, src=0
+            )
+        if decision is None:
+            return None
+        if decision <= 0:
+            return _BROADCAST_DISCARD
+        return decision
 
     def maybe_cap_chunked_prefill_size(
         self,
@@ -256,8 +328,9 @@ class MixedPrefillBudgetControl:
         return min(chunked_prefill_size, self.budget.tokens + num_mixed_decode)
 
     def begin_step(self, batch: ScheduleBatch) -> Optional[MixedPrefillStep]:
-        """Record the start event for a controlled mixed step. Must run on the
-        forward stream, right before the forward is enqueued."""
+        """Create the sample for a controlled mixed step. On the leader this
+        also records the start event; must run on the forward stream, right
+        before the forward is enqueued."""
         if not batch.forward_mode.is_mixed():
             return None
         decode_tokens = len(batch.decoding_reqs or ())
@@ -269,27 +342,39 @@ class MixedPrefillBudgetControl:
             prefill_tokens=batch.extend_num_tokens - decode_tokens,
             decode_tokens=decode_tokens,
             budget_tokens=self.budget.tokens,
-            start_event=torch.cuda.Event(enable_timing=True),
         )
-        step.start_event.record()
+        if self._is_leader:
+            step.start_event = torch.cuda.Event(enable_timing=True)
+            step.start_event.record()
         self._inflight[batch.forward_iter] = step
         return step
 
     def end_step(self, step: Optional[MixedPrefillStep]) -> None:
-        """Record the end event after the forward is enqueued."""
-        if step is not None:
+        """Record the end event after the forward is enqueued (leader only)."""
+        if step is not None and self._is_leader:
             step.end_event = torch.cuda.Event(enable_timing=True)
             step.end_event.record()
 
     def process_batch_result(self, batch: ScheduleBatch) -> None:
-        """Hand the step's sample to the budget once its events are ready."""
+        """Hand the step's sample to the budget once the leader resolves it.
+
+        At most one head-of-line exchange per call, in strict FIFO order, so
+        every rank keeps the same pending queue and the same sample stream.
+        """
         step = self._inflight.pop(batch.forward_iter, None)
         if step is not None:
             self._pending.append(step)
             if len(self._pending) > self.MAX_PENDING_STEPS:
                 self._pending.popleft()
-        while self._pending and self._pending[0].try_resolve():
-            self._feed(self._pending.popleft())
+        if not self._pending:
+            return
+        decision = self._exchange_head_sample()
+        if decision is None:
+            return
+        head = self._pending.popleft()
+        if decision != _BROADCAST_DISCARD:
+            head.elapsed_ms = decision
+            self._feed(head)
 
     def _feed(self, step: MixedPrefillStep) -> None:
         before = self.budget.tokens
@@ -300,6 +385,8 @@ class MixedPrefillBudgetControl:
             elapsed_ms=step.elapsed_ms,
         )
         self._num_samples += 1
+        if not self._is_leader:
+            return
         if self.budget.gave_up and not self._logged_give_up:
             self._logged_give_up = True
             logger.warning(
