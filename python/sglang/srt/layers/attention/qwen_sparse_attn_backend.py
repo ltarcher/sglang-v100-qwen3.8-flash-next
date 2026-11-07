@@ -718,6 +718,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         compress_ratio,
         row_token_starts=None,
         prefix_lens=None,
+        tail_rows=None,
     ):
         """Compressed-write plan for one forward, computed entirely on device.
 
@@ -731,6 +732,10 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         A group's compressed slot is its first raw slot // ratio (DSV4-style
         addressing over the page-aligned full-KV cache).
+
+        ``tail_rows`` (mixed-chunk batches) marks decode tails whose groups
+        have no in-chunk members: their ``member_rows`` entries get the -1
+        sentinel so the compressor sources them from the pending ring.
         """
         device = token_slot_table.device
         # The gathered token-slot table must cover every planned group. Its
@@ -765,7 +770,28 @@ class QwenSparseAttnBackend(AttentionBackend):
                 row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
+            if tail_rows is not None:
+                # Mixed decode-tail groups keep no member in the chunk; the
+                # -1 sentinel routes them to the pending ring. Padding
+                # entries (valid=False, rows forced to 0) stay 0.
+                member_rows = torch.where(valid & tail_rows[rows], -1, member_rows)
         return write_locs, group_end_positions, rows, member_rows
+
+    @staticmethod
+    def _mixed_tail_mask(sequence_lengths, extend_lens, compress_ratio):
+        """Rows of a mixed-chunk batch that are resident decode tails.
+
+        ``mix_with_running`` packs resident decode rows beside the chunk as
+        extend rows with one query token resuming at their own length
+        (prefix = length - 1, never a shared prefix), while prefill rows
+        carry page-granular shared prefixes that always cover whole groups.
+        So within a mixed batch the rows whose prefix is not ratio-aligned
+        are exactly the tails. Pure device arithmetic; the tail count never
+        crosses to the worker (resolve_forward_inputs consumes
+        mix_running_indices before metadata is built).
+        """
+        prefix_lens = (sequence_lengths.long() - extend_lens.long()).clamp_min(0)
+        return ~(prefix_lens % compress_ratio == 0)
 
     def _qsa_build_write_plan(
         self,
@@ -774,12 +800,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         speculative_paged: bool,
         token_slot_table,
         sequence_lengths,
+        mix_tails=None,
     ):
         """Plan the compressed writes for this forward, device-side only.
 
         Returns (write_locs, group_end_positions, sequence_ids). The only
         per-mode part is the block range each row owns, which is device
-        arithmetic over lengths the batch already carries.
+        arithmetic over lengths the batch already carries. ``mix_tails``
+        marks the trailing decode-tail rows of a mixed-chunk batch.
         """
         ratio = self.token_to_kv_pool.qsa_compress_ratio
         lengths = sequence_lengths.long()
@@ -802,8 +830,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = (lengths - extend_lens).clamp_min(0)
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
-        # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        # misaligned prefix would leave a shared group half-written. Mixed
+        # decode tails are exempt: they resume at their own length
+        # (prefix = length - 1), never share a prefix, and complete at most
+        # one group whose members come from the pending ring. The tail rows
+        # are derived by _mixed_tail_mask, so on mixed batches every row is
+        # either aligned or an exempt tail; on every non-mixed extend the
+        # alignment invariant is asserted strictly.
+        if mix_tails is None:
+            torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
@@ -816,6 +851,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_ratio=ratio,
             row_token_starts=row_token_starts,
             prefix_lens=prefix_lens,
+            tail_rows=mix_tails,
         )
 
     def _metadata_from_forward_batch(self, forward_batch) -> QwenSparseAttnMetadata:
@@ -884,6 +920,22 @@ class QwenSparseAttnBackend(AttentionBackend):
             num_position_tokens = (
                 positions.shape[-1] if positions.ndim == 2 else positions.numel()
             )
+            # Mixed-chunk decode tails: resident decode rows packed beside
+            # the chunk (see _mixed_tail_mask). The host-side flag only
+            # gates the ring-sourced compression pass. The eager runner
+            # rewrites MIXED to EXTEND before metadata init, so the mixed
+            # identity arrives via _original_forward_mode (see
+            # eager_runner.execute); NPU keeps the mode untouched.
+            num_mix_tails = 0
+            mix_tails = None
+            if (
+                forward_batch.forward_mode.is_mixed()
+                or original_mode == ForwardMode.MIXED
+            ):
+                num_mix_tails = 1
+                mix_tails = self._mixed_tail_mask(
+                    sequence_lengths, forward_batch.extend_seq_lens, self.compress_ratio
+                )
             if forward_batch.forward_mode.is_decode():
                 # Decode owns exactly one query row per request row.  Paged
                 # QSA metadata is per query row, so a different count means a
@@ -931,6 +983,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 speculative_paged=speculative_paged,
                 token_slot_table=token_slot_table,
                 sequence_lengths=sequence_lengths,
+                mix_tails=mix_tails,
             )
         )
         decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
@@ -964,6 +1017,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
+                tail_rows=mix_tails,
             )
             if write_locs.numel():
                 if group_member_rows is not None:
@@ -995,6 +1049,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_group_positions=group_positions,
             compress_sequence_ids=group_sequence_ids,
             compress_member_rows=group_member_rows,
+            mixed_chunk_tails=num_mix_tails > 0,
+            mix_tail_rows=mix_tails,
             decode_page_table=decode_page_table,
             decode_lengths=decode_lengths,
             decode_logical_positions=decode_logical_positions,

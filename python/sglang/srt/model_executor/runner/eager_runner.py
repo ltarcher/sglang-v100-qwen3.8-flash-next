@@ -261,7 +261,11 @@ class EagerRunner(BaseRunner):
         if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
             # A mixed batch is extend-shaped (decode tails are 1-token
             # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
-            # kernel; CP keeps it to skip the zigzag split.
+            # kernel; CP keeps it to skip the zigzag split. Record the
+            # original mode: attention backends build metadata before the
+            # model call and need to know the batch carries decode tails
+            # (e.g. the QSA mixed-chunk compression plan).
+            forward_batch._original_forward_mode = ForwardMode.MIXED
             forward_batch.forward_mode = ForwardMode.EXTEND
             mode = ForwardMode.EXTEND
         if mode.is_decode():

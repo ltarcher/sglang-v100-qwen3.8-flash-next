@@ -27,6 +27,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
 
@@ -286,6 +287,181 @@ class TestQsaExtendCompressPlan(CustomTestCase):
         torch.testing.assert_close(
             self.pool.compressed[slots[1]], token_k[RATIO : 2 * RATIO].mean(dim=0)
         )
+
+
+class TestQsaMixedChunkCompressPlan(CustomTestCase):
+    """Mixed-chunk batches: decode tails packed beside a prefill chunk.
+
+    ``mix_with_running`` converts resident decode rows into extend rows with
+    prefix ``seq_len - 1`` and one query token, which is not ratio-aligned.
+    Their completing group has no in-chunk members (the older tokens live in
+    the pending ring), so the plan must flag those groups and the compressor
+    must source them from the ring instead of the packed chunk.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.indexer = _make_indexer()
+        self.pool = _FakePool(num_slots=2048, num_compressed=2048)
+
+    def _mixed_plan(self, rows, num_tails):
+        """Run the real extend write plan over a mixed-shaped batch.
+
+        ``rows`` is [(prefix_len, extend_len), ...]; the last ``num_tails``
+        rows are decode tails. Row r takes raw slots from its own stride base
+        so compressed slots stay disjoint across rows.
+        """
+        backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+        backend.token_to_kv_pool = SimpleNamespace(qsa_compress_ratio=RATIO)
+        prefix_lens = torch.tensor([p for p, _ in rows])
+        extend_lens = torch.tensor([e for _, e in rows])
+        lengths = prefix_lens + extend_lens
+        table = torch.zeros(len(rows), int(lengths.max()), dtype=torch.int32)
+        for r, seq_len in enumerate(lengths.tolist()):
+            base = (r + 1) * SLOT_BASE_STRIDE
+            table[r, :seq_len] = torch.arange(base, base + seq_len, dtype=torch.int32)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            extend_seq_lens=extend_lens,
+            input_ids=torch.zeros(int(extend_lens.sum()), dtype=torch.int64),
+        )
+        mix_tails = QwenSparseAttnBackend._mixed_tail_mask(lengths, extend_lens, RATIO)
+        return backend._qsa_build_write_plan(
+            forward_batch=forward_batch,
+            speculative_paged=False,
+            token_slot_table=table,
+            sequence_lengths=lengths,
+            mix_tails=mix_tails,
+        )
+
+    def test_mixed_plan_accepts_unaligned_decode_tail(self):
+        """A tail whose prefix is not ratio-aligned must not trip the assert.
+
+        The tail (len 10, prefix 9) completes no group; only its length
+        arithmetic participates in the plan.
+        """
+        write_locs, group_positions, sequence_ids, member_rows = self._mixed_plan(
+            [(0, 8), (9, 1)], num_tails=1
+        )
+        # Prefill row completes blocks 0 and 1; the tail completes none.
+        self.assertEqual(int((member_rows >= 0).sum()), 4)
+        self.assertEqual(
+            member_rows.tolist(), [0, 4, 0, 0]
+        )  # two real groups + two padding entries
+        self.assertEqual(int(write_locs.numel()), 4)
+
+    def test_mixed_tail_completing_group_is_ring_sourced(self):
+        """A tail completing a group is flagged (member_rows == -1)."""
+        write_locs, group_positions, sequence_ids, member_rows = self._mixed_plan(
+            [(0, 8), (7, 1)], num_tails=1
+        )
+        # Prefill row: groups at blocks 0,1 (member rows 0 and 4). Tail row:
+        # one completing group at block 1 (positions 4-7), flagged for the
+        # pending ring. Last entry is capacity padding.
+        self.assertEqual(member_rows.tolist(), [0, 4, -1, 0])
+        # The tail group writes the compressed slot of raw slot base+4.
+        self.assertEqual(int(write_locs[2]), (2 * SLOT_BASE_STRIDE + 4) // RATIO)
+        self.assertEqual(int(group_positions[2]), 7)
+
+    def _mixed_metadata(self, rows, num_tails, plan):
+        write_locs, group_positions, sequence_ids, member_rows = plan
+        prefix_lens = torch.tensor([p for p, _ in rows])
+        extend_lens = torch.tensor([e for _, e in rows])
+        lengths = prefix_lens + extend_lens
+        table = torch.zeros(len(rows), int(lengths.max()), dtype=torch.int32)
+        for r, seq_len in enumerate(lengths.tolist()):
+            base = (r + 1) * SLOT_BASE_STRIDE
+            table[r, :seq_len] = torch.arange(base, base + seq_len, dtype=torch.int32)
+        token_to_batch_idx = torch.repeat_interleave(
+            torch.arange(len(rows)), extend_lens
+        )
+        return SimpleNamespace(
+            token_to_kv_pool=self.pool,
+            is_cuda_graph=False,
+            write_locs=write_locs,
+            compress_group_positions=group_positions,
+            compress_sequence_ids=sequence_ids,
+            compress_member_rows=member_rows,
+            mixed_chunk_tails=num_tails > 0,
+            mix_tail_rows=QwenSparseAttnBackend._mixed_tail_mask(
+                lengths, extend_lens, RATIO
+            ),
+            extend_rope_matrix=None,
+            token_slot_table=table,
+            sequence_lengths=lengths,
+            token_to_batch_idx=token_to_batch_idx,
+            req_pool_indices=torch.tensor([5, 9], dtype=torch.int64),
+        )
+
+    def test_mixed_tail_group_compresses_from_ring(self):
+        """The tail's completing group pools ring members plus its own token.
+
+        The tail request sits at req_pool row 9, so its ring slots are
+        36..39; positions 4-6 were stored by earlier decode steps and the
+        position-7 token must land in slot 39 during this forward's state
+        store.
+        """
+        rows = [(0, 8), (7, 1)]
+        plan = self._mixed_plan(rows, num_tails=1)
+        metadata = self._mixed_metadata(rows, num_tails=1, plan=plan)
+        tail_slot = (2 * SLOT_BASE_STRIDE + 4) // RATIO
+        # Row 0 (cold, 8-token chunk) completes blocks 0 and 1:
+        # slot = base//RATIO + block.
+        prefill_slot_0 = (1 * SLOT_BASE_STRIDE) // RATIO
+        prefill_slot_1 = prefill_slot_0 + 1
+        ring_members = torch.randn(3, 1, HEAD_DIM)
+        self.pool.key_state[36:39] = ring_members
+        # 8 chunk tokens at positions 0..7 plus the tail token at position 7.
+        token_k = torch.randn(9, 1, HEAD_DIM)
+        positions = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 7])
+        self.indexer.normalize_compressed_keys = lambda pooled, positions: pooled
+        self.indexer.update_key_state_and_compress(
+            token_k,
+            positions,
+            positions,
+            metadata,
+            state_stored=False,
+        )
+        written = self.pool.compressed.reshape(self.pool.compressed.shape[0], -1)
+        # Slot 0 is the reserved inert target of padding/tail entries; its
+        # content is don't-care (here the ring pass overwrites it with the
+        # zeroed scratch rows), so it is not in the expected set.
+        self.assertEqual(
+            written.count_nonzero(dim=1).nonzero().flatten().tolist(),
+            sorted([prefill_slot_0, prefill_slot_1, tail_slot]),
+        )
+        torch.testing.assert_close(
+            self.pool.compressed[tail_slot],
+            torch.cat([ring_members, token_k[8:9]]).mean(dim=0),
+        )
+        torch.testing.assert_close(
+            self.pool.compressed[prefill_slot_0], token_k[:4].mean(dim=0)
+        )
+        torch.testing.assert_close(
+            self.pool.compressed[prefill_slot_1], token_k[4:8].mean(dim=0)
+        )
+
+    def test_mixed_tail_token_lands_in_true_ring_slot(self):
+        """The tail's own token must not dump into the req-0 scratch region.
+
+        A completing group is compressed from the ring in the same forward,
+        so the newest member has to be readable at ``req * ratio + pos % ratio``.
+        """
+        from sglang.srt.layers.attention.qsa.metadata import build_pending_ring_slots
+
+        slots = build_pending_ring_slots(
+            token_to_batch_idx=torch.tensor([0, 0, 0, 0, 1]),
+            req_pool_indices=torch.tensor([5, 9], dtype=torch.int64),
+            sequence_lengths=torch.tensor([12, 8]),
+            logical_positions=torch.tensor([0, 1, 2, 3, 7]),
+            compress_ratio=RATIO,
+            is_extend=True,
+            tail_rows=torch.tensor([False, True]),
+        )
+        # Prefill tokens are non-pending chunk rows: scratch region [0, ratio).
+        self.assertEqual(slots[:4].tolist(), [0, 1, 2, 3])
+        # The tail token keeps its true ring slot (9*4 + 7%4 = 39).
+        self.assertEqual(int(slots[4]), 39)
 
 
 if __name__ == "__main__":

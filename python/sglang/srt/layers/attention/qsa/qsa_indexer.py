@@ -289,6 +289,7 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
             is_extend=is_extend,
+            tail_rows=getattr(metadata, "mix_tail_rows", None),
         )
 
     def _group_ring_slots(
@@ -300,6 +301,36 @@ class QSAIndexer(MultiPlatformOp):
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
         )
+
+    def _compress_store(
+        self,
+        pool,
+        source_keys: torch.Tensor,
+        source_rope: torch.Tensor,
+        group_locs: torch.Tensor,
+        write_locs: torch.Tensor,
+    ) -> None:
+        """One mean -> gemma norm -> MRoPE -> compressed-store pass.
+
+        Entries whose ``write_locs`` points at the reserved slot 0 stay
+        inert regardless of what their member window gathers.
+        """
+        if self._use_fused_compress(pool):
+            self._fused_compress_store(
+                pool,
+                group_locs,
+                write_locs,
+                source_keys=source_keys,
+                source_rope=source_rope,
+            )
+            return
+        key_groups = source_keys[group_locs]
+        pooled = average_pool_qsa_keys(key_groups)
+        compressed_rope_positions = self._rope_from_matrix(
+            source_rope[group_locs[:, 0]]
+        )
+        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        pool.set_qsa_compressed_k_buffer(self.layer_id, write_locs, normalized)
 
     def update_key_state_and_compress(
         self,
@@ -337,29 +368,9 @@ class QSAIndexer(MultiPlatformOp):
             )
         if metadata.write_locs.numel() == 0:
             return
-        if is_extend and token_k.shape[0] < self.compress_ratio:
-            # A chunk shorter than one group completes none (prefixes are
-            # ratio-aligned), so every entry here is capacity padding, whose
-            # member window -- rows [0, ratio) of the chunk -- overruns it.
-            return
         group_end_positions = metadata.compress_group_positions.long()
         compressed_locs = metadata.write_locs
-        if is_extend:
-            # Extend chunks are group-aligned, so every member of every
-            # planned group is a token of THIS forward: source the members
-            # from the packed chunk tensors directly (no cache round trip).
-            member_rows = metadata.compress_member_rows.long()
-            group_locs = member_rows[:, None] + torch.arange(
-                self.compress_ratio, device=member_rows.device, dtype=torch.long
-            )
-            source_keys = token_k
-            group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
-            source_rope = metadata.extend_rope_matrix
-            if source_rope is None:
-                source_rope = build_rope_position_matrix(
-                    rope_positions, token_k.shape[0]
-                )
-        else:
+        if not is_extend:
             # Paged eager rows (speculative fallback) complete at most one
             # group each; its members are exactly the pending ring window.
             group_locs = metadata.compress_group_ring_locs
@@ -369,24 +380,75 @@ class QSAIndexer(MultiPlatformOp):
                     group_end_positions,
                     metadata.compress_sequence_ids.long(),
                 )
-            source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
-            source_rope = pool.qsa_rope_position_buffer
-        if self._use_fused_compress(pool):
-            self._fused_compress_store(
+            self._compress_store(
                 pool,
+                pool.get_qsa_key_state_buffer(self.layer_id),
+                pool.qsa_rope_position_buffer,
                 group_locs,
                 compressed_locs,
-                source_keys=source_keys,
-                source_rope=source_rope,
             )
             return
-        key_groups = source_keys[group_locs]
-        pooled = average_pool_qsa_keys(key_groups)
-        compressed_rope_positions = self._rope_from_matrix(
-            source_rope[group_locs[:, 0]]
+        # Extend chunk, possibly mixed with decode tails (mixed-chunk
+        # batches). Tail groups carry the -1 member sentinel: they have no
+        # in-chunk members (the tail resumes at its own length), so they are
+        # sourced from the pending ring in a second pass.
+        member_rows = metadata.compress_member_rows.long()
+        ring_mask = member_rows < 0
+        group_locs = member_rows[:, None] + torch.arange(
+            self.compress_ratio, device=member_rows.device, dtype=torch.long
         )
-        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
-        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+        # The clamp keeps the -1 sentinels and capacity-padding windows
+        # (rows past a short chunk) inside the source; such entries only
+        # ever reach the reserved inert slot 0.
+        group_locs = group_locs.clamp(0, token_k.shape[0] - 1)
+        num_tails = 1 if getattr(metadata, "mixed_chunk_tails", False) else 0
+        if num_tails == 0:
+            if token_k.shape[0] < self.compress_ratio:
+                # A chunk shorter than one group completes none (prefixes are
+                # ratio-aligned), so every entry here is capacity padding,
+                # whose member window -- rows [0, ratio) of the chunk --
+                # overruns it.
+                return
+            source_rope = metadata.extend_rope_matrix
+            if source_rope is None:
+                source_rope = build_rope_position_matrix(
+                    rope_positions, token_k.shape[0]
+                )
+            self._compress_store(
+                pool, token_k, source_rope, group_locs, compressed_locs
+            )
+            return
+        # Mixed: pass 1 compresses the chunk's own groups (tail entries write
+        # the reserved slot 0); pass 2 compresses the tails' completing
+        # groups from the pending ring (chunk entries write slot 0). Two
+        # full-capacity passes keep every shape static and sync-free.
+        if token_k.shape[0] >= self.compress_ratio:
+            source_rope = metadata.extend_rope_matrix
+            if source_rope is None:
+                source_rope = build_rope_position_matrix(
+                    rope_positions, token_k.shape[0]
+                )
+            chunk_write_locs = torch.where(
+                ring_mask, torch.zeros_like(compressed_locs), compressed_locs
+            )
+            self._compress_store(
+                pool, token_k, source_rope, group_locs, chunk_write_locs
+            )
+        ring_group_locs = self._group_ring_slots(
+            metadata,
+            group_end_positions,
+            metadata.compress_sequence_ids.long(),
+        )
+        ring_write_locs = torch.where(
+            ring_mask, compressed_locs, torch.zeros_like(compressed_locs)
+        )
+        self._compress_store(
+            pool,
+            pool.get_qsa_key_state_buffer(self.layer_id),
+            pool.qsa_rope_position_buffer,
+            ring_group_locs,
+            ring_write_locs,
+        )
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
         """Run a fixed-shape compression step; non-boundaries write slot zero.
