@@ -188,6 +188,12 @@ GLM 线:分组被 smem 判死、planner 被 round-2 判死 → 本立项书范�
 > 长 prefill 一次性付出 ~10 个 bucket 编译(实测 47-257s);缓存落在
 > sglang-v100-jit 卷后跨重启复用(157 目录/115M,跨臂实测仍有 ~1-2 个
 > bucket 重编,~18s)。生产启用需评估该首条成本,或预编译常见 bucket。
+>
+> **生产启用(2026-11-08)**:8110 compose(docker-compose-sglang-v100-mtp-8110.yaml)
+> 已设 `SGLANG_SM70_QSA_GROUPED_PREFILL: "1"`;连带影响已在该文件标注——
+> L3-1 mixed-prefill 预算的固定成本地板(350-650ms)按 Triton 核
+> (×29.5ms)标定,grouped 后每 chunk 稀疏开销 ~16.6ms,750ms 甜点档待
+> 按 §2 ladder 重标。
 
 ### 1.4 风险与坑清单
 
