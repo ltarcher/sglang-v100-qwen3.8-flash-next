@@ -1468,6 +1468,11 @@ class Scheduler(
             chunked_prefill_size=self.chunked_prefill_size,
             target_ms=target_ms,
             min_tokens=envs.SGLANG_MIXED_PREFILL_MIN_TOKENS.get(),
+            # Page-aligned budget keeps every chunk boundary on the KV pool's
+            # page granularity (see MixedPrefillBudget.align): the QSA write
+            # plan asserts prefix_lens % compress_ratio == 0 for non-mixed
+            # extends, and an arbitrary learned cap breaks that invariant.
+            align=self.page_size,
             world_group=get_parallel().world_group,
         )
         logger.info(

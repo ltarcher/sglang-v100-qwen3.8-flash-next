@@ -40,9 +40,12 @@ class _FakeEvent:
 
 
 class TestMixedPrefillBudget(CustomTestCase):
-    def make_budget(self, target_ms=250.0, max_tokens=4096, min_tokens=0):
+    def make_budget(self, target_ms=250.0, max_tokens=4096, min_tokens=0, align=1):
         return MixedPrefillBudget(
-            max_tokens=max_tokens, target_ms=target_ms, min_tokens=min_tokens
+            max_tokens=max_tokens,
+            target_ms=target_ms,
+            min_tokens=min_tokens,
+            align=align,
         )
 
     def test_seed_budget(self):
@@ -221,6 +224,52 @@ class TestMixedPrefillBudget(CustomTestCase):
         )
         self.assertEqual(budget.tokens, 1024)
 
+    def test_page_aligned_budget_stays_aligned(self):
+        # Regression (QSA crash): the cap handed to PrefillAdder must stay on
+        # the KV pool's page granularity — the QSA compress write plan asserts
+        # prefix_lens % compress_ratio == 0 for non-mixed extends, and an
+        # arbitrary learned cap leaks misaligned chunk boundaries through the
+        # adder's fallback paths.
+        # Three identical slow samples converge to 336: %16 (passes the
+        # quantum) but a half-page boundary under page=64.
+        unaligned = self.make_budget(target_ms=100.0, max_tokens=8192)
+        aligned = self.make_budget(target_ms=100.0, max_tokens=8192, align=64)
+        for _ in range(3):
+            unaligned.update(1024, 2, 1024, 300.0)
+            aligned.update(1024, 2, 1024, 300.0)
+        self.assertEqual(unaligned.tokens, 336)
+        self.assertEqual(aligned.tokens, 320)
+        # Every subsequent sample keeps the alignment, whatever the fit says.
+        for elapsed in (150.0, 90.0, 40.0, 200.0):
+            aligned.update(
+                prefill_tokens=aligned.tokens,
+                decode_tokens=2,
+                budget_tokens=aligned.tokens,
+                elapsed_ms=elapsed,
+            )
+            self.assertEqual(aligned.tokens % 64, 0)
+            self.assertGreaterEqual(aligned.tokens, 64)
+
+    def test_give_up_budget_is_page_aligned(self):
+        # max_tokens=4000 is not a page multiple: the uncapped fallback must
+        # still hand over a page-aligned chunk.
+        budget = self.make_budget(target_ms=250.0, max_tokens=4000, align=64)
+        for _ in range(8):
+            budget.update(
+                prefill_tokens=64,
+                decode_tokens=2,
+                budget_tokens=64,
+                elapsed_ms=400.0,
+            )
+        self.assertTrue(budget.gave_up)
+        self.assertEqual(budget.tokens, 4000 // 64 * 64)
+
+    def test_align_clamped_to_max_tokens(self):
+        # A page larger than the whole chunk budget degrades gracefully.
+        budget = self.make_budget(target_ms=250.0, max_tokens=32, align=64)
+        self.assertEqual(budget.align, 32)
+        self.assertEqual(budget.tokens, 32)
+
 
 class TestMixedPrefillBudgetControl(CustomTestCase):
     def make_control(self, target_ms=250.0):
@@ -332,6 +381,25 @@ class TestMixedPrefillBudgetControl(CustomTestCase):
         )
         self.assertEqual(capped, control.budget.tokens + 2)
         self.assertLess(capped, 4096)
+
+    def test_control_plumbs_page_alignment(self):
+        # The scheduler must hand its page_size down: with align=64 every
+        # capped chunk boundary stays page-granular (QSA prefix invariant).
+        control = MixedPrefillBudgetControl(
+            chunked_prefill_size=4096, target_ms=250.0, min_tokens=0, align=64
+        )
+        self.assertEqual(control.budget.align, 64)
+        running = SimpleNamespace(
+            is_empty=lambda: False,
+            return_logprob=False,
+            reqs=[self.make_req() for _ in range(2)],
+        )
+        control.budget.update(4096, 2, 4096, 1600)
+        capped = control.maybe_cap_chunked_prefill_size(
+            4096, running, [], [], is_mixed_chunk=True
+        )
+        self.assertEqual(capped, control.budget.tokens + 2)
+        self.assertEqual(control.budget.tokens % 64, 0)
 
     def test_step_lifecycle_with_fake_events(self):
         control = self.make_control()

@@ -85,11 +85,27 @@ class MixedPrefillBudget:
     # Weight of earlier samples in the step-cost fit.
     DECAY = 0.75
 
-    def __init__(self, max_tokens: int, target_ms: float, min_tokens: int = 0) -> None:
+    def __init__(
+        self,
+        max_tokens: int,
+        target_ms: float,
+        min_tokens: int = 0,
+        align: int = 1,
+    ) -> None:
         self.max_tokens = max_tokens
         self.target_ms = target_ms
         self.min_tokens = min(min_tokens, max_tokens)
-        self.tokens = max(min(512, max_tokens), self.min_tokens)
+        # Budget tokens must land on ``align`` multiples: the KV pool's page
+        # granularity is the alignment anchor of every chunk boundary (the QSA
+        # compress write plan asserts prefix_lens % compress_ratio == 0 and
+        # page_size % compress_ratio == 0, so page-aligned caps keep every
+        # non-final chunk of a request ratio-aligned). The legacy uncapped
+        # path only ever handed over the chunked_prefill_size, which is
+        # page-aligned; an arbitrary learned budget would break that.
+        self.align = max(1, min(align, max_tokens))
+        self.tokens = self._align(
+            max(min(512, max_tokens), self.min_tokens, self.align)
+        )
         self.ms_per_token: Optional[float] = None
         # Steps whose prefill part is below this contribute no fit sample: at
         # that size the step cost is the per-step fixed overhead (kernel
@@ -102,6 +118,11 @@ class MixedPrefillBudget:
         # Unreachable-target detection: see update().
         self.gave_up = False
         self._full_over_target = 0
+
+    def _align(self, tokens: int) -> int:
+        """Floor to the page alignment, never below one aligned chunk."""
+        floored = tokens // self.align * self.align
+        return max(floored, self.align)
 
     def _affine_budget(self) -> Optional[float]:
         """Budget from the fixed-plus-linear step cost, once chunks differ.
@@ -162,7 +183,7 @@ class MixedPrefillBudget:
             self._full_over_target += 1
             if self._full_over_target >= 8:
                 self.gave_up = True
-                self.tokens = self.max_tokens
+                self.tokens = self._align(self.max_tokens)
                 return
         else:
             self._full_over_target = 0
@@ -193,10 +214,13 @@ class MixedPrefillBudget:
         if elapsed_ms < self.target_ms:
             growth = min(growth, self.target_ms / elapsed_ms)
         desired = min(desired, max(self.tokens * growth, self.tokens + quantum))
-        self.tokens = max(
-            quantum,
-            self.min_tokens,
-            min(self.max_tokens, int(desired) // quantum * quantum),
+        self.tokens = self._align(
+            max(
+                quantum,
+                self.min_tokens,
+                self.align,
+                min(self.max_tokens, int(desired) // quantum * quantum),
+            )
         )
 
 
@@ -233,12 +257,14 @@ class MixedPrefillBudgetControl:
         chunked_prefill_size: int,
         target_ms: float,
         min_tokens: int,
+        align: int = 1,
         world_group=None,
     ):
         self.budget = MixedPrefillBudget(
             max_tokens=chunked_prefill_size,
             target_ms=target_ms,
             min_tokens=min_tokens,
+            align=align,
         )
         self._world_group = world_group
         self._is_leader = world_group is None or world_group.rank == 0
