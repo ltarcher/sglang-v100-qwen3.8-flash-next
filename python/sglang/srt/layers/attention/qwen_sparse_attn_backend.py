@@ -2448,6 +2448,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         """
         if is_in_breakable_cuda_graph():
             return None
+        # Mixed-chunk batches carry decode tails whose topk layout appends
+        # gap-capture columns and remaps tail rows (see _tail_offsets /
+        # tail_rows handling above); the grouped planner assumes the uniform
+        # valid-first -1-padding layout of pure extend rows and would corrupt
+        # tail outputs -- keep those batches on the Triton path.
+        if forward_batch.forward_mode == ForwardMode.MIXED:
+            return None
         R = q.shape[0]
         if not (
             forward_batch.forward_mode.is_extend()
