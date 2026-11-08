@@ -1,6 +1,6 @@
 # PREFILL 杠杆立项书(L2 / L3)
 
-立项日期:2026-11-07。状态:**L2-a spike 完成(2026-11-08,裁定 TileLang 产线,L2-b 待开工);L3 已上线**。开工前先读本文对应节的门槛与坑。
+立项日期:2026-11-07。状态:**L2-a spike + L2-b 产线完成(2026-11-08,L2-b 实测 e2e +13~18%,开关默认关);L3 已上线**。开工前先读本文对应节的门槛与坑。
 
 来源:1Cat-vLLM v1.5.2 逆向分析(HEAD c98a8d664,PR #387/#666/#860/#754 全部在 tag 内;
 Apache-2.0/BSD-3/MIT 许可,可借设计与源码)。逆向全账见记忆
@@ -140,6 +140,54 @@ CUDA graph。(3) occupancy 调优轴:BI=32 + 2 CTA/SM(撞 FullCol ≥16 列
 约束,需 64 线程形态验证)或 M=48 拆分,目标 25T+。(4) 验收走 §3 全套门。
 GLM 线:分组被 smem 判死、planner 被 round-2 判死 → 本立项书范围内**不动**;
 若要动,另立 CUDA 立项。
+
+> **L2-b 实测结果(2026-11-08,4×V100-32GB PCIe,容器;开关
+> `SGLANG_SM70_QSA_GROUPED_PREFILL`,默认关,eager prefill only)**:
+> 实现 = `_kernels_grouped_sparse_prefill.py`(TileLang 分组核 + sort-based
+> GPU planner)+ `qwen_sparse_attn_backend.py` 接线(batched_plan 之后、
+> packed gather 之前,ineligible 时原路 fall through)。
+>
+> **与原工程项的三处偏差(均有 A/B 证据)**:
+> 1. **并集索引直读池,不做稠密 panel 物理化**:V1g 间接读 5.88-6.32ms vs
+>    V1 稠密物化 6.06-6.09ms,输出逐位一致——间接化零开销,省 ~2.4GB/发
+>    往返。(2) 项"graph-capturable"未做:Qwen 生产 prefill 图本就 disabled
+>    (`--cuda-graph-backend-prefill disabled`),且 breakable-graph 路径显式
+>    返回 None 走 Triton;(3) 项 occupancy 调优未开(见后续轴)。
+> 2. **planner 每层每 chunk 必跑,不可按 forward 缓存**:实测确认每个全注意
+>    力层各自跑 indexer(qwen4_exp.py 层内 `layer_id % interval == 0` 分支),
+>    topk_indices 逐层不同;冷 64k = 17 chunk × 12 层 = 208 次。
+> 3. **planner 有一次 scalar readback**(max union length → U_pad bucket),
+>    非"无 host sync"严格形态;eager-only 下与 chunk 间串行无重叠
+>    (side-stream 跨层重叠被 indexer L+1 依赖判死)。
+>
+> **planner 成本(单卡实测,产线形状 R=4096/topk=2048)**:int32 全链
+> (key=(group_slot<<20)|logical,sort→cumsum→u_rank→index_add_ 散射)
+> ~10.65ms/发,其中 sort 1.8ms + elementwise 链 ~3.5ms + index_add_ 2.6ms
+> + readback sync;index_put_ 形态实测 17.7ms 已弃用。**fused CUDA/Triton
+> planner(smem 内 per-group 排序去重,1Cat 口径 +0.362ms/发)是补齐窗口的
+> 后续优化轴**。
+>
+> **4 卡 A/B(同机同配置,仅开关不同,每臂 3-6 次)**:
+>
+> | 指标 | baseline(Triton) | grouped(本项) |
+> | --- | ---: | ---: |
+> | 冷 65,601-token prefill e2e | 28.78-29.83s(中位 28.96) | 24.06-27.11s(中位 25.2) |
+> | 冷 prefill 吞吐 | 2,199-2,280 tok/s | 2,420-2,727 tok/s |
+> | warm 8k prefill | 3.71s(2,214 tok/s) | 3.62s(2,265 tok/s) |
+> | decode 256 tok(MTP on) | 68.3 tok/s | 69.0 tok/s |
+> | 前缀缓存门(同 prompt 二发) | — | cached 65,600 tok,0.79s,输出与全量 prefill 逐位一致 |
+>
+> **判读**:e2e **+13~18%**(低于 §1.1 预期 +23~28% 下沿——差额即 planner
+> ~10.65ms/发 × 208 发 ≈ 2.2s 的账,fused planner 后续轴可回收;核侧 6.2×
+> 与 L2-a 一致)。三臂回归带内:decode/2k 上下文输出与 baseline 逐位一致;
+> ≥4k 上下文 temp-0 出现零星首 token argmax 翻转(两臂输出均连贯、语义
+> 等价,与离线 oracle max|Δ| 3e-5~5e-4 的 fp16 舍入包络一致,判读为内核
+> 归约序差异的非比特等价签名,非正确性问题)。
+>
+> **运维注意**:TileLang 按核形状(U_pad bucket,512 步长)JIT,冷缓存首条
+> 长 prefill 一次性付出 ~10 个 bucket 编译(实测 47-257s);缓存落在
+> sglang-v100-jit 卷后跨重启复用(157 目录/115M,跨臂实测仍有 ~1-2 个
+> bucket 重编,~18s)。生产启用需评估该首条成本,或预编译常见 bucket。
 
 ### 1.4 风险与坑清单
 

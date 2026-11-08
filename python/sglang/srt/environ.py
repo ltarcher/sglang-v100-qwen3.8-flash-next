@@ -1564,6 +1564,14 @@ class Envs:
     SGLANG_SM70_MTP_GDN = EnvBool(True)
     SGLANG_SM70_QSA_COMBINE = EnvBool(True)
     SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH = EnvBool(True)
+    # Route QSA chunked prefill with a prefix through the grouped TileLang
+    # kernel (8-row union panels read straight from the fp16 token pool,
+    # tilelang_fa_v100._kernels_grouped_sparse_prefill) instead of the packed
+    # gather + Triton FMA path. L2-b: ~6x on the sparse-attention kernel
+    # (35.7 -> ~5.9 ms/launch at the 4k TP4 shape); pays one planner pass
+    # (~10.7 ms measured, one scalar readback) per layer per chunk. Eager
+    # prefill only.
+    SGLANG_SM70_QSA_GROUPED_PREFILL = EnvBool(False)
     # Dequantize FP8 block-128 routed experts to FP16 at load when the TP shard
     # is not a block multiple (e.g. moe_intermediate 640 at TP4 = 160 columns,
     # the Qwen3.8 MTP draft layer) and run the TurboMind FP16 MoE kernels.

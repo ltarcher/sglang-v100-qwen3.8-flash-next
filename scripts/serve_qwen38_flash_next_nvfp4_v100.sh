@@ -97,6 +97,20 @@ export SGLANG_SM70_FORCE_FP16=1
 export SGLANG_SM70_DENSE_GEMV=1
 export SGLANG_SM70_QWEN_FUSIONS=1
 export SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192
+# Grouped sparse chunk-prefill (L2-b, docs/v100/PREFILL_LEVERS_PLAN.md §1.3,
+# opt-in; default 0 = the packed Triton FMA path). Replaces the packed
+# full-context gather + per-row Triton kernel (35.7 ms/launch, 1.44 TFLOP/s)
+# with a grouped TileLang WMMA kernel that reads K/V straight from the fp16
+# token pool through a per-group sorted top-k union (20 TFLOP/s, 6.2x at
+# kernel level); a sort-based GPU planner (~10 ms/launch, one scalar readback)
+# rebuilds the union per layer per chunk. Measured (2026-11-08, 4x V100 PCIe,
+# MTP on, identical config both arms): cold 65,601-token prefill 29.0 -> 25.2 s
+# median (+13-18%); decode / warm 8k prefill / prefix-cache arms unchanged.
+# Caveats: eager prefill only (the breakable-graph path keeps Triton); the
+# first long prefill on a cold TileLang cache compiles one kernel per
+# panel-width bucket (~1-4 min one-time, cached under the sglang-v100-jit
+# volume when composed as in docker-compose-sglang-v100-mtp-8110.yaml).
+export SGLANG_SM70_QSA_GROUPED_PREFILL="${SGLANG_SM70_QSA_GROUPED_PREFILL:-0}"
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_NUMA_BIND_V2=0
 # Image preprocessing runs in the launcher on cuda:0 next to the static pool;

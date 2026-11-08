@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -426,6 +427,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._sm70_dense_decode_logged = False
         self._sm70_sparse_prefill_logged = False
         self._sm70_sparse_decode_logged = False
+        self._sm70_grouped_prefill_logged = False
         self._verify_mask = None
 
     @staticmethod
@@ -2123,6 +2125,18 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
             return self._pad_extend_output(output, num_output_rows)
+        if envs.SGLANG_SM70_QSA_GROUPED_PREFILL.get():
+            grouped = self._forward_sm70_grouped_sparse_prefill(
+                q,
+                k_buffer,
+                v_buffer,
+                forward_batch,
+                topk_indices,
+                cu_seqlens_q,
+                layer.scaling,
+            )
+            if grouped is not None:
+                return self._pad_extend_output(grouped, num_output_rows)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -2415,6 +2429,75 @@ class QwenSparseAttnBackend(AttentionBackend):
             and forward_batch.req_pool_indices.numel() == 1
             and forward_batch.seq_lens.numel() == 1
         )
+
+    def _forward_sm70_grouped_sparse_prefill(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        forward_batch,
+        topk_indices: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        scaling: float,
+    ) -> Optional[torch.Tensor]:
+        """Grouped TileLang sparse chunk-prefill over the fp16 token pool.
+
+        Replaces the packed full-context gather + Triton FMA path for
+        prefix chunks (L2-b, PREFILL_LEVERS_PLAN.md §1.3). Returns None when
+        ineligible so the caller falls through unchanged.
+        """
+        if is_in_breakable_cuda_graph():
+            return None
+        R = q.shape[0]
+        if not (
+            forward_batch.forward_mode.is_extend()
+            and q.dtype == torch.float16
+            and q.ndim == 3
+            and q.shape[1:] == (6, 256)
+            and R >= 256
+            and topk_indices.ndim == 2
+            and topk_indices.shape[0] == R
+            and topk_indices.dtype == torch.int32
+            and k_buffer.dtype == torch.float16
+            and v_buffer.dtype == torch.float16
+            and k_buffer.ndim == 3
+            and k_buffer.shape[1:] == (1, 256)
+            and v_buffer.shape == k_buffer.shape
+        ):
+            return None
+        if k_buffer.stride(2) != 1 or k_buffer.stride(1) != 256:
+            return None
+        if v_buffer.stride(2) != 1 or v_buffer.stride(1) != 256:
+            return None
+        req_to_token = self.req_to_token
+        if req_to_token is None:
+            return None
+        from sglang.srt.layers.attention.tilelang_fa_v100._kernels_grouped_sparse_prefill import (
+            build_grouped_union_plan,
+            run_grouped_sparse_prefill,
+        )
+
+        plan = build_grouped_union_plan(
+            topk_indices,
+            cu_seqlens_q,
+            forward_batch.seq_lens,
+            forward_batch.req_pool_indices,
+            req_to_token,
+            self.max_context_len,
+        )
+        if plan is None:
+            return None
+        if not self._sm70_grouped_prefill_logged:
+            uidx, mask, u_pad = plan
+            logger.info(
+                "SM70 QSA grouped prefill: rows=%d groups=%d union_pad=%d "
+                "(SGLANG_SM70_QSA_GROUPED_PREFILL).",
+                R,
+                uidx.shape[0],
+                u_pad,
+            )
+            self._sm70_grouped_prefill_logged = True
+        return run_grouped_sparse_prefill(q, k_buffer, v_buffer, plan, scaling)
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:
