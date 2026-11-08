@@ -1,6 +1,6 @@
 # PREFILL 杠杆立项书(L2 / L3)
 
-立项日期:2026-11-07。状态:**已立项,未开工**(本文件即立项书;开工前先读本文对应节的门槛与坑)。
+立项日期:2026-11-07。状态:**L2-a spike 完成(2026-11-08,裁定 TileLang 产线,L2-b 待开工);L3 已上线**。开工前先读本文对应节的门槛与坑。
 
 来源:1Cat-vLLM v1.5.2 逆向分析(HEAD c98a8d664,PR #387/#666/#860/#754 全部在 tag 内;
 Apache-2.0/BSD-3/MIT 许可,可借设计与源码)。逆向全账见记忆
@@ -96,12 +96,50 @@ decode 路由报告。本文所有 1Cat 倍数按"设计模式可信、倍数需
   planner 不吃分组),spike 必须带上这个预算账。
 - 判据:任一形态破 25T → 走 TileLang 产线;全灭 → L2-b 按 CUDA 移植立项。
 
-**L2-b(产线)**:按 L2-a 结果二选一。Qwen 线倾向移植 1Cat CUDA 路径
-(BSD-3/Apache 可借源),需改配我们的 page-16 fp16 池与 sglang metadata
-(他们绑 Page4 微块 + E4M2,不是拿来即用);GLM 线按 spike 结论 TileLang 或
-CUDA。改动遵守 fork 纪律:上游文件最小可 rebase,行为开关走 `SGLANG_*`
-(environ.py 约定,读 env-var-conventions skill),serve 脚本注释与 README
-性能表同步。
+> **L2-a 实测结果(2026-11-08,1× V100-PCIE-32GB,容器单卡离线 microbench;
+> 基准代码 `benchmark/kernels/benchmark_sm70_qsa_grouped_sparse_prefill_l2a.py`,
+> 形状 = 产线真实形状:Q=4096 行、Hq=6、kv_heads=1、D=256、topk=2048、
+> fp16 池 65,536 行、sm_scale=1/16)**:
+>
+> | 变体 | 中位耗时 | 有效吞吐 | 判读 |
+> | --- | ---: | ---: | --- |
+> | Triton 产线基线(`_sparse_gqa_chunk_prefill`) | 35.70 ms | 1.44 T(per-row FLOPs) | 与 L2-0 的 34.2 ms/发吻合;比 FMA 峰(~14T)还低一个量级——不止 FMA 地板,还有 6 头各自重复拉同一份 KV 的读放大(每发潜在 ~51GB) |
+> | V2 每-token + 索引 gather(M=16,现 TileLang 核形状移植) | 11.20 ms | 4.60 T | **DRAM 带宽 bound**:8.6GB/发 ÷ ~900GB/s ≈ 9.5ms 地板;D256 把 GLM 的字节/浮点比翻倍,发射器地板(17T)根本没轮到 |
+> | V2b 每-token + 稠密页表(零每-tile 间接) | 13.32 ms | 3.87 T | 稠密页表救不了每-token 形态——瓶颈是 6 头摊不掉的每行 KV 读,不是 gather 间接 |
+> | **V1 分组(8 行×6 头=48 M 行)+ 组内并集稠密 panel,ov=0.82** | **5.80 ms** | **20.0 T(own MMA)** | **6.2× vs 产线基线**;带宽仅 407GB/s,未撞墙 |
+> | V1 分组,ov=0.5(U=8832) | 9.52 ms | 23.4 T | U 越大效率越高——25T 方向真实存在 |
+>
+> 正确性:V1 vs fp32 参考 max|d| = 2e-5(fp16 舍入级);并集构造保证每行可见
+> 自身全部 topk,无全掩码行。
+>
+> **两问的答案**:(a) 预排序稠密页表对每-token 形态无效(4-5T,带宽死),
+> 但**分组形态 20-23T、6.2× 核加速——TileLang 产线成立**(判据原意:不到
+> "全灭"且核加速远超立项所需的 3-4×;25T 未破,但限制因素是 occupancy——
+> smem 62KB → 1 CTA/SM——而非发射器,属 L2-b 调优轴:BI=32 + 双 CTA 共驻、
+> 或 M=48 拆分。注意 Hq=6 下组大小必须使 M=行数×6 为 16 的倍数 → 8 行
+> (M=48)即最小可行组)。(b) smem 账实测落账:Qwen M=48 形态 Q_shared_l/r
+> 24KB + K/V 32KB + S 6KB ≈ **62KB ✓**(寄存器 acc ~120/线程可编译);
+> GLM 侧复算:H=16、D=512 下 8 行 = Q 128KB ✗、4 行 = 136KB ✗、2 行 =
+> 100KB ✗(差 4KB 且零余量;V==K_nope 的共享 buffer 省一半也撞已记录的
+> swizzle 双布局死结;BI=32 形态撞 FullCol 每 warp ≥16 列的 emitter 约束)
+> ——**GLM 线分组在 TileLang 内不可行**,维持 round-2 结论:GLM prefill
+> 17T 现状,或另立 CUDA 项(不随 L2-b 走)。
+>
+> 端到端外推(按 L2-0 账本):QSA 稀疏 7.11s → 1.15s(6.2×),回收 GPU busy
+> ~23.7% → **冷 64k prefill 预期 +23~28%**(2,237 → ~2,750-2,860 tok/s,
+> 落在 §1.1 窗口上沿;未计 planner-lite 开销,1Cat 口径 +0.362ms/发可忽略;
+> 外推需 L2-b 原型在 4 卡实测确认)。
+
+**L2-b(产线)**:L2-a 已裁定 **Qwen 线走 TileLang 产线**(分组 + planner-lite,
+不再考虑 1Cat CUDA 路径移植)。工程项:(1) GPU planner——每行 topk → 组内
+并集(逻辑序排序,确定性要求见 §1.4)→ 稠密 panel 物理化(K/V gather 到
+[G,U,256] 缓冲)+ 每行可见性掩码,需无 host sync、graph-capturable、随图
+bucket 预分配;U 按 bucket pad 到 64 倍数。(2) 核从 spike 形态转产线:接
+QSA metadata 契约(有效项前置、-1 padding)、早 chunk visible<topk 行、
+CUDA graph。(3) occupancy 调优轴:BI=32 + 2 CTA/SM(撞 FullCol ≥16 列
+约束,需 64 线程形态验证)或 M=48 拆分,目标 25T+。(4) 验收走 §3 全套门。
+GLM 线:分组被 smem 判死、planner 被 round-2 判死 → 本立项书范围内**不动**;
+若要动,另立 CUDA 立项。
 
 ### 1.4 风险与坑清单
 
