@@ -62,6 +62,12 @@ services:
       FLASH_NEXT_GPUS: ${FLASH_NEXT_GPUS:-0,1,2,3}
       # The host KV tier spills to disk; keep it on the cache volume.
       SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: /root/.cache/hicache_storage
+      # Adaptive mixed-prefill budget (L3-1): >0 makes the serve script append
+      # --enable-mixed-chunk and arm the scheduler budget controller. 750 ms is
+      # the measured sweet spot on this box (mixed-step fixed cost floor is
+      # 350-650 ms; ladder: resident max gap 1.988 -> 1.080 s, entry TTFT
+      # +15%). Set 0 to fall back to plain chunked prefill.
+      SGLANG_MIXED_PREFILL_STEP_LATENCY_MS: ${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-750}
       # PCIe cards without NVLink: SGLANG_CUSTOM_AR_ALLOW_PCIE=1.
       SGLANG_CUSTOM_AR_ALLOW_PCIE: ${SGLANG_CUSTOM_AR_ALLOW_PCIE:-0}
 

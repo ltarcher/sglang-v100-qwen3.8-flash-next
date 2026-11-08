@@ -52,6 +52,15 @@ services:
       SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS: "8192"
       SGLANG_MAMBA_CONV_DTYPE: float16
       SGLANG_MAMBA_SSM_DTYPE: float16
+      # ---- adaptive mixed-prefill budget (L3-1, 2026-11-08) ----
+      # >0 arms the scheduler budget controller; --enable-mixed-chunk below is
+      # the paired launch flag. 750 ms is the measured sweet spot on 4x V100:
+      # a mixed step has a 350-650 ms fixed cost (12 QSA sparse prefill layers
+      # x ~29.5 ms floor), targets below the floor are refused by the
+      # controller (it warns and runs uncapped). Ladder (2 resident decodes +
+      # 32k entry): resident max gap 1.988 s -> 1.080 s (-46%), cost = entry
+      # TTFT 19.5 -> 22.5 s (+15%). Set 0 to disable (plain chunked prefill).
+      SGLANG_MIXED_PREFILL_STEP_LATENCY_MS: ${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-750}
       SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: "0"
       SGLANG_NUMA_BIND_V2: "0"
       SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
@@ -132,14 +141,19 @@ services:
       - "2"
       - --max-mamba-cache-size
       - "20"
-      # 4096, not smaller: this engine is prefill-first with no mixed chunk,
-      # so running decoders stall for the whole chunk stream. 1024 measured
-      # prefill ~2049 tok/s vs ~3000 at 4096 while decode gained nothing —
-      # smaller chunks just lengthen the stall.
+      # 4096, not smaller: 1024 measured prefill ~2049 tok/s vs ~3000 at 4096
+      # while decode gained nothing — smaller chunks just lengthen the stall.
+      # Resident stalls during long prefills are now bounded by the mixed
+      # prefill budget controller above, not by the chunk size.
       - --chunked-prefill-size
       - "4096"
       - --max-prefill-tokens
       - "4096"
+      # Paired with SGLANG_MIXED_PREFILL_STEP_LATENCY_MS>0 (see the env block):
+      # enables mixed chunked prefill so resident decodes step between the
+      # entry request's prefill chunks. The scheduler budget controller only
+      # arms when mixed chunk is on and overlap is on.
+      - --enable-mixed-chunk
       # See the driver note in the header: capture dies with CUDA error 35 on
       # driver 550.54.15. Qwen never ran prefill graphs on this fork anyway.
       - --cuda-graph-backend-prefill

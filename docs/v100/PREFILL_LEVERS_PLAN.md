@@ -29,9 +29,9 @@ decode 路由报告。本文所有 1Cat 倍数按"设计模式可信、倍数需
 
 ### 1.1 打击面与预期
 
-| 线 | 现状 | 预期(立项假设,待 L2-0 修正) |
+| 线 | 现状 | 预期(L2-0 实测后修正) |
 | --- | --- | --- |
-| Qwen 冷长文 prefill | 首 chunk 后全走 Triton 稀疏(29.5ms/层,FMA) | **+25~45%**(3,080→4,000-4,500 tok/s;190k 冷首 turn 62s→42-50s)。1Cat 同模型族 64K 纯 prefill +29.9% |
+| Qwen 冷长文 prefill | 首 chunk 后全走 Triton 稀疏(29.5ms/层,FMA;实测 34.2ms/发@4096 chunk)。**L2-0 实测 QSA 稀疏核占 GPU busy 28.3%** | **+20~28%**(3,080→~3,700-3,950 tok/s;核加速 3-4× 口径;份额天花板 +39%)。原 +25~45% 上半段不可达——注意力份额仅 28.3%,远低于 GLM DSA 的 46.4%。1Cat 同模型族 64K 纯 prefill +29.9% 与本机口径相容 |
 | Qwen 短请求/工具轮 | 首 chunk 走 dense,短请求占比高 | −10~20%(注意力份额低) |
 | GLM prefill 8k | DSA 核 46.4% 份额、17T | **+20~30%**(1,390→~1,700-1,850) |
 | decode(两线) | 路径不相干 | **0** |
@@ -66,6 +66,25 @@ decode 路由报告。本文所有 1Cat 倍数按"设计模式可信、倍数需
 **L2-0(前置测量,独占机)**:Qwen3.8 冷 64k prefill 的 kernel 构成 profile
 (GLM53_FLASH_PLAN G.5 同法)。注意力份额是 §1.1 收益估计里唯一没实测的乘数。
 产出:份额表 + 修正后的预期收益,回填本文件。
+
+> **L2-0 实测结果(2026-11-08,4×V100-32GB,生产默认配置/预算关)**:
+> 引擎 `launch_server`(MTP EAGLE、chunked-prefill 4096、tilelang_fa_v100);
+> 冷 65,601 token prefill(`flush_cache` 后、distinct prompt、max_new_tokens=1),
+> e2e 29.3s(2,237 tok/s 冷),GPU busy 25.1s(86% 占空比)。TP-0 torch-profiler
+> kernel 聚类(trace:`/tmp/l2prof/trace/l2cold64k-TP-0.trace.json.gz`):
+>
+> | 分量 | GPU busy | 份额 | 证据 |
+> | --- | ---: | ---: | --- |
+> | QSA 稀疏 prefill(Triton FMA,`_sparse_gqa_chunk_prefill`) | 7.11s | **28.3%** | 208 发,均值 34.2ms/发(= 12 全注意力层 × 17 chunk;与在案 29.5ms/层@4k FMA 地板吻合) |
+> | NCCL AllReduce(RING_LL)+ custom AR/hc_combine | 6.14s + 0.60s | **24.5% + 2.4%** | 1,755 发;L2 范围外的第二大税,另行挂账 |
+> | Marlin MoE(两种 tile shape) | 4.57s | 18.2% | 1,632 发 |
+> | dense GEMM(cuBLAS s884/cutlass/turbomind) | 3.51s | 14.0% | 10,595 发;混 GDN 投影/首 chunk dense 路由/QKV,非纯注意力 |
+> | GDN TileLang(main_kernel/kernel_kernel)+ mamba | 1.08s + 0.32s + 0.04s | ~5.8% | main_kernel p50 31µs(小核),max 2.4ms = 首 chunk dense TileLang 注意力(3.55ms/层口径吻合) |
+> | elementwise/misc/other/norm | ~0.9s | ~3.6% | fast_topk 0.57%、QSA metadata(_expand_qsa_block_indices 等)0.06% 均已含 |
+>
+> **修正结论**:QSA 稀疏核换成 grouped WMMA(3-4×,17-25T)→ 回收 GPU busy
+> 18.9-21.2% → **端到端 +23~27%**,份额天花板 +39%(核归零也不到 +40%)。
+> §1.1 已按此回填。L2-a spike 判据不变:破 25T ≈ 本表口径下 +27% 附近。
 
 **L2-a(spike,天级,TileLang 内)**:两问一次答:
 - (a) 预排序稠密页表(离线 gather 好、零每-tile 间接)能否让现 TileLang 核破
@@ -188,6 +207,11 @@ qwen_sparse_attn_backend.py:740(`end_blocks*ratio <= token_slot_table.shape[1]`)
   请求推入 dense 路径,重开本案。
 
 ## 5. 挂账(backlog,未立项)
+
+- **冷长 prefill NCCL AllReduce 税**(L2-0 副产物):RING_LL AllReduce 占冷
+  64k prefill GPU busy 24.5%(6.14s/1,755 发),+ hc_combine 2.4%。与 QSA 稀疏核
+  28.3% 同级,却不在任何杠杆打击面内。候选方向:prefill 两段式 AR 重叠、
+  one-shot 自定义 AR 阈值上探(chunk 4096 时是否还该走 RING_LL 待量)。
 
 - **#754 稀疏 retention 边界调度**(1Cat):816-token GDN state block 把 prefill
   预算切成多次 mini-forward,scheduler 只在被保留状态边界停 → Flash-Next
@@ -382,9 +406,12 @@ chunk 全部混入 decode 尾行,0 scheduler 异常)。**
   dev 挂载仪器假象);decode(MTP)95-114 tok/s ≥ 基线带 81-83;accept
   2.70-3.15 ≥ 带 1.95-2.58(数数类贪心文本可预测性高,方向为优);质量
   臂(数数 1-100 完整、链表反转代码、前缀缓存解释)不劣化。
-- **遗留**:生产启用需在 compose/serve 注册 `--enable-mixed-chunk`(L3-1
-  预算控制器落地时一并定参);`_original_forward_mode` 的 DSV4 paged 路径
-  回退仅在有混批流量的 DSV4.1 部署里生效,当前 DSV4.1 生产未开混批,无影响。
+- **遗留**:生产启用已完成(2026-11-08):`docker/v100-compose.yaml` 与
+  `docker/v100-compose-qwen38-mtp.yaml` 均设
+  `SGLANG_MIXED_PREFILL_STEP_LATENCY_MS=750`(env 可覆写;standalone 文件另带
+  `--enable-mixed-chunk` flag),README 性能节已登记;`_original_forward_mode`
+  的 DSV4 paged 路径回退仅在有混批流量的 DSV4.1 部署里生效,当前 DSV4.1
+  生产未开混批,无影响。
 
 ## 7. 封存记录:L3-1(自适应 mixed-prefill 预算控制器,2026-11-08)
 
