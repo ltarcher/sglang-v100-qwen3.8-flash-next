@@ -2,11 +2,17 @@
 
 状态:Phase 1 已实施并验收(2026-10-31);Phase 2 页入+手动降级已实施,
 位级验收通过,文本级 A/B 判据因引擎基线不收敛而作废(见 §8 记录);
-Phase 3 最小闭环(512K×1 直映射)已实施,S2 矩阵与 S3 516K 单请求
-验收通过(2026-11-01);S4(MTP+CUDA graph)与 512K×2/×4 调度未做
+Phase 3 最小闭环已实施:S2 矩阵、S3 516K 单请求与 S4(MTP+CUDA graph)
+验收通过(2026-11-01,见 §10.7);§6.1 pair-split 对拆已落地验收
+(2026-11-04)并于 2026-11-05 **转生产**(8110 compose:PAIR_PARITY +
+Phase 3 tier,3×256K 满配,`SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH=1` 暂作
+准入闸门,质量门禁入 CI 后随代码移除);YaRN ×3 并发判死(2026-11-05,
+§6.3)。**未做**:组件 5 准入与更大并发(4×256K 两次实测不可行,§6.1
+生产启用记录)、1M/YaRN 线(§7 质量门 3/4)、NVMe KV 冷层(杠杆 3)
 日期:2026-10-30(同日两次修订:§4 以 np=1 实测基准校准;补测 262k 锚点
 并重估 §4.2 外推带);2026-10-31 Phase 1 落地,同日 Phase 2 落地;
-2026-11-01 Phase 3 落地
+2026-11-01 Phase 3 落地;2026-11-03/04 pair-split 落地与验收;
+2026-11-05 YaRN ×3 判死 + PAIR 转生产
 范围:Qwen3.8-Flash-Next 线(4×V100-32GB SXM2,TP4,fp16 KV, production 配置)
 参考:Strata `/data/develop/Strata` 的 kv_stream 机制(kv_stream.cu / src/core/layer.cpp)
 
@@ -124,7 +130,8 @@ Phase 3 实施记录(2026-11-01):
   10 分片正常;read→EINVAL/lseek→ESPIPE/mmap→ENODEV,filefrag 元数据完好)致
   权重加载 os error 19、容器崩溃。wget 直连 resolve URL 重下(huggingface_hub
   1.29 对 >50GB 文件强制 hf_xet,本机 `HF_HUB_DISABLE_XET=1`),sha256 精确
-  匹配。坏文件保留同目录 `.corrupt` 后缀,待有 root 时取证(dmesg/smartctl/fsck)。
+  匹配。坏文件取证与清理已完结(2026-11-10 核对:同目录无 `.corrupt` 残留,
+  在役分片为重下后的校验通过版本)。
 
 ## 1. 背景与目标
 
@@ -175,6 +182,11 @@ host RAM 预算:120G − 系统/tokenizer ~10-12G − hicache host 层(缩至 4-
 tokens/rank,2×256K=524,288 装不下(实测 2×224K 即强制串行)——PAIR
 pair-split(§6.1,PHYS=663,040)+ tier 正是为此路径服务;YaRN 512K 扩展
 场景降级为第二阶段。
+
+**达成记录(2026-11-05,生产)**:目标已超额达成——8110 compose 生产
+运行 3×256K 满配(PAIR_PARITY + PHYS=786,432 + 逻辑扩展开,详见
+§6.1 生产启用记录);4×256K 两次实测不可行(warmup OOM)。YaRN
+扩展保持判死(§6.3)。
 
 ## 3. 架构设计
 
@@ -293,6 +305,10 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 | SGLANG_V100_KV_TIER_PAGEIN | 0 | Phase 2 页入路径(需 HOST_TIER=1;稳镜像 + UVA 原地恢复,零 host sync、图安全) |
 | SGLANG_V100_KV_TIER_DEGRADE_FLAG | "" | 手动降级测试钩子:文件存在即在下次 decode-like build 一次性全量镜像 + closed 页 qNaN 垃圾化 |
 | SGLANG_V100_KV_TIER_DISABLE_EXTEND | 0 | 关闭 Phase 3 逻辑容量扩展:保持 profiled 设备容量,释放字节留给激活(推荐开启;见 §10 头部修订) |
+| SGLANG_V100_KV_TIER_PHYS_TOKENS | 0 | Phase 3 设备池物理 token 数(每 rank;0=关;>0 时逻辑池 modulo 直映射其上,host 镜像覆盖全部逻辑页) |
+| SGLANG_V100_KV_HEAD_LAYOUT | 0(FULL) | 设备池布局:PAIR_PARITY(对拆,§6.1)每 rank 只存奇偶半页,读侧 owner-bit 双指针 P2P 直读对家;需 PHYS_TOKENS>0 且 P2P 探测通过 |
+| SGLANG_V100_KV_HEAD_LAYOUT_BLOCK | 1 | PAIR_PARITY 奇偶组块数(N>1 把 64-token 页并成 N×64 拷贝粒度,须整除 pair 总页数) |
+| SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH | 0 | PAIR_PARITY 服务门:置 1 才允许 boot。生产 8110 compose 已置 1(2026-11-05 转生产,作准入闸门);质量门禁入 CI 后随代码移除 |
 
 上线时同步 serve 脚本注释与 README 表格(fork 纪律)。
 
@@ -354,10 +370,28 @@ decode/gather kernel 按位选基指针(本地池或 IPC 导入的对家池)。�
 (`pair_split_ipc.py`,池张量常驻 → 无生命周期管理,图安全);对家 tags
 每 build 一次 P2P 刷新。boot 用 `can_actually_p2p` 硬探测,失败拒绝启动。
 
-**已落地(scaffolding)**:environ 枚举 + block 旋钮、configurator PHYS
-对半、奇偶所有权图、写侧 parity guards、IPC 模块、协议测试(owner-bit
-双指针语义,CPU 重放)。**读侧 v2 切片未落地**——PAIR_PARITY boot 以
-`SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH` 门拒绝服务,防静默错读。
+**已落地**:environ 枚举 + block 旋钮、configurator PHYS 对半、奇偶所有权
+图、写侧 parity guards、IPC 模块、协议测试(owner-bit 双指针语义,CPU
+重放);**读侧 v2 owner-bit 双指针已落地**(2026-11-03 `_p3_gather_kernel`
+PAIR 切片 + decode/gather 表消费者接线,2026-11-04 修复 `map_slot_table`
+极性 bug,见下方勘误 2 与验收记录)。
+
+**生产启用记录(2026-11-05,`~/vllm-Qwen3.8/docker-compose-sglang-v100-mtp-8110.yaml`)**:
+
+- env:`HOST_TIER=1`、`HEAD_LAYOUT=1`(PAIR_PARITY)、`PHYS_TOKENS=786,432`
+  (PAIR 总量,每 rank device 池 = PHYS/2 = 393,216;6144 页偶数满足
+  2×block 整除)、`PAIR_SPLIT_TESTBENCH=1`(准入闸门:不设则 boot
+  RuntimeError;质量门禁入 CI 后随代码移除)。
+- 调度:`--max-total-tokens 786,432`(3×262144,factor 1.0 回退)超出
+  GPU profile(~426K)的部分由 host mirror 承担(`DISABLE_EXTEND` 不设,
+  逻辑扩展开);`--max-running-requests 3` = 3×256K 满配。4×256K 两次
+  实测不可行:PAIR 硬约束 device 池 ≥ logical/2(524,288 tok =
+  6.0 GB/rank)后激活余量仅 20 MiB,warmup 即 OOM。
+- 内存账(2026-11-05 实测标定):mirror 12.6 KB/tok/rank,786,432 时
+  ~36G 总,充裕;PLE staged 服务期为 mmap 不吃 pinned(51G 硬 pinned
+  已解除,见 PLE_NVME_TIER_DESIGN.md)。GPU 账:图捕获后余量 3.23 GB
+  (本组 boot 健康实证);warmup 惰性 triton 真实需求 ~2.1-2.4 GB,
+  图后 <3.0 GB 的配置死于 warmup(§6.3 死亡数据)。
 
 4. MTP draft 池不参与(host_tier=False 语义不变);radix/调度器零改动
    (逻辑空间与页粒度不变)。

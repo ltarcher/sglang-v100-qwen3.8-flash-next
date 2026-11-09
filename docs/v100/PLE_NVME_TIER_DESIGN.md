@@ -1,8 +1,10 @@
 # PLE n-gram 表 NVMe 分层(staged 后端)设计文档
 
-状态:设计定稿,未实施(2026-11-04)。触发条件:KV host tier 需要扩
-`SGLANG_V100_KV_HOST_TIER_GB`(当前被 PLE pinned 限制在 2),或需要恢复
-hicache 文件分层时再启动实施。
+状态:已实施(2026-11-04/05)。Phase 1 staged NVMe 后端(§10)、Phase 2
+decode 图 pre-replay staging(§11)与 prefill 双缓冲(§11.9.4)均已落地,
+生产 8110 compose 已切 staged 后端。剩余:chunk-ahead 预取(算 chunk i
+时预取 chunk i+1)未实施(§12 方向,§11.9.4 记录)。本节下方正文保留
+立项时的"未实施"分析视角,实施状态以 §10/§11 各实施记录为准。
 日期:2026-11-04(分析含当日实测数字)
 范围:Qwen3.8-Flash-Next NVFP4 线(4×V100-32GB SXM2,TP4,生产配置
 `vllm-Qwen3.8/docker-compose-sglang-v100-mtp-8110.yaml`)

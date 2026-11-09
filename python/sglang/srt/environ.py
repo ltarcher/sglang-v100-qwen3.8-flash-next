@@ -1639,8 +1639,8 @@ class Envs:
     # read path never consumes the host copy, so the default-off behavior
     # is identical to the tier being absent.
     SGLANG_V100_KV_HOST_TIER = EnvBool(False)
-    # Per-rank host pool size. Phase 1 mirrors into a rolling window of this
-    # budget; stable page->slot mapping arrives with Phase 2 page-in.
+    # Per-rank host pool size. Phase 3 pins a full-logical-page mirror here
+    # (its byte cost is validated against MemAvailable at boot).
     SGLANG_V100_KV_HOST_TIER_GB = EnvInt(32)
     # Host page granularity in tokens. Phase 1 requires it to equal the KV
     # pool page size (64 in production).
@@ -1671,7 +1671,8 @@ class Envs:
     # and a pinned host mirror holds every logical page, so prefill/decode
     # reads page in on demand and the freed device memory goes to activations.
     # 0 = off (Phase 1/2 behavior); requires a multiple of the pool page size.
-    # Opt-in only: needs --disable-cuda-graph and target-only serving.
+    # Opt-in only. MTP + CUDA graph run on the tier since S4 (the graph
+    # buffers are persistent full-width tables refreshed per replay).
     SGLANG_V100_KV_TIER_PHYS_TOKENS = EnvInt(
         0
     )  # Phase 3 logical-capacity extension kill-switch: when set, the tier keeps
@@ -1696,10 +1697,12 @@ class Envs:
     # for better P2P bandwidth at coarser page-in granularity). Must divide
     # the pair-total physical page count.
     SGLANG_V100_KV_HEAD_LAYOUT_BLOCK = EnvInt(1)
-    # Testbench escape for the PAIR_PARITY scaffolding: the read path
-    # (owner-bit dual-pointer decode/gather tables) is a pending slice, so
-    # boots under PAIR_PARITY refuse to serve without this set. Write-side
-    # parity guards and the IPC rendezvous run either way.
+    # Testbench escape for PAIR_PARITY serving: the owner-bit dual-pointer
+    # read path is implemented and pair-accept validated (2026-11-04), and
+    # the 8110 production compose enables PAIR_PARITY with this flag set
+    # (2026-11-05) as an admission gate -- boots refuse to serve without it
+    # until the quality gates move into CI, at which point the flag and the
+    # check are removed together.
     SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
