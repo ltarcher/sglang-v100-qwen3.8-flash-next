@@ -1,6 +1,6 @@
 # PREFILL 杠杆立项书(L2 / L3)
 
-立项日期:2026-11-07。状态:**L2-a spike + L2-b 产线完成(2026-11-08,实测 e2e +13~18%,生产已启用);L3 已上生产(8110 开 --enable-mixed-chunk + SGLANG_MIXED_PREFILL_STEP_LATENCY_MS=750ms 预算控制器)**。开工前先读本文对应节的门槛与坑。
+立项日期:2026-11-07。状态:**L2-a spike + L2-b 产线完成(2026-11-08,实测 e2e +13~18%);受控三臂 A/B 于 2026-11-09 完成(§8.1:分叉率不超噪声地板,无系统性质量退化);但 2026-11-09 WorkBuddy agentic 实战匹配对照(§8.2)裁定 grouped ON 与工具调用参数缺失/重写螺旋强关联(ON 3/3 失败含一次全新会话 vs OFF 1/1 干净),解码速率两臂无差异、代价全在 agent 轨迹层。生产已回 OFF(2026-11-09);grouped 降级为离线/非工具负载的预填充加速开关**;L3 已于 2026-11-08 生产回滚(混批步固定成本实测 ~660ms + 1.3ms/tok,长 prompt 并发下常驻 decode 崩至 ~2.8 tok/s、入场 prefill 仅 ~320-640 tok/s,净负收益;详见 §2 回滚注)。开工前先读本文对应节的门槛与坑。
 
 来源:1Cat-vLLM v1.5.2 逆向分析(HEAD c98a8d664,PR #387/#666/#860/#754 全部在 tag 内;
 Apache-2.0/BSD-3/MIT 许可,可借设计与源码)。逆向全账见记忆
@@ -590,3 +590,151 @@ resident 最长间隙 1.988 s → 1.080 s(−46%),代价入场 TTFT 19.5 → 22.
 - **遗留**:生产默认仍关闭(mixed-chunk 与预算都 opt-in);启用即在
   serve/compose 设 `SGLANG_MIXED_PREFILL_STEP_LATENCY_MS`(>0 自动附带
   `--enable-mixed-chunk`,见 serve 脚本注释)。DSV4.1 未开混批,不适用。
+
+## 8. Grouped prefill 质量受控 A/B 方案(2026-11-08 立项,待执行)
+
+背景:2026-11-08 两次质量异常与 `SGLANG_SM70_QSA_GROUPED_PREFILL=1` 时间上
+关联(第二次开关对照干净:ON 异常 / OFF 复测正常;第一次确认是 WorkBuddy
+侧记忆污染)。引擎侧既有 A/B 证据(≤2k 逐位一致、≥4k 零翻转)与用户报告
+矛盾,需要一次受控定案。理论预期仅 fp16 归约序差异(TileLang 在线 softmax
+vs Triton,3e-5~5e-4),temp-0 argmax 在 top-2 极近时蝴蝶分叉,非系统性。
+
+**三臂设计**(不是两臂):
+
+| 臂 | flag | 作用 |
+| --- | --- | --- |
+| A1 | 0 | 基线 |
+| A2 | 0(第二次 boot) | null 对照:boot 间噪声地板(JIT/图捕获/内存布局逐位差异) |
+| B | 1 | 待测 |
+
+B 相对 A 的分叉率**超过 A1-vs-A2 地板**才归因于 flag。唯一变量 = flag;
+两臂同镜像、compose 其余项一致(mixed-chunk 已摘除、预算 env=0)、同
+`--random-seed`(compose 已固定)。页对齐修复(a8ede6f)两臂都含,不构成
+臂间差异;若 A/B 无差异但质量仍差于"昨天",补 pre-a8ede6f 代码臂。MTP 保持
+生产形态;若发现异常分叉,追加去 MTP 对照。
+
+**执行**(runner:`scripts/ab_qsa_grouped_quality_v100.py`,任务构建已在
+容器内离线验证:33 任务 = 20 基础(数学×5 有答案/代码×5/中文×5/agentic×5)
++ WorkBuddy 鹈鹕骑自行车 canary(SVG 动画,用户实际质量门)+ 每长度档
+(1k/4k/16k/32k/64k/128k)needle QA + 文档内数学各一):
+
+```bash
+# 每臂 = 一次 boot(compose 改 flag)+ 一条命令;8110 停服 ~1.5h
+docker run --rm --network host --entrypoint /opt/venv/bin/python \
+  -v /data/develop/sglang-v100-sxm2-qwen3.8-flash-next:/sglang-workspace \
+  -v /data/models/nvidiaQwen3.8-Flash-Next-NVFP4:/data/models/nvidiaQwen3.8-Flash-Next-NVFP4:ro \
+  -v /tmp/ab_grouped:/tmp/ab_grouped \
+  sglang-v100-unified:latest /sglang-workspace/scripts/ab_qsa_grouped_quality_v100.py \
+  run --arm A1 --base http://127.0.0.1:8110 --out /tmp/ab_grouped
+# (A2 同命令 flag=0 第二次 boot;B 臂 flag=1,首条长 prefill 付 JIT 1-4 分钟,已剔除统计)
+analyze --out /tmp/ab_grouped --arms A1 A2 B
+```
+
+臂内协议:8k warmup(剔除)→ 33 任务 bs=1 串行(temp=0、固定 max_new、
+ignore_eos、top-2 logprob)→ `/flush_cache` 后重跑 11 条(含 canary,G1 门)。
+
+**判定门**:
+
+- G1 同 boot 确定性:重跑与首跑必须逐位一致;不一致 = 引擎自身不确定
+  (批不变性/overlap),先修它,结果不归因 flag。
+- G2 分叉:B 臂分叉 tag 数 ≤ A1-vs-A2 地板,且每个分叉点 top-2 margin
+  < 1e-3(蝴蝶特征)。**红旗(任一即判有害,不重开,开 bug)**:far-margin
+  分叉、分叉率超地板、thinking 长度分布显著偏移(过度思考信号)。
+- G3 任务:数学/needle 有答案子集命中率两臂相等。
+- **G3-canary(用户实际质量门)**:鹈鹕骑自行车 SVG 每臂落盘
+  `pelican_<arm>.html`,analyze 自动检查结构标记(DOCTYPE/svg/
+  animateTransform/html 闭合);最终裁定须人工浏览器渲染三份文件——
+  骑行正常为 PASS 必要条件,B 臂结构损坏而 A 臂正常 = 红旗。
+
+**注意**:runner 建议 `docker run --network host`(`--base` 直接写
+`http://127.0.0.1:8110`);结果 JSONL 落宿主 `/tmp/ab_grouped`
+(臂文件 arm_*.jsonl,可断点续跑)。完成后把裁定回填本节与本文件头状态行。
+
+### 8.1 执行结果与裁定(2026-11-09)
+
+v1 执行暴露两处测试设计缺陷,数据作废(原始数据在 `/tmp/ab_grouped/v1/`):
+①裸文本不套 chat template → 模型落入"百度知道"式续写退化态,边界 token
+(`\n\n` vs `assistant`)是真实近平手,放大噪声面,G3 判定全灭;②发现引擎
+存在 **flag 无关的 run-to-run 噪声**:同 prompt、同 seed、同 boot 内 flush 后
+重复 5 次 4 次逐位一致、1 次首 token 分叉——内核选择随内存布局漂移,把近平手
+argmax 随机翻转。v2 修复:全任务套 chat template(短答手动注入空 think 块,
+Qwen3 模板的 `enable_thinking` kwarg 虽存在但对该模型不生效)。
+
+**v2 结果(33 任务 × 3 臂,44 记录/臂)**:
+
+| 判定门 | 结果 | 裁定 |
+| --- | --- | --- |
+| G1 同 boot 重跑逐位一致 | A1 7/11、A2 8/11、B 7/11(v1 为 0-1/11) | 残余翻转均为近平手 margin(1.5e-2~6e-2)= 引擎噪声,非 flag |
+| G2 分叉率 | 地板(A1vA2)20/33 vs B 23/33 | 同量级,B 不超地板 |
+| G2 大 margin 翻转 | 地板 2 个 >1.0,B 4 个 >1.0 | 两臂都有(16k+ 长上下文),1 样本/tag 无统计差异 |
+| G3 needle+math_ctx(12 题) | A1 12/12、A2 12/12、B 11/12 | B 差 math_131072 一次,噪声级 |
+| G3-canary 结构 | A2 13.3k tok、B 10.1k tok,5/5 标记全过 | 待人工浏览器渲染裁定 |
+
+math0-4 全臂未命中 = `enable_thinking` 未生效、64 token 预算全耗在思考里,
+各臂同等失败,不影响对比。v1 里"看起来的 B 臂质量差"与 v2 定量的
+"地板=B 臂噪声"共同指向:**用户感知的质量波动主要来自引擎级蝴蝶噪声
+(与 flag 无关)+ WorkBuddy 记忆污染**,grouped prefill 无系统性质量退化
+证据。
+
+**遗留**:①canary 双臂 HTML(`/tmp/ab_grouped/pelican_{A2,B}_canary.html`)
+人工渲染后定案,若正常建议 flag 回 "1" 拿回 +13~18%;②引擎 run-to-run
+噪声(内核选择随布局漂移)值得单独治理(确定性内核选择/batch-invariant
+路径)——它同时解释"同一 prompt 重试输出漂移",与 grouped 无关。
+
+### 8.2 WorkBuddy agentic 实战匹配对照与裁定(2026-11-09,推翻 §8.1 的生产建议)
+
+§8.1 判定"grouped 无系统性质量退化"后生产回 ON(11-09 10:26 boot);当日
+WorkBuddy 鹈鹕骑自行车任务连续三次 21-24 分钟(健康基线 2-4 分钟),agent
+自述"尾部混入大量无效片段"。经 shim 请求日志(2.8GB/3834 行,含完整 SSE
+响应)取证 + 同 prompt 开关匹配对照,裁定如下。
+
+**取证一:引擎侧零损坏证据**(脚本 `/tmp/l2b_work/shim_*.py`,原始日志已
+归档 `/data/develop/l2b_work/shim_debug_groupON_20261107-09.log.gz`):
+
+- 全日志 `finish_reason` 无一处 length → 排除 max_tokens 截断;
+- 鹈鹕会话每次 Write 的 arguments 完整干净(全部以 `</html>\n"}` 收尾、
+  键齐全)→ 客户端记录的历史参数 = 引擎实际交付内容,引擎输出无损;
+- 607 个含 HTML 的读回结果尾部全部干净(仅 19 个良性行号槽标);
+- "尾部混入大量无效片段"的自述不可信:13:16 的"结构有问题"无任何读取
+  即宣布;13:22 的"读取确认"是 `limit:60` 读 236 行文件,从未看到它声称
+  损坏的尾部,且读到的 60 行干净。
+
+**取证二:耗时倍增 = 生成量倍增,不是速率回退**。shim 逐轮 usage + 轮间
+墙钟:当日(grouped ON)鹈鹕会话有效速率 42-64 tok/s,与 11-07/11-08 基线
+52-67 tok/s 同带;三次失败各生成 64-71k tokens(健康任务 ≈8-10k)。速率
+恒定时"耗时 ×8"严格等价于"token 量 ×8"——全部来自重写螺旋(单文件 15 次
+完整重写)与 3 次 Write 缺 `file_path` 整体作废(每次烧 9.6-15k tokens)。
+
+**取证三:同 prompt 开关匹配对照(决定性)**。WorkBuddy 对同一 prompt 的
+重跑是逐字节相同的请求(prompt 32,607 tok,连 629/21 bootstrap 轮都一致):
+
+| 指标 | ON(14:13,grouped=1,近全新会话) | OFF(15:06,grouped=0,全新会话) |
+| --- | --- | --- |
+| 生成总量 | 67,509 tokens | **7,457 tokens** |
+| Write 次数 | 8+ 次重写 | **1 次,一次过** |
+| 工具参数缺失 | 3 次(当日累计) | **0** |
+| 总耗时 | ~22 分钟 | **~2.4 分钟** |
+| 有效速率 | ~51 tok/s | ~55 tok/s(无差异) |
+
+当日汇总:ON 3/3 失败(含一次全新会话)vs OFF 1/1 干净完成。
+
+**裁定**:
+
+1. §8.1 的"无系统性质量退化"在**静态矩阵口径下依然成立**——分叉率、
+   margin 分布确实不超噪声地板;但该口径测不到的分布尾部才是要害:fp16
+   归约序扰动(~3e-5~5e-4)使近并列 argmax 翻转概率升高,翻转**落在工具
+   调用参数 JSON 里**时代价是灾难性的(参数缺失 → 工具报错进上下文 →
+   agent 自疑螺旋),一次翻转即可烧 5-10 分钟。静态矩阵每 tag 只有 1-2 个
+   采样点,而 agentic 会话一次任务要生成数万个"必须精确"的 JSON 结构
+   token,尾部风险被采样密度放大。
+2. **生产回 OFF**(2026-11-09 compose 已改,env `=0`):agentic 工具链
+   稳定性 > +13~18% prefill。
+3. grouped 降级保留为**离线/非工具负载开关**:纯续写、批量探针、
+   needle 类无 tool-call 负载可安全吃 prefill 红利(§8.1 矩阵与 262k
+   锚点复刻 2,654-2,871 tok/s 均为其背书)。
+4. 鹈鹕几何悬案(两臂脚不踩踏板)独立存在——A/B canary 走 /generate 无
+   工具也踩空,属任务难度/模型几何能力,与开关无关,另案处理。
+
+可选定案实验(未执行,不阻塞):再切 ON 重跑同 prompt 一次,复现螺旋即
+因果完全闭环。如未来要找回该收益,正确路径是 §8.1 遗留②的确定性治理
+(内核选择固定/batch-invariant)先行,而非直接开 flag。
