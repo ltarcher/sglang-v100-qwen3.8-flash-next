@@ -28,7 +28,10 @@ import time
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.models.qwen4_exp_ple_staged import PleRowStaging
+from sglang.srt.models.qwen4_exp_ple_staged import (
+    PleAheadStaging,
+    PleRowStaging,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +236,117 @@ def _discover_staged_ple_entries(model) -> list:
     return entries
 
 
-def prefetch_staged_ple_prefill(model, ple_batch) -> None:
+def _chunked_prefill_size() -> int:
+    """The scheduler's chunked-prefill size, for chunk-ahead slicing (0 when
+    unusable). Indirected so tests can monkeypatch it without pulling in the
+    scheduler stack."""
+    from sglang.srt.managers.schedule_batch import get_schedule
+
+    return get_schedule().chunked_prefill_size or 0
+
+
+# Chunk-ahead stash (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.5): future chunk
+# tokens keyed by req pool slot, recorded by the scheduler at every
+# prepare_for_extend and popped at the extend forward's start. Stale or
+# overwritten entries are harmless — the consume side verifies the staged ids
+# bit-exactly against the forward's own ids before trusting anything.
+_PLE_CHUNK_STASH: dict[int, list] = {}
+
+
+def record_ple_chunk_ahead(reqs, pool_indices_cpu) -> None:
+    """Scheduler-side stash for the chunk-ahead prefetch: the future chunk
+    tokens are pure scheduler state (``full_untruncated_fill_ids`` beyond the
+    current ``extend_range``), so record them here keyed by the req pool slot.
+    The model's extend-forward start pops the entry and speculatively stages
+    chunks ``i+1..i+depth`` while chunk ``i`` computes."""
+    depth = envs.SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD.get()
+    if depth <= 0:
+        return
+    chunk_size = _chunked_prefill_size()
+    if chunk_size <= 0:
+        return
+    for i, req in enumerate(reqs):
+        end = req.extend_range.end
+        fill_ids = req.full_untruncated_fill_ids
+        if end >= len(fill_ids):
+            continue
+        _PLE_CHUNK_STASH[int(pool_indices_cpu[i])] = list(
+            fill_ids[end : end + depth * chunk_size]
+        )
+
+
+def _pop_ple_chunk_ahead(ple_batch, forward_batch) -> tuple:
+    """Gate + stash pop for the chunk-ahead window. Returns ``(pool_idx,
+    tokens)`` only for the shape the speculative fill can serve exactly —
+    one extend sequence in the batch (no verify strides, no multi-request
+    rows) with a recorded stash; everything else falls back to the existing
+    synchronous double buffer."""
+    if ple_batch.ngram_context is None or ple_batch.mode.is_target_verify():
+        return None, None
+    if not ple_batch.mode.is_extend() or ple_batch.lengths.shape[0] != 1:
+        return None, None
+    pool_idx = int(forward_batch.req_pool_indices.reshape(-1)[0].item())
+    tokens = _PLE_CHUNK_STASH.pop(pool_idx, None)
+    if not tokens:
+        return None, None
+    return pool_idx, tokens
+
+
+def _submit_ple_chunk_ahead(
+    entries: list, ple_batch, stash_tokens: list, pool_idx: int, depth: int
+) -> None:
+    """Speculatively stage the next ``depth`` chunks' rows (§11.9.5).
+
+    Chunk ``i+1``'s gather ids are pure input-side state: its ngram context is
+    ``cat([history, chunk_i+1])`` where ``history`` is chunk ``i``'s last two
+    tokens, and ``ple_batch.ngram_context`` is already ``cat([history, chunk_i])``
+    — so windows ``[L_i + j*cs : L_i + (j+1)*cs]`` of
+    ``cat([ple_batch.ngram_context, next_tokens])`` equal chunk ``i+1+j``'s own
+    forward windows for any ``L_i >= 1`` (including the ``L_i == 1`` boundary
+    where the history spans the old history column). Hashing these windows on
+    the GPU with each layer's real ``_hash_contexts`` and slicing per chunk
+    keeps the speculative ids bit-identical to what the future forward will
+    compute; mismatches (chunk boundaries off ``cs``, scheduler budget splits,
+    stale stash) are caught at consume time and fall back cleanly.
+    """
+    chunk_size = _chunked_prefill_size()
+    if chunk_size <= 0:
+        return
+    embedding0 = entries[0].embedding
+    ngram_context = ple_batch.ngram_context
+    l_i = ngram_context.shape[1] - (embedding0.ngram_size - 1)
+    next_tokens = torch.tensor(
+        stash_tokens, dtype=torch.long, device=ngram_context.device
+    ).unsqueeze(0)
+    merged = torch.cat([ngram_context, next_tokens], dim=1)
+    windows = merged.unfold(1, embedding0.ngram_size, 1)[:, l_i:]
+    total_windows = windows.shape[1]
+    for entry in entries:
+        embedding = entry.embedding
+        ahead = embedding.ngram_embedding._staged_ahead
+        if ahead is None:
+            continue
+        # One hash + one D2H per layer for the whole window: chunk slices are
+        # contiguous row ranges of the flattened [W, heads] id tensor.
+        ids = embedding._hash_contexts(windows, decode_sized=False)
+        ids_np = ids.reshape(-1).to(torch.long).cpu().numpy()
+        heads = embedding.ngram_heads
+        for j in range(depth):
+            lo, hi = j * chunk_size, min((j + 1) * chunk_size, total_windows)
+            if hi <= lo:
+                break
+            ahead.submit(
+                pool_idx,
+                ids_np[lo * heads : hi * heads],
+                vocab_start=entry.vocab_start,
+                vocab_end=entry.vocab_end,
+            )
+
+
+def prefetch_staged_ple_prefill(model, ple_batch, forward_batch) -> None:
     """Phase 2 prefill double buffering (docs/v100/PLE_NVME_TIER_DESIGN.md
-    §4.2/§11.9.4): stage every PLE layer's rows once at extend-forward start.
+    §4.2/§11.9.4) plus chunk-ahead prefetch (§11.9.5): stage every PLE
+    layer's rows once at extend-forward start.
 
     At this point the current stream holds only batch-prep kernels, so the
     per-layer ids D2H is cheap; the background fills then overlap early-layer
@@ -243,6 +354,12 @@ def prefetch_staged_ple_prefill(model, ple_batch) -> None:
     otherwise sit on the critical path right where the next layer's launch is
     due). Each layer's gather later finds its staging pending via
     ``fill_pending`` and skips its own D2H and refill entirely.
+
+    With ``SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=d > 0``, chunk ``i``'s rows are
+    served from the speculative fill submitted at forward ``i-1`` (bit-exact
+    id match at consume), the main staging is skipped, and chunks
+    ``i+1..i+d`` are submitted for the next forwards — the fill tail wait
+    moves entirely into earlier chunks' compute windows.
 
     No-op for other backends, non-extend batches, capture (captured decode /
     verify graphs are filled by the launch gate), and when disabled via
@@ -261,13 +378,50 @@ def prefetch_staged_ple_prefill(model, ple_batch) -> None:
             )
     if not entries:
         return
+    depth = envs.SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD.get()
+    pool_idx, stash_tokens = None, None
+    if depth > 0:
+        pool_idx, stash_tokens = _pop_ple_chunk_ahead(ple_batch, forward_batch)
     for entry in entries:
         ids = entry.embedding.compute_ngram_ids(ple_batch)
-        entry.staging.stage_async(
-            ids.detach().reshape(-1),
-            vocab_start=entry.vocab_start,
-            vocab_end=entry.vocab_end,
-        )
+        ids_flat = ids.detach().reshape(-1)
+        host = entry.embedding.ngram_embedding
+        serve = None
+        if stash_tokens is not None:
+            # One D2H here (cheap at extend-forward start) also proves the
+            # previous forward's gathers finished, so the buffer served then
+            # is safe to refill by the submits below.
+            ids_np = ids_flat.to(torch.long).cpu().numpy()
+            if host._staged_ahead is None:
+                host._staged_ahead = PleAheadStaging(
+                    table=host._staged_table,
+                    depth=depth,
+                    max_rows=envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
+                )
+                logger.info(
+                    "PLE chunk-ahead prefetch wired: depth=%d, buffers=%d, max_rows=%d",
+                    depth,
+                    depth + 1,
+                    envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
+                )
+            serve = host._staged_ahead.consume(pool_idx, ids_np)
+            if serve is not None:
+                # The gather reads this buffer directly; no main fill.
+                host._staged_serve = serve
+            else:
+                entry.staging.stage_async(
+                    torch.from_numpy(ids_np),
+                    vocab_start=entry.vocab_start,
+                    vocab_end=entry.vocab_end,
+                )
+        else:
+            entry.staging.stage_async(
+                ids_flat,
+                vocab_start=entry.vocab_start,
+                vocab_end=entry.vocab_end,
+            )
+    if stash_tokens is not None:
+        _submit_ple_chunk_ahead(entries, ple_batch, stash_tokens, pool_idx, depth)
 
 
 def build_qwen4_exp_ple_decode_prep(model):

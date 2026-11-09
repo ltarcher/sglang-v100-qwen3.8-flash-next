@@ -3139,6 +3139,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefill_input_ids_cpu = pinned_input_ids
         self.req_pool_indices = req_pool_indices_tensor
         self.req_pool_indices_cpu = req_pool_indices_cpu
+        # PLE chunk-ahead stash (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.5):
+        # future chunk tokens keyed by req pool slot; the model's extend
+        # forward start pops the entry and speculatively stages chunks
+        # i+1..i+depth while chunk i computes. Stale entries are harmless —
+        # the consume side verifies the staged ids bit-exactly.
+        if envs.SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD.get():
+            from sglang.srt.models.qwen4_exp_ple_prep import (
+                record_ple_chunk_ahead,
+            )
+
+            record_ple_chunk_ahead(reqs, req_pool_indices_cpu)
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (

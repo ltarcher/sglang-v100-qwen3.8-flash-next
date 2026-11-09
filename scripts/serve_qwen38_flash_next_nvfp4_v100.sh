@@ -325,6 +325,13 @@ args=(
   # NVMe random-row IOPS per 4096-token chunk (-16% TTFT @64k, -10% @262k);
   # warm decode within a few % of pinned (see §11.9.4 for the accepted A/B).
   --ple-offload-backend staged
+  # Chunk-ahead prefill prefetch (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.5):
+  # while chunk i computes, chunks i+1..i+d are speculatively staged so the
+  # fill tail wait hides in earlier chunks' compute windows; consume verifies
+  # ids bit-exactly and falls back on any mismatch. OFF by default (0) —
+  # enable via env (production compose carries the commented entry) after
+  # the depth=1/2 A/B; d=2 needs 3 extra staging buffers (~671 MB each).
+  # SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=2
   # Builds FlashInfer's sampling kernels before serving (JIT, ~90 s when cold).
   --warmups sampling
 )

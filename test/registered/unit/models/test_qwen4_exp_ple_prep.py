@@ -21,14 +21,21 @@ of the real embeddings are covered on hardware by the Phase 2 bit-exact
 oracle.
 """
 
+import numpy as np
+import pytest
 import torch
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.models.qwen4_exp_ple_prep import (
     PleDecodePrep,
     PlePrepEntry,
+    _PLE_CHUNK_STASH,
+    prefetch_staged_ple_prefill,
+    record_ple_chunk_ahead,
 )
 from sglang.srt.models.qwen4_exp_ple_staged import (
+    PleAheadStaging,
     PleRowStaging,
     PleStagedTable,
 )
@@ -259,3 +266,498 @@ class TestEnvContract:
         # Section 11.8: the Phase 2 main switch defaults to enabled; False
         # falls back to Phase 1 behavior (capture refused).
         assert envs.SGLANG_QWEN4_PLE_STAGED_DECODE_PREP.get() is True
+
+    def test_chunk_ahead_defaults_off(self):
+        # Section 11.9.5: chunk-ahead prefetch is opt-in (depth 0 = off);
+        # existing single-buffer double-buffering behavior is untouched.
+        assert envs.SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD.get() == 0
+
+
+# ---------------------------------------------------------------------------
+# Chunk-ahead prefetch (docs/v100/PLE_NVME_TIER_DESIGN.md section 11.9.5)
+# ---------------------------------------------------------------------------
+
+
+class FakeMode:
+    """Duck-typed ForwardMode subset used by the prefetch gate."""
+
+    def __init__(self, name="extend"):
+        self.name = name
+
+    def is_extend(self):
+        return self.name in ("extend", "verify")
+
+    def is_target_verify(self):
+        return self.name == "verify"
+
+
+class FakePleBatch:
+    def __init__(self, ngram_context, lengths=(1,), mode_name="extend"):
+        self.mode = FakeMode(mode_name)
+        self.ngram_context = ngram_context
+        self.lengths = torch.tensor(lengths)
+
+
+class FakeForwardBatch:
+    def __init__(self, pool_idx):
+        self.req_pool_indices = torch.tensor([pool_idx], dtype=torch.long)
+
+
+class FakeModel:
+    def __init__(self, entries):
+        self._ple_staged_prefill_entries = entries
+
+
+class FakeHost:
+    """Duck-typed Qwen4ExpPinnedHostEmbedding staged fields."""
+
+    def __init__(self, table):
+        self._staged_table = table
+        self._staged_serve = None
+        self._staged_ahead = None
+
+
+class FakeNGramEmbedding:
+    """Duck-typed Qwen4ExpNGramEmbedding: canned ids for the main compute-
+    ahead path plus a real deterministic hash for the ahead windows (the
+    prefetch calls ``_hash_contexts`` directly for those)."""
+
+    def __init__(self, host, ngram_size=3, heads=2):
+        self.ngram_embedding = host
+        self.main_ids = None
+        self.ngram_size = ngram_size
+        self.ngram_heads = heads
+        self.gather_dp_tokens = False
+        self.contexts_seen = []
+
+    def compute_ngram_ids(self, batch) -> torch.Tensor:
+        return self.main_ids
+
+    def _hash_contexts(self, contexts: torch.Tensor, *, decode_sized=False):
+        self.contexts_seen.append(contexts.detach().clone())
+        return (
+            (contexts.sum(dim=-1, keepdim=True) % 251)
+            .expand(-1, -1, self.ngram_heads)
+            .to(torch.long)
+        )
+
+
+class FakeReq:
+    def __init__(self, fill_ids, end):
+        self.full_untruncated_fill_ids = array("q", fill_ids)
+        # record_ple_chunk_ahead only reads .end off the real Range object.
+        self.extend_range = type("R", (), {"end": end})()
+
+
+def _fake_hash(contexts: torch.Tensor, heads=2) -> torch.Tensor:
+    return (
+        (contexts.sum(dim=-1, keepdim=True) % 251).expand(-1, -1, heads).to(torch.long)
+    )
+
+
+def _make_staged_table(tmp_path, tag: str, seed: int = 3):
+    table_u8 = _make_table(SHARD_ROWS, seed=seed).view(torch.uint8)
+    staged = PleStagedTable(
+        shape=(SHARD_ROWS, ROW_BYTES),
+        dtype=torch.float8_e4m3fn,
+        table_dir=str(tmp_path),
+        tag=tag,
+    )
+    staged.materialize(table_u8.view(torch.float8_e4m3fn), reuse=False)
+    return table_u8, staged
+
+
+@pytest.fixture(autouse=True)
+def _cpu_only_capture_check(monkeypatch):
+    """The CPU test container has no CUDA driver; the prefetch's capture
+    check would initialize CUDA and raise. Production always has a device;
+    tests pin the check to False."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+
+class TestPleRowWaitAndMatch:
+    def test_matches_after_fill(self, tmp_path):
+        table_u8, staged = _make_staged_table(tmp_path, "wm1")
+        staging = PleRowStaging(staged, max_rows=64, io_threads=1)
+        ids_np = np.arange(8, dtype=np.int64)
+        staging.stage_async(torch.from_numpy(ids_np), 0, 1 << 62)
+
+        assert staging.wait_and_match(ids_np) is True
+
+    def test_rejects_different_ids(self, tmp_path):
+        _, staged = _make_staged_table(tmp_path, "wm2")
+        staging = PleRowStaging(staged, max_rows=64, io_threads=1)
+        ids_np = np.arange(8, dtype=np.int64)
+        staging.stage_async(torch.from_numpy(ids_np), 0, 1 << 62)
+
+        assert staging.wait_and_match(ids_np + 100) is False
+
+    def test_false_when_nothing_staged(self, tmp_path):
+        _, staged = _make_staged_table(tmp_path, "wm3")
+        staging = PleRowStaging(staged, max_rows=64, io_threads=1)
+
+        assert staging.wait_and_match(np.arange(4, dtype=np.int64)) is False
+
+
+class TestPleAheadStaging:
+    def _make(self, tmp_path, tag: str, depth: int, max_rows: int = 64):
+        table_u8, staged = _make_staged_table(tmp_path, tag)
+        return table_u8, PleAheadStaging(
+            staged, depth=depth, max_rows=max_rows, io_threads=1
+        )
+
+    def test_roundtrip_hit(self, tmp_path):
+        table_u8, ahead = self._make(tmp_path, "ah1", depth=1)
+        ids_np = np.arange(12, dtype=np.int64)
+        assert ahead.submit(7, ids_np, 0, 1 << 62) is True
+
+        serve = ahead.consume(7, ids_np)
+
+        assert serve is not None
+        got = serve.buffer[:12].view(torch.uint8)
+        assert torch.equal(got, table_u8[ids_np.tolist()])
+
+    def test_consume_empty_queue_returns_none(self, tmp_path):
+        _, ahead = self._make(tmp_path, "ah2", depth=1)
+
+        assert ahead.consume(1, np.arange(4, dtype=np.int64)) is None
+
+    def test_consume_pool_mismatch_drops_head(self, tmp_path):
+        _, ahead = self._make(tmp_path, "ah3", depth=1)
+        ids_np = np.arange(8, dtype=np.int64)
+        ahead.submit(7, ids_np, 0, 1 << 62)
+
+        assert ahead.consume(8, ids_np) is None  # different pool slot: stale
+        assert ahead.consume(7, ids_np) is None  # head was dropped, queue empty
+
+    def test_consume_ids_mismatch_drops_head(self, tmp_path):
+        _, ahead = self._make(tmp_path, "ah4", depth=1)
+        ids_np = np.arange(8, dtype=np.int64)
+        ahead.submit(7, ids_np, 0, 1 << 62)
+
+        assert ahead.consume(7, ids_np + 1) is None
+        assert ahead.consume(7, ids_np) is None  # entry was dropped on mismatch
+
+    def test_fifo_order_across_entries(self, tmp_path):
+        table_u8, ahead = self._make(tmp_path, "ah5", depth=2)
+        ids_a = np.arange(4, dtype=np.int64)
+        ids_b = np.arange(10, 20, dtype=np.int64)
+        ahead.submit(3, ids_a, 0, 1 << 62)
+        ahead.submit(3, ids_b, 0, 1 << 62)
+
+        serve_a = ahead.consume(3, ids_a)
+        serve_b = ahead.consume(3, ids_b)
+
+        assert serve_a is not None and serve_b is not None
+        assert torch.equal(
+            serve_a.buffer[:4].view(torch.uint8), table_u8[ids_a.tolist()]
+        )
+        assert torch.equal(
+            serve_b.buffer[:10].view(torch.uint8), table_u8[ids_b.tolist()]
+        )
+
+    def test_duplicate_submit_skipped(self, tmp_path):
+        _, ahead = self._make(tmp_path, "ah6", depth=2)
+        ids_np = np.arange(8, dtype=np.int64)
+
+        assert ahead.submit(1, ids_np, 0, 1 << 62) is True
+        assert ahead.submit(1, ids_np, 0, 1 << 62) is False  # already queued
+        assert ahead.submit(1, ids_np + 1, 0, 1 << 62) is True
+
+    def test_no_free_buffer_drops_submission(self, tmp_path):
+        # depth d keeps d+1 buffers (one is the in-flight serve) and caps the
+        # FIFO at d entries; a saturated window drops further submissions.
+        _, ahead = self._make(tmp_path, "ah7", depth=1)
+        ids_a = np.arange(8, dtype=np.int64)
+        ids_b = np.arange(20, 24, dtype=np.int64)
+
+        assert ahead.submit(1, ids_a, 0, 1 << 62) is True
+        assert ahead.submit(1, ids_b, 0, 1 << 62) is False  # queue at cap
+
+    def test_serve_buffer_protected(self, tmp_path):
+        _, ahead = self._make(tmp_path, "ah8", depth=1)
+        ids_a = np.arange(4, dtype=np.int64)
+        ids_c = np.arange(30, 34, dtype=np.int64)
+        ids_d = np.arange(40, 44, dtype=np.int64)
+        ids_e = np.arange(50, 54, dtype=np.int64)
+        ahead.submit(1, ids_a, 0, 1 << 62)
+
+        serve_a = ahead.consume(1, ids_a)
+        assert serve_a is not None
+        assert ahead.submit(1, ids_c, 0, 1 << 62) is True  # second buffer
+        # The served buffer is being gathered this forward: never reused.
+        assert ahead.submit(1, ids_d, 0, 1 << 62) is False
+        # Next consume releases the previous serve (caller's D2H drained it).
+        serve_c = ahead.consume(1, ids_c)
+        assert serve_c is not None
+        assert ahead.submit(1, ids_e, 0, 1 << 62) is True
+
+    def test_overflow_submission_returns_false_without_raise(self, tmp_path):
+        _, ahead = self._make(tmp_path, "ah9", depth=1, max_rows=4)
+
+        assert ahead.submit(1, np.arange(8, dtype=np.int64), 0, 1 << 62) is False
+
+
+class TestPleChunkAheadRecord:
+    def test_records_future_chunk_tokens(self, tmp_path, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        req = FakeReq(fill_ids=[10] * 10, end=2)  # 2 done, 8 remain
+
+        record_ple_chunk_ahead([req], torch.tensor([5]))
+
+        assert _PLE_CHUNK_STASH[5] == [10] * 8
+        _PLE_CHUNK_STASH.clear()
+
+    def test_disabled_env_records_nothing(self, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.delenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", raising=False)
+        _PLE_CHUNK_STASH.clear()
+        req = FakeReq(fill_ids=[10] * 10, end=2)
+
+        record_ple_chunk_ahead([req], torch.tensor([5]))
+
+        assert _PLE_CHUNK_STASH == {}
+        _PLE_CHUNK_STASH.clear()
+
+    def test_req_without_next_chunk_skipped(self, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        req = FakeReq(fill_ids=[10] * 6, end=6)  # fully prefilled
+
+        record_ple_chunk_ahead([req], torch.tensor([5]))
+
+        assert _PLE_CHUNK_STASH == {}
+        _PLE_CHUNK_STASH.clear()
+
+    def test_slice_capped_at_remaining_tokens(self, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        req = FakeReq(fill_ids=[7] * 10, end=5)  # 5 remain < depth*cs = 8
+
+        record_ple_chunk_ahead([req], torch.tensor([5]))
+
+        assert _PLE_CHUNK_STASH[5] == [7] * 5
+        _PLE_CHUNK_STASH.clear()
+
+    def test_latest_record_wins_per_pool_slot(self, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        record_ple_chunk_ahead([FakeReq(fill_ids=[1] * 10, end=2)], torch.tensor([5]))
+        record_ple_chunk_ahead([FakeReq(fill_ids=[2] * 10, end=4)], torch.tensor([5]))
+
+        assert _PLE_CHUNK_STASH[5] == [2] * 6
+        _PLE_CHUNK_STASH.clear()
+
+
+class TestPleChunkAheadPrefetch:
+    def _wire(self, tmp_path, tag: str):
+        table_u8, staged = _make_staged_table(tmp_path, tag)
+        host = FakeHost(staged)
+        emb = FakeNGramEmbedding(host)
+        entry = PlePrepEntry(
+            embedding=emb,
+            staging=PleRowStaging(staged, max_rows=64, io_threads=1),
+            vocab_start=0,
+            vocab_end=1 << 62,
+        )
+        return table_u8, host, emb, entry, FakeModel([entry])
+
+    def _fake_hash(self, contexts):
+        return _fake_hash(contexts, heads=2)
+
+    def test_first_forward_miss_then_submits_window(self, tmp_path, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        table_u8, host, emb, entry, model = self._wire(tmp_path, "pf1")
+        ple_batch = FakePleBatch(torch.tensor([[100, 101, 1, 2, 3, 4]]))
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12]] * 4)  # chunk i's own ids
+        stash = [10, 11, 12, 13, 14, 15, 16, 17]
+        _PLE_CHUNK_STASH[5] = list(stash)
+
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        # Miss on the empty queue: the main staging takes chunk i's fill.
+        assert host._staged_serve is None
+        assert np.array_equal(
+            entry.staging._staged_ids, emb.main_ids.reshape(-1).numpy()
+        )
+
+        # The ahead windows compose from the already-built ngram_context plus
+        # the stash tokens: windows [L_i : L_i + T] of the merged sequence.
+        merged = torch.tensor([[100, 101, 1, 2, 3, 4] + stash])
+        windows = merged.unfold(1, 3, 1)
+        assert len(emb.contexts_seen) == 1
+        assert torch.equal(emb.contexts_seen[0], windows[:, 4:12])
+
+        queue = host._staged_ahead._queue
+        assert len(queue) == 2
+        exp1 = self._fake_hash(windows[:, 4:8]).reshape(-1).numpy()
+        exp2 = self._fake_hash(windows[:, 8:12]).reshape(-1).numpy()
+        assert queue[0][0] == 5 and np.array_equal(queue[0][1], exp1)
+        assert queue[1][0] == 5 and np.array_equal(queue[1][1], exp2)
+        _PLE_CHUNK_STASH.clear()
+
+    def test_window_composition_l1_edge(self, tmp_path, monkeypatch):
+        # L_i = 1: the committed history's last two tokens span the old
+        # history column and the single chunk token; the merged-window slice
+        # must still equal the real forward's own windows for chunk i+1.
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        _, host, emb, _, model = self._wire(tmp_path, "pf2")
+        ple_batch = FakePleBatch(torch.tensor([[100, 101, 7]]))
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12]])  # 1 window x 2 heads
+        stash = [10, 11, 12, 13]
+        _PLE_CHUNK_STASH[5] = list(stash)
+
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        # Real forward for chunk i+1: cat([[101, 7], [10, 11, 12, 13]]).
+        real_ctx = torch.tensor([[101, 7, 10, 11, 12, 13]])
+        assert torch.equal(emb.contexts_seen[0], real_ctx.unfold(1, 3, 1))
+        _PLE_CHUNK_STASH.clear()
+
+    def test_second_forward_consumes_serve(self, tmp_path, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        table_u8, host, emb, entry, model = self._wire(tmp_path, "pf3")
+        ple_batch = FakePleBatch(torch.tensor([[100, 101, 1, 2, 3, 4]]))
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12]] * 4)
+        _PLE_CHUNK_STASH[5] = [10, 11, 12, 13, 14, 15, 16, 17]
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+        chunk1_ids = host._staged_ahead._queue[0][1]
+
+        # Forward i+1: the ple_batch advances (history = chunk i's last two
+        # tokens), the main ids are exactly the speculatively staged chunk
+        # i+1 ids -> serve hit, main staging untouched.
+        emb.main_ids = torch.from_numpy(chunk1_ids.reshape(4, 2))
+        ple_batch.ngram_context = torch.tensor([[3, 4, 10, 11, 12, 13]])
+        emb.contexts_seen.clear()
+        _PLE_CHUNK_STASH[5] = [20, 21, 22, 23, 24, 25, 26, 27]
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        assert host._staged_serve is not None
+        got = host._staged_serve.buffer[:8].view(torch.uint8)
+        assert torch.equal(got, table_u8[chunk1_ids.tolist()])
+        # Main staging was skipped this forward: still holding forward i's ids.
+        assert np.array_equal(
+            entry.staging._staged_ids, [11, 12, 11, 12, 11, 12, 11, 12]
+        )
+        # Sliding window: one entry consumed, the next chunk admitted.
+        assert len(host._staged_ahead._queue) == 2
+        _PLE_CHUNK_STASH.clear()
+
+    def test_ids_mismatch_falls_back_to_main_stage(self, tmp_path, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        table_u8, host, emb, entry, model = self._wire(tmp_path, "pf4")
+        ple_batch = FakePleBatch(torch.tensor([[100, 101, 1, 2, 3, 4]]))
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12]] * 4)
+        _PLE_CHUNK_STASH[5] = [10, 11, 12, 13, 14, 15, 16, 17]
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        # The speculative fill cannot be trusted: the forward's own ids
+        # differ from the staged head -> serve stays None, the main staging
+        # takes the fill, and the stale head is dropped.
+        emb.main_ids = torch.tensor([[90, 91]] * 4)
+        _PLE_CHUNK_STASH[5] = [20, 21, 22, 23, 24, 25, 26, 27]
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        assert host._staged_serve is None
+        assert np.array_equal(
+            entry.staging._staged_ids, [90, 91, 90, 91, 90, 91, 90, 91]
+        )
+        _PLE_CHUNK_STASH.clear()
+
+    def test_multi_sequence_batch_skips_ahead(self, tmp_path, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        _, host, emb, entry, model = self._wire(tmp_path, "pf5")
+        ple_batch = FakePleBatch(
+            torch.tensor([[100, 101, 1, 2], [102, 103, 3, 4]]), lengths=(2, 2)
+        )
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12], [13, 14]])
+        stash = [10, 11, 12, 13]
+        _PLE_CHUNK_STASH[5] = list(stash)
+
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        # Only the shape the speculative fill can serve exactly gets ahead
+        # fills; everything else keeps the synchronous double buffer.
+        assert host._staged_ahead is None
+        assert host._staged_serve is None
+        assert _PLE_CHUNK_STASH[5] == stash  # stash untouched
+        assert np.array_equal(entry.staging._staged_ids, [11, 12, 13, 14])
+        _PLE_CHUNK_STASH.clear()
+
+    def test_verify_mode_skips_ahead(self, tmp_path, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        _, host, emb, _, model = self._wire(tmp_path, "pf6")
+        ple_batch = FakePleBatch(torch.tensor([[100, 101, 1, 2]]), mode_name="verify")
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12]])
+        _PLE_CHUNK_STASH[5] = [10, 11, 12, 13]
+
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        assert host._staged_ahead is None
+        assert host._staged_serve is None
+        _PLE_CHUNK_STASH.clear()
+
+    def test_disabled_env_keeps_legacy_behavior(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", raising=False)
+        _PLE_CHUNK_STASH.clear()
+        _, host, emb, entry, model = self._wire(tmp_path, "pf7")
+        ple_batch = FakePleBatch(torch.tensor([[100, 101, 1, 2, 3, 4]]))
+        fb = FakeForwardBatch(5)
+        emb.main_ids = torch.tensor([[11, 12]] * 4)
+        _PLE_CHUNK_STASH[5] = [10, 11, 12, 13, 14, 15, 16, 17]
+
+        prefetch_staged_ple_prefill(model, ple_batch, fb)
+
+        # Depth 0: no ahead pool, no stash pop — exactly the phase-2 double
+        # buffering behavior before this feature.
+        assert host._staged_ahead is None
+        assert _PLE_CHUNK_STASH[5] == [10, 11, 12, 13, 14, 15, 16, 17]
+        assert np.array_equal(
+            entry.staging._staged_ids, [11, 12, 11, 12, 11, 12, 11, 12]
+        )
+        _PLE_CHUNK_STASH.clear()

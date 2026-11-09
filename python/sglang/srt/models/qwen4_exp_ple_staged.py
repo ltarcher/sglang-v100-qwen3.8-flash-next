@@ -32,6 +32,7 @@ imports so its IO machinery can be unit-tested on CPU.
 import json
 import os
 import struct
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -389,6 +390,22 @@ class PleRowStaging:
         cpu = ids.detach().to(torch.long).cpu()
         return cpu.numel() == staged.shape[0] and np.array_equal(cpu.numpy(), staged)
 
+    def wait_and_match(self, ids_np: np.ndarray) -> bool:
+        """Chunk-ahead consume check (docs/v100/PLE_NVME_TIER_DESIGN.md
+        §11.9.5): block until this buffer's speculative fill completed, then
+        compare its id set against ``ids_np`` — the ids the consuming forward
+        computed itself from the real batch. The staged fill was derived
+        speculatively from the previous forward's merged context, so a
+        bit-exact match is the only trust basis; any mismatch sends the
+        caller back to the synchronous path."""
+        self._wait_pending()
+        staged = self._staged_ids
+        return (
+            staged is not None
+            and staged.shape[0] == ids_np.shape[0]
+            and np.array_equal(staged, ids_np)
+        )
+
     def stage(self, ids: torch.Tensor, vocab_start: int, vocab_end: int) -> int:
         """Fill staging for ``ids`` (1D global ids). Returns the slot count.
 
@@ -436,3 +453,88 @@ class PleRowStaging:
                     raise exc
         self._staged_ids = ids_np
         return n
+
+
+class PleAheadStaging:
+    """Chunk-ahead prefetch pool for extend prefill (docs/v100/
+    PLE_NVME_TIER_DESIGN.md §11.9.5).
+
+    While chunk ``i`` computes on the GPU, the rows for chunks ``i+1..i+depth``
+    are already being pread into extra staging buffers, so the gather's
+    ``fill_pending`` tail wait (~198 ms per 64k chunk) disappears into the
+    previous chunks' compute windows. ``depth`` queues ``depth`` speculative
+    fills and holds ``depth + 1`` buffers — the extra one is the buffer just
+    handed out as the current forward's serve, which must not be refilled
+    until the next consume (the caller's id D2H there proves this forward's
+    gathers finished).
+
+    Entries are FIFO, tagged with the req pool slot. ``consume`` trusts a
+    staged fill only after a bit-exact id comparison against the ids the
+    consuming forward computed itself; any mismatch (mixed batches, verify,
+    re-slotted requests, stale stash) drops the entry and the caller falls
+    back to the synchronous path — zero correctness risk, IO timing only.
+    """
+
+    def __init__(
+        self,
+        table: PleStagedTable,
+        depth: int,
+        max_rows: int,
+        io_threads: int | None = None,
+    ):
+        if depth < 1:
+            raise ValueError("PleAheadStaging needs depth >= 1")
+        self.depth = depth
+        self.buffers = [
+            PleRowStaging(table, max_rows, io_threads) for _ in range(depth + 1)
+        ]
+        # FIFO of (pool_idx, ids_np, PleRowStaging); ids kept for the dedup
+        # below (each forward re-derives the whole window from its stash).
+        self._queue: deque = deque()
+        self._serve: PleRowStaging | None = None
+
+    def close(self) -> None:
+        for buf in self.buffers:
+            buf.close()
+
+    def submit(
+        self, pool_idx: int, ids_np: np.ndarray, vocab_start: int, vocab_end: int
+    ) -> bool:
+        """Queue a speculative fill for a future chunk. Non-blocking; skips
+        ids already queued (the sliding window re-derives every chunk each
+        forward) and drops when the window is saturated. Returns True when
+        the fill was queued."""
+        if ids_np.shape[0] > self.buffers[0].max_rows:
+            return False  # speculative: never raise, just skip the fill
+        for _, staged, _buf in self._queue:
+            if staged.shape == ids_np.shape and np.array_equal(staged, ids_np):
+                return False
+        buf = self._pick_free()
+        if buf is None or len(self._queue) >= self.depth:
+            return False
+        buf.stage_async(torch.from_numpy(ids_np), vocab_start, vocab_end)
+        self._queue.append((pool_idx, ids_np, buf))
+        return True
+
+    def consume(self, pool_idx: int, ids_np: np.ndarray) -> PleRowStaging | None:
+        """Hand the head entry's buffer to the caller's gather when it was
+        staged for exactly this forward's ids. The previous forward's serve
+        is released here: the caller already synced its ids D2H, which proves
+        that forward's gathers finished, so the buffer is safe to refill."""
+        self._serve = None
+        if not self._queue:
+            return None
+        head_pool, _head_ids, buf = self._queue.popleft()
+        if head_pool != pool_idx:
+            return None  # stale slot tag; the sync path refills instead
+        if buf.wait_and_match(ids_np):
+            self._serve = buf
+            return buf
+        return None
+
+    def _pick_free(self) -> PleRowStaging | None:
+        queued = {id(buf) for _, _, buf in self._queue}
+        for buf in self.buffers:
+            if buf is not self._serve and id(buf) not in queued:
+                return buf
+        return None

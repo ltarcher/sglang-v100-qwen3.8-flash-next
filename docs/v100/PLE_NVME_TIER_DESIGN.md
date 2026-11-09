@@ -1,10 +1,12 @@
 # PLE n-gram 表 NVMe 分层(staged 后端)设计文档
 
-状态:已实施(2026-11-04/05)。Phase 1 staged NVMe 后端(§10)、Phase 2
+状态:已实施(2026-11-04/05/10)。Phase 1 staged NVMe 后端(§10)、Phase 2
 decode 图 pre-replay staging(§11)与 prefill 双缓冲(§11.9.4)均已落地,
-生产 8110 compose 已切 staged 后端。剩余:chunk-ahead 预取(算 chunk i
-时预取 chunk i+1)未实施(§12 方向,§11.9.4 记录)。本节下方正文保留
-立项时的"未实施"分析视角,实施状态以 §10/§11 各实施记录为准。
+生产 8110 compose 已切 staged 后端。chunk-ahead 预取(§11.9.5,算 chunk i
+时投机预取 chunk i+1..i+d)已实现并过 CPU 单测,默认关
+(`SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=0`),待真机 A/B 后在生产 compose
+开启。本节下方正文保留立项时的"未实施"分析视角,实施状态以 §10/§11
+各实施记录为准。
 日期:2026-11-04(分析含当日实测数字)
 范围:Qwen3.8-Flash-Next NVFP4 线(4×V100-32GB SXM2,TP4,生产配置
 `vllm-Qwen3.8/docker-compose-sglang-v100-mtp-8110.yaml`)
@@ -383,6 +385,7 @@ GPU 侧(真机,§11.9 第 3 步起):
 | --- | --- |
 | `SGLANG_QWEN4_PLE_STAGED_DECODE_PREP = EnvBool(True)` | Phase 2 主开关;False 退回 Phase 1 行为(capture 拒绝),便于 A/B 与回退 |
 | `SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG = EnvBool(False)` | DEBUG 级 oracle 探针:图内 gather 在 capture 期把 flat ids 记入持久缓冲(capture-only,eager prefill/warmup 不覆写),gate 每步把它与上一步 gate ids 比对,失配 `logger.error`、命中 `logger.info`(每步一条;每层一次 D2H,严禁生产常开)。接线成功时打 `gate wired: N PLE layers` |
+| `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD = EnvInt(0)` | chunk-ahead 预取深度(§11.9.5,默认 0=关):extend forward i 投机预取 chunk i+1..i+d 的行,consume 逐位比对兜底。深度 d 需要 d+1 个额外 staging 缓冲(各 ~max_rows×row_bytes,生产 64k chunk 下约 671MB/个);一个 chunk 的计算 ≥ fill/d 才能全遮(生产 ~156ms 计算 vs ~210ms fill → d=2)。依赖 `SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH=1` |
 
 staged 后端 + decode 图 + `DECODE_PREP=False` → 启动期显式 raise
 (把 Phase 1 的 capture 期错误提前到启动)。gate 接线成功与失配都有
@@ -612,6 +615,69 @@ staged 后端。实现要点:
 生产配置:`/home/bso/vllm-Qwen3.8/docker-compose-sglang-v100-mtp-8110.yaml`
 (镜像 `sglang-v100-unified:ple-nvme-20261105`,`--ple-offload-backend
 staged`,shard 目录挂 `/data/sglang-ple-staged` + `REUSE=1`)。
+
+## 11.9.5 实施记录:chunk-ahead 预取(2026-11-10,默认关,待真机 A/B)
+
+§11.9.4 定量的"下一个明确杠杆":算 chunk i 时投机预取 chunk i+1..i+d 的
+PLE 行,把 `fill_pending` 尾部等待(~198ms/chunk)移进更早 chunk 的计算
+窗口。**未开启生产**(默认 0),真机 A/B(depth=1/2)后裁决。
+
+核心洞察与机制:
+
+- **chunk i+1 的 gather ids 是纯输入侧可预算的**:其 ngram context =
+  `cat([history, chunk_i+1])`,而 `history` 恰是 chunk i 的末 2 个 token,
+  且 `ple_batch.ngram_context` 已经 = `cat([history, chunk_i])` →
+  chunk i+1..i+d 的 contexts = `cat([ple_batch.ngram_context, 后续
+  token]).unfold(1, ngram, 1)[:, L_i + j*cs : L_i + (j+1)*cs]`,对任意
+  L_i≥1 与该 chunk 真实 forward 逐位一致(含 L_i=1 时 history 跨旧 history
+  列的边界;单测 `test_window_composition_l1_edge` 锁定)。GPU 侧用各层
+  真实 `_hash_contexts` 计算一次、单次 D2H,按 chunk 行段切片。
+- **未来 token 唯一来源是调度器**:`prepare_for_extend`(`alloc_for_extend`
+  之后)在 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD>0` 时把
+  `full_untruncated_fill_ids[extend_range.end : end + d*chunked_prefill_size]`
+  存进程级 stash(`record_ple_chunk_ahead`,`{pool_idx: tokens}`);
+  forward 起点 pop。陈旧/复用 pool_idx 无害(见下)。
+- **流水线深度 = 缓冲数 − 1**:`PleAheadStaging`(`qwen4_exp_ple_staged.py`)
+  持 depth+1 个 `PleRowStaging`(各带自己的 IO 线程池)+ FIFO 队列(条目含
+  pool_idx 与 ids)。forward i 消费队首(chunk i 的行,即 forward i-1 提交
+  的投机 fill),`wait_and_match` 等待 pending 后与 forward 自算 ids
+  `np.array_equal` 逐位比对:**命中 → 该缓冲成为本轮 serve,主 staging 完全
+  跳过 fill;未命中/队首 pool 不符 → 丢弃该条目,走原 stage_async 路径**。
+  然后 submit chunk i+1..i+d(ids 逐位去重:滑窗每轮重推全窗口,已排队项
+  跳过;队列 ≤ d)。稳态:chunk j 在 forward j−d 提交、forward j 消费,
+  遮盖 d 个 forward;d=2(3 缓冲,~2GB host)即全遮生产 64k chunk 的
+  210ms fill(2×156ms > 210ms);d=1 半遮(尾部残等 ~54ms)。
+- **serve 接线**(`qwen4_exp.py::_gather_staged`):eager 路径 consume-once
+  读 `_staged_serve` 并立即置 None(绝不泄漏进 decode eager break /
+  capture warmup——capture 期仍用主 staging,图内指针在 capture 时定死);
+  consume 的逐位比对本身强于 PREP_DEBUG 探针,debug 开时仍对 serve 复核;
+  每 64 gather 日志追加 `ahead_hits` 计数。
+- **正确性回退语义**:混合 batch、verify、DP gather、断行重排、调度器
+  预算切分导致 chunk 边界偏离 cs、stash 陈旧等一切失配场景,consume 的
+  `np.array_equal` 兜底 → 自动回退原同步路径。oracle:仅 IO 时序变化,
+  逐位一致;staged 行填充本身复用 §4.2 语义(无效槽清零)。
+- **门控**:仅单 req 全行 extend(`lengths==1`、非 verify、ngram_context
+  非 None)pop stash;depth=0 时与 §11.9.4 行为完全一致(不建 pool、不动
+  stash)。forward 起点的 ids D2H 同时证明上一 forward 的 gather kernel
+  已完成 → serve 缓冲方可安全重填(`consume` 入口先释放旧 serve)。
+
+改动面:`qwen4_exp_ple_staged.py`(`PleRowStaging.wait_and_match` +
+`PleAheadStaging`)、`qwen4_exp_ple_prep.py`(stash + `record_ple_chunk_ahead`
++ `_pop_ple_chunk_ahead` 门控 + `_submit_ple_chunk_ahead` + prefetch 扩展,
+签名加 `forward_batch`)、`qwen4_exp.py`(`_gather_staged` serve 接线 +
+host embedding `_staged_serve/_staged_ahead/_staged_ahead_hits` +
+调用点传 `forward_batch`)、`environ.py`(新 env,§11.8 表)、
+`schedule_batch.py`(prepare_for_extend hook,~8 行懒 import)。
+
+单测:s9-pytest 容器 CPU 34/34(原 9 例 + 新增 25 例:`TestPleRowWaitAndMatch`
+3、`TestPleAheadStaging` 9、`TestPleChunkAheadRecord` 5、
+`TestPleChunkAheadPrefetch` 7、env 默认值 1,含 L_i=1 窗口
+等价、滑窗稳态、serve 保护、失配回退、多 req/verify 门控、depth=0 不动
+既有路径);ruff check/format 干净(改动文件)。
+
+待办:真机 A/B(`bench_ple_staged_ab_v100.sh` 口径 + ORACLE_MTP=1 逐位,
+depth=1/2 各测),达标后在生产 compose(8110)登记
+`SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"` 并复测。
 
 ## 11.10 风险清单
 

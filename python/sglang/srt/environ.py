@@ -383,6 +383,17 @@ class Envs:
     # per-layer gather then reads the pre-staged rows without its own D2H.
     # Kill switch for A/B; off restores the per-layer synchronous stage().
     SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH = EnvBool(True)
+    # Chunk-ahead prefill prefetch (design doc section 11.9.5): while chunk i
+    # computes, chunks i+1..i+depth are speculatively staged from the
+    # scheduler's future tokens, so the gather's fill tail wait moves into
+    # earlier chunks' compute windows. 0 disables (plain 11.9.4 double
+    # buffering). Depth d costs d+1 extra staging buffers (~max_rows * row
+    # bytes each) and needs one chunk's compute >= fill / d to fully hide the
+    # fill (64k-token chunks at ~156 ms compute / ~210 ms fill: depth 2).
+    # Requires SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH=1; entries are
+    # verified bit-exactly at consume and fall back to the sync path on any
+    # mismatch, so this is an IO-timing optimization with no output change.
+    SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD = EnvInt(0)
     # Qwen4-Exp PLE and HiCache host slabs of at least 1 GiB prefer the
     # boot-reserved 1 GiB hugetlb pool, on the GPU's NUMA node when that node
     # has enough free pages. Machines without the pool, or with too few free

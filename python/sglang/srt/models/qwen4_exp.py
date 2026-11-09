@@ -1015,6 +1015,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # Eager staging timing (logged every 64 gathers in _gather_staged).
         self._staged_stage_ms = 0.0
         self._staged_stage_n = 0
+        # Chunk-ahead prefetch (§11.9.5): the buffer the extend forward's
+        # prefetch consumed from its speculative pool (consume-once, reset in
+        # _gather_staged), its per-embedding pool, and how many serves hit.
+        self._staged_serve = None
+        self._staged_ahead = None
+        self._staged_ahead_hits = 0
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -1134,6 +1140,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 max_rows=envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get(),
             )
             self._staged_staging = staging
+        serve = None
+        if not capturing:
+            # Chunk-ahead serve (§11.9.5): consume-once, so a stale serve can
+            # never leak into a later eager gather (decode eager breaks and
+            # capture warmup keep using the main staging below).
+            serve = self._staged_serve
+            self._staged_serve = None
+            if serve is not None:
+                staging = serve
         n = flat_ids.numel()
         if (
             capturing
@@ -1145,7 +1160,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # breakable eager break) must not clobber the buffer the gate
             # compares against the previous replay's in-graph ids.
             self._staged_debug_ids[:n].copy_(flat_ids)
-        if not capturing:
+        if serve is not None:
+            # The buffer was speculatively filled by the previous forward's
+            # submit and verified bit-exactly against this forward's own ids
+            # at consume time — gather directly, no fill and no D2H.
+            if envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get():
+                self._debug_verify_prefill_ids(staging, flat_ids, n)
+            self._staged_ahead_hits += 1
+        elif not capturing:
             t0 = time.perf_counter()
             pending = staging.fill_pending(n)
             if pending:
@@ -1166,10 +1188,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             self._staged_stage_n += 1
             if self._staged_stage_n % 64 == 0:
                 logger.info(
-                    "PLE staged eager staging: n=%d pending=%s "
+                    "PLE staged eager staging: n=%d pending=%s ahead_hits=%d "
                     "mean fill wait %.2f ms over %d gathers",
                     n,
                     pending,
+                    self._staged_ahead_hits,
                     self._staged_stage_ms / self._staged_stage_n,
                     self._staged_stage_n,
                 )
@@ -2186,8 +2209,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             # Phase 2 prefill double buffering: stage every PLE layer's rows
             # now (batch prep is the only stream work queued) so the fills
             # overlap early-layer compute; no-op unless the staged backend is
-            # in use (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.4).
-            prefetch_staged_ple_prefill(self, ple_batch)
+            # in use (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.4). The
+            # forward_batch enables the chunk-ahead window (§11.9.5).
+            prefetch_staged_ple_prefill(self, ple_batch, forward_batch)
         aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
