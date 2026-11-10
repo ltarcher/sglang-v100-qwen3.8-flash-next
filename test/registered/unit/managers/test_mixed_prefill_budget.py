@@ -458,6 +458,29 @@ class TestMixedPrefillBudgetControl(CustomTestCase):
         )
         self.assertIsNone(control.begin_step(mixed_no_decode))
 
+    def test_inflight_overflow_evicts_oldest_only(self):
+        # m18 (docs/v100/CODE_REVIEW_TODO_20261110.md): when the in-flight
+        # window saturates, evict the oldest step FIFO-style. Clearing the
+        # whole dict would discard every concurrently queued forward's timing
+        # sample and corrupt the budget's sample stream for that window.
+        control = self.make_control()
+        batches = [
+            SimpleNamespace(
+                forward_mode=SimpleNamespace(is_mixed=lambda: True),
+                decoding_reqs=[object()],
+                extend_num_tokens=2,
+                forward_iter=i,
+            )
+            for i in range(control.MAX_INFLIGHT_STEPS + 1)
+        ]
+        with patch("torch.cuda.Event", _FakeEvent):
+            for b in batches:
+                self.assertIsNotNone(control.begin_step(b))
+        self.assertEqual(len(control._inflight), control.MAX_INFLIGHT_STEPS)
+        self.assertNotIn(0, control._inflight, "oldest step must be evicted")
+        self.assertIn(1, control._inflight, "survivors must be kept")
+        self.assertIn(control.MAX_INFLIGHT_STEPS, control._inflight)
+
 
 class _FakeCpuGroup:
     """One-slot mailbox shared by fake ranks, modeling the CPU-group

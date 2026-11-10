@@ -363,7 +363,12 @@ class MixedPrefillBudgetControl:
         if decode_tokens <= 0:
             return None
         if len(self._inflight) >= self.MAX_INFLIGHT_STEPS:
-            self._inflight.clear()
+            # FIFO eviction (review m18): the window only saturates when
+            # forwards queue up faster than their results resolve, so drop
+            # just the oldest step. Clearing the whole dict would discard
+            # every concurrently queued forward's timing sample and corrupt
+            # the budget's sample stream for that window.
+            self._inflight.pop(next(iter(self._inflight)))
         step = MixedPrefillStep(
             prefill_tokens=batch.extend_num_tokens - decode_tokens,
             decode_tokens=decode_tokens,
