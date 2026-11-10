@@ -869,3 +869,106 @@ class TestPleChunkAheadPrefetch:
             entry.staging._staged_ids, [11, 12, 11, 12, 11, 12, 11, 12]
         )
         _PLE_CHUNK_STASH.clear()
+
+
+class _RecordingGatherKernel:
+    """Triton-style stand-in for _gather_ple_embedding_from_pinned_kernel."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.calls.append((grid, args, kwargs))
+
+        return launch
+
+
+class TestGatherStagedServeWidthGuard:
+    """Consume-side width guard for the chunk-ahead serve path (review M5,
+    2026-11-10).
+
+    The serve buffer is filled from the previous forward's ple_batch, whose
+    width is the LOCAL rank's token count; ``_gather_staged`` consumes
+    ``flat_ids`` whose width is the GLOBAL gathered width under DP attention.
+    A width mismatch makes the gather read the wrong pinned rows (n <=
+    max_rows) or index past the buffer end with a wild
+    ``buffer.data_ptr()+slot*row_bytes`` dereference (n > max_rows) — both
+    silent, and the prep-side bit-exact id match cannot catch it because its
+    two compared sides are both local-width. The consume side must refuse to
+    serve when the staged width differs from the live ids width.
+    """
+
+    def _make_host(self):
+        from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
+
+        host = object.__new__(Qwen4ExpPinnedHostEmbedding)
+        host.embedding_dim = 40
+        host._emit_dtype = torch.float16
+        host._block_d = 32
+        host.weight = torch.zeros(1, dtype=torch.float8_e4m3fn)
+        host._staged_staging = object()  # non-None: skips PleRowStaging build
+        host._staged_serve = None
+        host._staged_ahead_hits = 0
+        host._staged_stage_ms = 0.0
+        host._staged_stage_n = 0
+        host._staged_debug_ids = None
+        return host
+
+    @staticmethod
+    def _make_serve(staged_ids):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            _staged_ids=torch.tensor(staged_ids, dtype=torch.long),
+            buffer=SimpleNamespace(data_ptr=lambda: 0),
+            slot_arange=lambda device: torch.arange(8, device=device, dtype=torch.long),
+        )
+
+    def _gather(self, host, serve, n):
+        host._staged_serve = serve
+        flat_ids = torch.arange(n, dtype=torch.long)
+        output = torch.empty(n, host.embedding_dim, dtype=host._emit_dtype)
+        import sglang.srt.models.qwen4_exp as q4
+
+        kernel = _RecordingGatherKernel()
+        monkeypatch_guard = pytest.MonkeyPatch()
+        monkeypatch_guard.setattr(
+            torch.cuda, "is_current_stream_capturing", lambda: False
+        )
+        monkeypatch_guard.setattr(
+            q4, "_gather_ple_embedding_from_pinned_kernel", kernel
+        )
+        try:
+            return host._gather_staged(flat_ids, output), kernel
+        finally:
+            monkeypatch_guard.undo()
+
+    def test_width_mismatch_refuses_to_serve(self):
+        # The DP shape: staged from a local 5-token chunk, consume gets the
+        # 8-token global flat batch. The gather must fail loud before the
+        # kernel launch — reading the buffer would be wrong rows.
+        host = self._make_host()
+        serve = self._make_serve([10, 11, 12, 13, 14])
+        with pytest.raises(RuntimeError, match="chunk-ahead"):
+            self._gather(host, serve, 8)
+        assert host._staged_serve is None  # consumed once, never re-served
+
+    def test_width_mismatch_refuses_even_under_capacity(self):
+        # n <= max_rows still reads the wrong rows; the guard must not
+        # degrade into "fits in the buffer, serve anyway".
+        host = self._make_host()
+        serve = self._make_serve([10, 11, 12])
+        with pytest.raises(RuntimeError, match="chunk-ahead"):
+            self._gather(host, serve, 5)
+
+    def test_width_match_serves_normally(self):
+        # Healthy non-DP operation: prep-side bit-exact match implies equal
+        # width; the gather proceeds with the recorded kernel.
+        host = self._make_host()
+        serve = self._make_serve([10, 11, 12, 13])
+        output, kernel = self._gather(host, serve, 4)
+        assert output.shape == (4, host.embedding_dim)
+        assert len(kernel.calls) == 1
+        assert kernel.calls[0][0] == (4,)
+        assert host._staged_serve is None

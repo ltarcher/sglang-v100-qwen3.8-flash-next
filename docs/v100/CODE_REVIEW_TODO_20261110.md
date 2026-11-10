@@ -85,14 +85,20 @@
     失败）后实现；全套件 30 passed。DP attention 下该开关混批 chunk 回到原始
     chunked_prefill_size 行为，与其他 DP-attention 不支持特性一致。
 
-- [ ] **M5. chunk-ahead serve 路径无宽度防护**（1/2 验证器确认，带保留）
+- [x] **M5. chunk-ahead serve 路径无宽度防护**（1/2 验证器确认，带保留）（2026-11-10 结案）
   - 位置：`models/qwen4_exp.py:1206-1217`
   - 触发：DP attention + `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD>0` 同时开。DP 下
     `gather_dp_tokens` gather 宽度为全局宽度而 staged 缓冲按本地宽度填充：n≤max_rows
     时本 rank token 读错行（静默错 embedding）；n>max_rows 时 grid 越界、
     `buffer.data_ptr()+slot*row_bytes` 野指针解引用 pinned 内存。
     保留意见：consume 位级校验存在，但其比较两侧同为本地宽度，DP 失配无法被其捕获。
-  - 修复：serve 分支加 `n == staged 宽度` 断言。
+  - **结案结论（采纳修复方向：serve 分支宽度断言）**：`_gather_staged` serve 分支
+    （qwen4_exp.py:1163-1184）在 gather 前断言 `n == staging._staged_ids.numel()`，
+    失配 fail-loud（错误信息点名 DP attention + CHUNK_AHEAD 组合与两条禁用路径）；
+    非 DP 健康路径下 prep 侧位级 id 匹配蕴含宽度相等，断言恒真、零开销。回归测试
+    `test_qwen4_exp_ple_prep.py::TestGatherStagedServeWidthGuard`：全局/本地宽度失配
+    拒绝 serve（含 n≤max_rows 子容量形态）、宽度匹配正常 serve（Recording 内核桩，
+    TDD 红灯先行）。PLE 全套件 83 passed / 3 skipped。
 
 ### Minor
 

@@ -1161,6 +1161,24 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # compares against the previous replay's in-graph ids.
             self._staged_debug_ids[:n].copy_(flat_ids)
         if serve is not None:
+            # The staged fill came from the previous forward's ple_batch: its
+            # width is the LOCAL rank's token count, while flat_ids is the
+            # GLOBAL gathered width under DP attention. A mismatch reads wrong
+            # pinned rows (n <= max_rows) or walks the buffer off its end with
+            # a wild data_ptr dereference (n > max_rows), and the prep-side
+            # bit-exact id match cannot catch it (both its sides are
+            # local-width) — refuse to serve (review M5, 2026-11-10).
+            staged_w = (
+                staging._staged_ids.numel() if staging._staged_ids is not None else -1
+            )
+            if n != staged_w:
+                raise RuntimeError(
+                    "PLE chunk-ahead serve width mismatch: this forward has "
+                    f"{n} ids but the speculative fill staged {staged_w} "
+                    "rows; likely DP attention running with "
+                    "SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD>0 (unsupported "
+                    "combination — disable one of them)."
+                )
             # The buffer was speculatively filled by the previous forward's
             # submit and verified bit-exactly against this forward's own ids
             # at consume time — gather directly, no fill and no D2H.
