@@ -16,7 +16,9 @@ Boundary scenarios covered (high-risk areas per the streaming-KV lessons):
 """
 
 import os
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.environ import envs
@@ -24,6 +26,7 @@ from sglang.srt.models.qwen4_exp_ple_staged import (
     PLE_STAGED_MAGIC,
     PleRowStaging,
     PleStagedTable,
+    ensure_max_rows_for_prefill,
     staged_table_file_name,
 )
 
@@ -421,6 +424,60 @@ class TestStageAsyncPrefillPrefetch:
         assert staging.fill_pending(40) is False
         for slot, gid in enumerate(ids.tolist()):
             assert torch.equal(staging.buffer[slot], table[gid].view(torch.uint8))
+
+
+class TestEnsureMaxRowsForPrefill:
+    """m12 boot guard (docs/v100/CODE_REVIEW_TODO_20261110.md): stage_async
+    raises on a gather wider than the staging capacity, which would kill the
+    scheduler mid-serve on the first long prefill under a legal
+    chunked_prefill_size > default max_rows / rows-per-token config. The boot
+    helper sizes the staging for the prefill width bound instead."""
+
+    def _patch_schedule(self, monkeypatch, chunked_prefill_size):
+        import sglang.srt.runtime_context as rc
+
+        schedule = SimpleNamespace(chunked_prefill_size=chunked_prefill_size)
+        monkeypatch.setattr(rc, "get_schedule", lambda: schedule)
+
+    def test_default_capacity_covers_default_chunk(self, monkeypatch):
+        # 16384 tokens x 16 rows/token == the 262144 default: no-op, env left
+        # untouched (still unset).
+        monkeypatch.delenv("SGLANG_QWEN4_PLE_STAGED_MAX_ROWS", raising=False)
+        self._patch_schedule(monkeypatch, 16384)
+        ensure_max_rows_for_prefill(16)
+        assert envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get() == 262144
+        assert not envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.is_set()
+
+    def test_oversize_chunk_auto_raises(self, monkeypatch):
+        monkeypatch.delenv("SGLANG_QWEN4_PLE_STAGED_MAX_ROWS", raising=False)
+        self._patch_schedule(monkeypatch, 32768)
+        ensure_max_rows_for_prefill(16)
+        assert envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get() == 32768 * 16
+
+    def test_explicit_max_rows_too_small_fails_loud(self, monkeypatch):
+        # An explicit SGLANG_QWEN4_PLE_STAGED_MAX_ROWS is operator intent:
+        # silently overriding it would be a surprise memory bump. Refuse
+        # instead of raising behind their back.
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_MAX_ROWS", "4096")
+        self._patch_schedule(monkeypatch, 4096)  # required = 65536 > 4096
+        with pytest.raises(ValueError, match="SGLANG_QWEN4_PLE_STAGED_MAX_ROWS"):
+            ensure_max_rows_for_prefill(16)
+
+    def test_explicit_max_rows_compatible_passes(self, monkeypatch):
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_MAX_ROWS", "65536")
+        self._patch_schedule(monkeypatch, 4096)  # required = 65536
+        ensure_max_rows_for_prefill(16)
+        assert envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get() == 65536
+
+    def test_disabled_chunked_prefill_refused(self, monkeypatch):
+        # -1 (chunking disabled) makes the prefill width unbounded: no finite
+        # staging can cover it, so refuse at boot with guidance instead of
+        # letting the first long prefill kill the scheduler.
+        monkeypatch.delenv("SGLANG_QWEN4_PLE_STAGED_MAX_ROWS", raising=False)
+        for bad in (-1, None, 0):
+            self._patch_schedule(monkeypatch, bad)
+            with pytest.raises(ValueError, match="chunked_prefill_size"):
+                ensure_max_rows_for_prefill(16)
 
 
 class TestEnvDefaults:

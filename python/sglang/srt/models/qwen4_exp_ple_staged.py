@@ -30,6 +30,7 @@ imports so its IO machinery can be unit-tested on CPU.
 """
 
 import json
+import logging
 import os
 import struct
 from collections import deque
@@ -39,6 +40,8 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 PLE_STAGED_MAGIC = b"SGPLSTG1"
 PLE_STAGED_VERSION = 1
@@ -539,3 +542,52 @@ class PleAheadStaging:
             if buf is not self._serve and id(buf) not in queued:
                 return buf
         return None
+
+
+def ensure_max_rows_for_prefill(rows_per_token: int) -> None:
+    """Boot-time width guard (review m12): ``stage``/``stage_async`` raise on
+    a gather wider than ``max_rows``, which would kill the scheduler mid-serve
+    on the first long prefill under a legal chunked_prefill_size whose
+    ``chunked_prefill_size * rows_per_token`` exceeds the staging capacity.
+
+    Prefill extends are bounded by chunked_prefill_size tokens (chunking
+    disabled => unbounded => no finite staging covers it), so size the
+    staging for that bound at boot: auto-raise the unset default; refuse when
+    the operator pinned SGLANG_QWEN4_PLE_STAGED_MAX_ROWS explicitly (silent
+    override would be a surprise pinned-memory bump) or disabled chunked
+    prefill. ``rows_per_token`` is the per-token gather width —
+    ``(ngram_size - 1) * heads_per_ngram`` (Qwen3.8-Flash-Next: 16, so the
+    16384-token default chunk exactly fills the 262144-row default staging)."""
+    from sglang.srt.runtime_context import get_schedule
+
+    chunked_prefill_size = get_schedule().chunked_prefill_size
+    if chunked_prefill_size is None or chunked_prefill_size <= 0:
+        raise ValueError(
+            "PLE staged backend requires chunked prefill: "
+            f"chunked_prefill_size={chunked_prefill_size!r} leaves the prefill "
+            "gather width unbounded, so the first long prefill exceeds the "
+            "staging capacity and kills the scheduler. Set "
+            "--chunked-prefill-size to a positive value."
+        )
+    required = chunked_prefill_size * rows_per_token
+    if required <= envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get():
+        return
+    if envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.is_set():
+        raise ValueError(
+            "PLE staged staging capacity too small: prefill gathers reach "
+            f"chunked_prefill_size ({chunked_prefill_size}) x "
+            f"{rows_per_token} = {required} rows, but the explicitly set "
+            "SGLANG_QWEN4_PLE_STAGED_MAX_ROWS is "
+            f"{envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.get()}. Raise it (each "
+            "staging buffer is max_rows x row_bytes pinned) or lower "
+            "--chunked-prefill-size."
+        )
+    envs.SGLANG_QWEN4_PLE_STAGED_MAX_ROWS.set(required)
+    logger.warning(
+        "PLE staged staging auto-raised to %d rows to cover "
+        "chunked_prefill_size=%d x %d rows/token (first gather wider than "
+        "the previous capacity would otherwise kill the scheduler).",
+        required,
+        chunked_prefill_size,
+        rows_per_token,
+    )

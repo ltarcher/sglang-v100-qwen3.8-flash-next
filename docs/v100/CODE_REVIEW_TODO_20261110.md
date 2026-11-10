@@ -143,10 +143,19 @@
     指引（强制 re-materialize 需重新构建 12.2GiB NVMe 表，热更新端点不值得）。
     回归 `test_qwen4_exp_ple_prep.py::TestStagedWeightUpdateGuard`（staged 后端拒绝、
     非 staged 正常放行）；prep 41 passed + staged 25 passed。
-- [ ] m12. `stage_async` 对 n>max_rows 直接 ValueError 杀 scheduler
+- [x] **m12. `stage_async` 对 n>max_rows 直接 ValueError 杀 scheduler**（2026-11-10 结案）
   - `models/qwen4_exp_ple_staged.py:338-343`。阈值 262144 行 = 16384 tokens（已实测核实）；
     `chunked_prefill_size=-1` 或 >16384 的合法配置首条长 prefill 崩溃。
-  - 修复：boot 期校验 chunked_prefill_size 与 max_rows 相容或自动上调。
+  - **结案结论（boot 期宽度防护）**：新增 `ensure_max_rows_for_prefill(rows_per_token)`
+    （`rows_per_token = (ngram_size-1) × heads_per_ngram`，Qwen3.8 为 16），在
+    `Qwen4ExpNGramEmbedding.__init__` staged 分支调用：`chunked_prefill_size ≤ 0`
+    （-1/禁用，宽度无界）→ boot ValueError 拒绝；所需行数超过默认容量且
+    `SGLANG_QWEN4_PLE_STAGED_MAX_ROWS` 未显式设置 → 自动上调并 warning；显式设置
+    但不足 → ValueError（不静默覆盖操作者意图）。`get_schedule().chunked_prefill_size`
+    在调度进程 publish 前 memory hook 已解析为具体值（arg_groups/pipeline.py:209），
+    模型 init 期读取安全。回归 `test_qwen4_exp_ple_staged.py::TestEnsureMaxRowsForPrefill`
+    （默认兼容 no-op / 超容自动上调 / 显式过小拒绝 / 显式相容放行 / -1+None+0 拒绝，
+    TDD 红灯先行）；staged 30 passed、prep 41 passed；ruff 干净。
 - [ ] m13. chunk-ahead miss 路径先等满整个 fill 再比较 ids
   - `models/qwen4_exp_ple_staged.py:520-534`。ids_np 本已是 host 侧 numpy，可先比较再等；
     miss 时白付整段 NVMe 随机行 IO 于关键路径。默认 CHUNK_AHEAD=0 生产不受影响。

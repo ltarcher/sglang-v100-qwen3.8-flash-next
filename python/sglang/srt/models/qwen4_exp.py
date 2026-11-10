@@ -647,6 +647,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             persistent=True,
         )
         if offload_embedding:
+            if getattr(config, "ple_offload_backend", "pinned") == "staged":
+                from sglang.srt.models.qwen4_exp_ple_staged import (
+                    ensure_max_rows_for_prefill,
+                )
+
+                # Boot width guard (review m12): stage_async would raise on
+                # the first gather wider than the staging capacity, which
+                # kills the scheduler mid-serve. Prefill extends are bounded
+                # by chunked_prefill_size tokens x ngram_heads rows each —
+                # size the staging for that bound at boot.
+                ensure_max_rows_for_prefill(self.ngram_heads)
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
