@@ -187,7 +187,7 @@ def test_dense_prefill_retains_mtp_seed_indices(monkeypatch, capture, compressed
         qwen_sparse_attn_backend, "use_sm70_qsa_dense_prefill", lambda *args: True
     )
     layer = SimpleNamespace(indexer=RecordingIndexer(), layer_id=2)
-    output = qwen4_exp.Qwen4ExpAttentionDecoderLayer._compute_qsa_topk_indices(
+    output = qwen4_exp.Qwen4ExpAttentionDecoderLayer._compute_qsa_topk_indices_eager(
         layer, torch.zeros((3, 2560)), torch.arange(3), SimpleNamespace()
     )
     assert calls == [compressed and not capture]
