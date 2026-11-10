@@ -182,9 +182,12 @@ def _qsa_cache_view(cache: torch.Tensor, like: torch.Tensor = None) -> torch.Ten
         ext = _load_sm70_cuda_decode_ops()
         assert ext is not None, "SM70 decode ops required for pair-split peers"
         shape = list(like.shape) if like is not None else [cache.numel]
-        return ext.sm70_as_tensor(
-            cache.data_ptr(), shape, cache.dtype
-        )
+        # Mirror the local branch's dtype semantics (review m22): the op reads
+        # an E5M2 pool through its uint8 byte view (one byte per element), an
+        # FP16 pool as half. Passing the raw float8 dtype through would hand
+        # the op a tensor it cannot read as bytes.
+        dtype = torch.uint8 if cache.dtype == torch.float8_e5m2 else cache.dtype
+        return ext.sm70_as_tensor(cache.data_ptr(), shape, dtype)
     if cache.dtype == torch.float8_e5m2:
         return cache.view(torch.uint8).contiguous()
     return cache.contiguous()

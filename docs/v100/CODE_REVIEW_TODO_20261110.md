@@ -255,10 +255,19 @@
     `test_base_processor_unmatched_tokens.py::TestStopIterationScopedToModality`
     （混排 prompt drop/默认两策略 + loader 级哨兵契约，TDD 红灯先行），本套件
     10 passed；bad_input + image_decode 套件 20 passed 无回归；ruff 干净。
-- [ ] m22. ImportedDeviceBuffer 分支缺 e5m2→uint8 byte view
+- [x] **m22. ImportedDeviceBuffer 分支缺 e5m2→uint8 byte view**（2026-11-10 结案）
   - `tilelang_fa_v100/_decode_cuda.py:181-191`。e5m2+PAIR decode 响亮报错；
     fp16 生产不受影响。
-  - 修复：peer 分支镜像本地 byte view。
+  - **结案结论（peer 分支镜像本地 byte view）**：`_qsa_cache_view` peer 分支把
+    `sm70_as_tensor` 收到的 dtype 由裸 `cache.dtype` 改为
+    `torch.uint8 if cache.dtype == torch.float8_e5m2 else cache.dtype`（e5m2 每
+    元素 1 字节，byte view 保 numel/shape 不变），与本地分支的
+    `cache.view(torch.uint8)` 语义一致；fp16 peer 原样直传。新增 CPU 单测
+    `test_qsa_cache_view_pair_dtype.py`（peer e5m2→uint8/peer fp16 直传/本地 e5m2
+    view/本地 fp16 直传；stub `ImportedDeviceBuffer`+`_load_sm70_cuda_decode_ops`，
+    TDD 红灯先行）4 passed；GPU 侧 `test_kv_host_tier_pair_gpu_kernels.py` 需真机
+    （本机无 V100），e5m2+PAIR 的端到端验证留待目标机。ruff 干净（`Path` 存量
+    未用 import 不动）。
 - [ ] m23. grouped planner 第二个隐藏 D2H 同步
   - `tilelang_fa_v100/_kernels_grouped_sparse_prefill.py:257`。`int(group_slot[-1])`
     隐式 .item()，与 docstring "one scalar readback" 相悖。
