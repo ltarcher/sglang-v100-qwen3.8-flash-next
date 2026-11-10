@@ -600,6 +600,29 @@ def _p3_gather_kernel(
         )
 
 
+def _check_pair_split_ranking(
+    attn_tp_rank: int, attn_tp_size: int, world_rank: int, world_size: int
+) -> None:
+    """Pair-split pairs ranks as ``attn_tp_rank ^ 1`` and ships IPC handles
+    over the *world* group (pair_split_ipc send/recv on world ranks). That
+    pairing is only correct when the attention-TP group is the whole world
+    group and even-sized (review m9): odd TP pairs a rank with itself
+    (hang), DP/PP maps ranks cross-wise (silently wrong KV).
+    """
+    if attn_tp_size % 2 != 0:
+        raise ValueError(
+            "pair-split requires an even attention-TP size; got "
+            f"attn_tp_size={attn_tp_size}"
+        )
+    if (world_rank, world_size) != (attn_tp_rank, attn_tp_size):
+        raise ValueError(
+            "pair-split requires the attention-TP group to be the whole world "
+            "group (no DP/PP), because the IPC rendezvous pairs ranks as "
+            "attn_tp_rank^1 over world ranks: attn_tp="
+            f"({attn_tp_rank}/{attn_tp_size}) world=({world_rank}/{world_size})"
+        )
+
+
 class KVHostTier:
     """Pinned host mirror + residency bookkeeping for the QSA full-KV pool."""
 
@@ -1110,6 +1133,16 @@ class KVHostTier:
         self.pair_block = envs.SGLANG_V100_KV_HEAD_LAYOUT_BLOCK.get()
         self.pair_pages = 2 * self.phys_pages
         rank = get_parallel().attn_tp_rank
+        import torch.distributed as dist
+
+        # Review m9: fail loudly at boot instead of hanging or crossing KV
+        # when the pairing assumption (attn-TP == world, even size) breaks.
+        _check_pair_split_ranking(
+            rank,
+            get_parallel().attn_tp_size,
+            dist.get_rank(),
+            dist.get_world_size(),
+        )
         # Group parity inside the pair: even TP ranks own even groups. The
         # pair members are (2i, 2i+1); QKVParallelLinear's shard_id =
         # kv_tp_rank // replicas places both members on the same head, so

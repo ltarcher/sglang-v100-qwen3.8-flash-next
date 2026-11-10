@@ -130,3 +130,19 @@ def test_export_rejects_offset_tensor(monkeypatch):
     offset = torch.zeros(32, dtype=torch.float16)[16:]
     with pytest.raises(ValueError, match="allocation base"):
         mod._tensor_ipc_bytes(offset)
+
+
+def test_pair_split_ranking_gate():
+    """m9: the rendezvous pairs ranks as attn_tp_rank^1 and ships handles
+    over the *world* group; that is only correct when the attention-TP group
+    is the whole world and even-sized. Odd TP pairs rank 0 with itself
+    (hang); DP/PP maps ranks cross-wise (silently wrong KV)."""
+    from sglang.srt.mem_cache.kv_host_tier import _check_pair_split_ranking
+
+    _check_pair_split_ranking(2, 4, 2, 4)  # healthy TP4
+    with pytest.raises(ValueError, match="even attention-TP"):
+        _check_pair_split_ranking(0, 3, 0, 3)
+    with pytest.raises(ValueError, match="whole world"):
+        _check_pair_split_ranking(0, 2, 0, 4)  # attn-TP group smaller than world
+    with pytest.raises(ValueError, match="whole world"):
+        _check_pair_split_ranking(1, 2, 3, 4)  # rank identity mismatch
