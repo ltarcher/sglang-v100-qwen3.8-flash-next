@@ -731,7 +731,36 @@ serve gather 打印 `n/sum(flat)/sum(staged)`;`_debug_spot_check_serve_rows`
 TP1-3 `checked=0`、只可能检查到 TP0。已改为 `data_offset + local *
 row_bytes` + 固定种子随机采样;在 CPU 容器用真实 shard 文件验证:
 干净 staging → `checked=56 mismatches=0`,注入 1 字节翻转 → 捕获
-`ROW MISMATCH slot=3`。真机 depth=2 复跑取行级证据仍待做。
+`ROW MISMATCH slot=3`。
+
+### 11.9.5.2 spot-check 修复后的 depth=2 复跑(2026-11-10,4×V100 真机)
+
+探针修复后立即复跑一次 depth=2 + long_prefill(`/data/ple_ahead_oracle_d2fix`),
+取到 serve 路径的行级字节证据:
+
+| rank | vs | checked | mismatches |
+| --- | --- | --- | --- |
+| TP0 | 0 | 72 | **0** |
+| TP1 | 80000384 | 60 | **0** |
+| TP2 | 160000768 | 64 | **0** |
+| TP3 | 240001152 | 60 | **0** |
+
+4 分片 256 采样全部零错,证明 chunk-ahead serve 路径**不只是 ids 对齐
+(§11.9.5 原有 consume `np.array_equal` + gate self-check)**,填充的
+**行字节也与同步路径从 shard 文件读得的完全一致**。退化签名未出现,
+long_prefill 首次分叉 token 15(stat2a 为 21,stat2b 为 token 0 但连贯),
+短用例 7 个全部逐位一致,gate self-check 1352 步 0 mismatch。
+chunk-ahead 数据面数值与行内容双重证实正确。
+
+先前遗留问题"staged 预填在长 prompt 下行错读"(§11.9.5.1 第 4 条)被
+本次复跑否证:若 staged 预填行错,serve 缓冲字节必然跟着错,但行级
+比对零错。**退化嫌疑收敛为长 prompt 路径的 per-boot 非确定性**,
+与 chunk-ahead 无关。
+
+后续:真机 A/B(`bench_ple_staged_ab_v100.sh`,depth=1/2 各测),达标后
+生产 compose 登记 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"`。长 prompt
+非确定另立调查(候选:首 token 近并列 logprob 放大、`--max-mamba-cache-size
+20` 紧张下的 state 复用、split-KV 非确定归约)。
 
 单测本步补 2 例(36/36 通过,ruff clean):尾 chunk(partial 或恰满)因
 调度器不再记 stash 而永不 serve(即使队列投机 fill 逐位相同);已完成请求
