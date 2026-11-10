@@ -275,6 +275,17 @@ def record_ple_chunk_ahead(reqs, pool_indices_cpu) -> None:
         )
 
 
+def release_ple_chunk_stash(pool_idx: int) -> None:
+    """Invalidate the chunk-ahead stash entry for a req pool slot (review
+    m16). Called from ``release_kv_cache`` — the choke point where a finished,
+    aborted, or retracted request returns its slot: a stale entry left under a
+    freed slot is consumed by the slot's next occupant as a wrong speculative
+    fill (correctness stays guarded by the consume-side ids compare, but it
+    pays a full-capacity fill wait), and multi-request-batch entries are never
+    consumed at all, so they would otherwise leak forever."""
+    _PLE_CHUNK_STASH.pop(int(pool_idx), None)
+
+
 def _pop_ple_chunk_ahead(ple_batch, forward_batch) -> tuple:
     """Gate + stash pop for the chunk-ahead window. Returns ``(pool_idx,
     tokens)`` only for the shape the speculative fill can serve exactly —

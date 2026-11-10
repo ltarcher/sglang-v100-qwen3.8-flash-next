@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 from array import array
+from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.srt.models.qwen4_exp_ple_prep import (
@@ -33,6 +34,7 @@ from sglang.srt.models.qwen4_exp_ple_prep import (
     _PLE_CHUNK_STASH,
     prefetch_staged_ple_prefill,
     record_ple_chunk_ahead,
+    release_ple_chunk_stash,
 )
 from sglang.srt.models.qwen4_exp_ple_staged import (
     PleAheadStaging,
@@ -599,6 +601,92 @@ class TestPleChunkAheadRecord:
         record_ple_chunk_ahead([FakeReq(fill_ids=[2] * 10, end=4)], torch.tensor([5]))
 
         assert _PLE_CHUNK_STASH[5] == [2] * 6
+        _PLE_CHUNK_STASH.clear()
+
+
+class TestPleChunkStashRelease:
+    """m16 (docs/v100/CODE_REVIEW_TODO_20261110.md): a stash entry keyed by a
+    req pool slot must not outlive the request — when the request finishes,
+    aborts, or retracts, the slot returns to the free pool and the slot's next
+    occupant would consume the stale entry as a wrong speculative fill
+    (correctness is guarded by the consume-side ids compare, but it wastes a
+    full-capacity fill wait), and multi-request-batch entries are never
+    consumed at all, so they used to leak forever."""
+
+    def test_release_pops_entry(self):
+        _PLE_CHUNK_STASH[42] = [1, 2, 3]
+        release_ple_chunk_stash(42)
+        assert 42 not in _PLE_CHUNK_STASH
+
+    def test_release_unknown_slot_is_noop(self):
+        release_ple_chunk_stash(2**40)
+        assert True  # no raise
+
+    def test_recorded_entry_cannot_outlive_release(self, monkeypatch):
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        req = FakeReq(fill_ids=[10] * 10, end=2)
+
+        record_ple_chunk_ahead([req], torch.tensor([5]))
+        assert _PLE_CHUNK_STASH[5] == [10] * 8
+
+        release_ple_chunk_stash(5)
+        assert _PLE_CHUNK_STASH == {}
+        _PLE_CHUNK_STASH.clear()
+
+    def test_release_kv_cache_invalidates_stash(self, monkeypatch):
+        # The wiring point: release_kv_cache is the single choke point where a
+        # finished/aborted/retracted request returns its req pool slot.
+        from sglang.srt.mem_cache import common as mem_common
+
+        monkeypatch.setattr(
+            mem_common, "_release_overallocated_kv_indices", lambda *a, **k: None
+        )
+        popped = []
+
+        class FakeKV:
+            holds_kv = True
+            is_kv_released = False
+            cache_protected_len = 0
+            kv_allocated_len = 10
+
+            def mark_kv_released(self):
+                self.is_kv_released = True
+
+        class FakeTreeCache:
+            def claim_kv_row(self, req):
+                return None
+
+            def free_kv_row(self, kv, ranges):
+                pass
+
+            def unpin(self, req):
+                pass
+
+            def on_release(self, req, inserted):
+                pass
+
+            class req_to_token_pool:
+                @staticmethod
+                def free(req):
+                    popped.append(req.req_pool_idx)
+
+        req = SimpleNamespace(
+            kv=FakeKV(),
+            req_pool_idx=77,
+            owned_kv_len=lambda: 10,
+            skip_radix_cache_insert=True,
+            rid="fake",
+        )
+        _PLE_CHUNK_STASH[77] = [1, 2, 3]
+
+        mem_common.release_kv_cache(req, FakeTreeCache(), is_insert=False)
+
+        assert popped == [77]
+        assert 77 not in _PLE_CHUNK_STASH
         _PLE_CHUNK_STASH.clear()
 
 

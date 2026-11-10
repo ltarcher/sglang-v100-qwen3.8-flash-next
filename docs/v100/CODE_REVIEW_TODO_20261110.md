@@ -191,10 +191,18 @@
     `test_qwen4_exp_ple_staged.py::TestCheckpointFingerprint`（helper 安全且可区分/
     异指纹换文件名/异指纹 meta 不符强制重写/同指纹 REUSE 复用，TDD 红灯先行）；
     prep+staged 两套件 79 passed；ruff 干净。
-- [ ] m16. `_PLE_CHUNK_STASH` 请求完成/中止后不失效
+- [x] **m16. `_PLE_CHUNK_STASH` 请求完成/中止后不失效**（2026-11-10 结案）
   - `models/qwen4_exp_ple_prep.py:256-292`。slot 复用弹旧条目触发错误投机预读+满额等待
     （正确性由 consume ids 兜底）；多请求批的 stash 亦不被消费。
-  - 修复：请求 finish/abort 或 release slot 时 pop 对应条目。
+  - **结案结论（slot 回收点 pop）**：新增 `release_ple_chunk_stash(pool_idx)`，在
+    `mem_cache/common.py::release_kv_cache`（finish/abort/retract 统一的 req slot
+    回收 choke point，`req_to_token_pool.free(req)` 之后）惰性导入调用——条目不再
+    可能活过请求生命周期：slot 复用者不再吃到过期投机 fill（省掉满额 fill 等待），
+    多请求批从不被消费的条目也随之不再泄漏。mamba 早退路径（不持有 KV 直接 return）
+    不经过该点，但该路径模型（DSV4.1）不使用 PLE chunk stash，无影响。回归
+    `test_qwen4_exp_ple_prep.py::TestPleChunkStashRelease`（release pop/未知 slot
+    no-op/record→release 生命周期/release_kv_cache 接线端到端，TDD 红灯先行）；
+    prep+staged 两套件 83 passed；ruff 干净。
 - [ ] m17. `_mixed_tail_mask` 回退防御缺口
   - `layers/attention/qwen_sparse_attn_backend.py:782-796`。把任何 prefix 非对齐行判为
     decode tail，且 mixed 批整体跳过 prefix 对齐 assert（:842-843）。触发前提（非对齐

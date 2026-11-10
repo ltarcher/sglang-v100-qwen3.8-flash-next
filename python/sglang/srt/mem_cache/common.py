@@ -340,6 +340,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
     req.kv.mark_kv_released()
+    # The slot is back in the free pool: invalidate any chunk-ahead stash
+    # entry keyed by it (review m16) so the slot's next occupant cannot
+    # consume a stale speculative fill. Lazy import: the stash lives in the
+    # Qwen4 PLE prep module and importing it eagerly would cycle models ->
+    # mem_cache -> models.
+    from sglang.srt.models.qwen4_exp_ple_prep import release_ple_chunk_stash
+
+    release_ple_chunk_stash(int(req.req_pool_idx))
 
 
 def _release_overallocated_kv_indices(
