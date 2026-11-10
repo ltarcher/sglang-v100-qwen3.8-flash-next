@@ -242,10 +242,19 @@
     按 pinned 尺寸标定，切 staged 属 §11.9.4 的实测 A/B 范畴而非默认值。在其
     `--ple-offload-embedding` 处补 divergence note（脚本 staged 的收益/代价、本
     compose 保留 pinned 的原因、opt-in 方法），行为零变更、无测试面。
-- [ ] m21. 多模态 StopIteration 合并语义：混排请求静默丢其他模态 token
+- [x] **m21. 多模态 StopIteration 合并语义：混排请求静默丢其他模态 token**（2026-11-10 结案）
   - `multimodal/processors/base_processor.py:1536-1551`（早退点 :1142-1148）。
     纯图像单模态生产不受影响。
-  - 修复：早退仅作用于同模态，或区分"数据缺失"与"迭代器提前退出"。
+  - **结案结论（None 哨兵区分"数据缺失"）**：`submit_data_loading_tasks` 的
+    StopIteration 早退改为 append `(None, None, None)` task_info + `None` future 哨兵
+    并 `continue`（提交覆盖每个特殊 token，后续模态照常提交）；外层消费循环遇到
+    modality 为 None 的哨兵条目时按 token 级套用同一 unmatched 策略（显式
+    `SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP` 优先于 precomputed echo 保留启发式，
+    都不满足则 RuntimeError），并同步消费配对的 None future 保持双迭代器对齐。
+    原 `except StopIteration` 处理器保留作安全网。回归
+    `test_base_processor_unmatched_tokens.py::TestStopIterationScopedToModality`
+    （混排 prompt drop/默认两策略 + loader 级哨兵契约，TDD 红灯先行），本套件
+    10 passed；bad_input + image_decode 套件 20 passed 无回归；ruff 干净。
 - [ ] m22. ImportedDeviceBuffer 分支缺 e5m2→uint8 byte view
   - `tilelang_fa_v100/_decode_cuda.py:181-191`。e5m2+PAIR decode 响亮报错；
     fp16 生产不受影响。

@@ -1145,7 +1145,14 @@ class BaseMultimodalProcessor(ABC):
                     logger.warning(
                         f"Mismatch: More '{modality.name}' tokens found than corresponding data provided."
                     )
-                    return futures, task_info
+                    # Data is missing for THIS token only (review m21):
+                    # submit a None sentinel so the consumer can skip
+                    # exactly this token. Returning early here used to
+                    # abandon every remaining text part's data, silently
+                    # dropping other modalities in a mixed prompt.
+                    task_info.append((None, None, None))
+                    futures.append(None)
+                    continue
 
                 frame_count_limit = None
                 if modality == Modality.IMAGE and image_estimated_frames_iter:
@@ -1493,6 +1500,31 @@ class BaseMultimodalProcessor(ABC):
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
+                    if modality is None:
+                        # Sentinel from submit_data_loading_tasks: data is
+                        # missing for exactly this token (review m21) — apply
+                        # the same unmatched-token policy scoped to it, while
+                        # later tokens of other modalities keep their data.
+                        # The explicit drop flag outranks the precomputed-echo
+                        # keep heuristic: an operator enabling it asked for
+                        # unmatched tokens to be dropped everywhere.
+                        if envs.SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP.get():
+                            logger.warning(
+                                "Dropping unmatched multimodal token in prompt "
+                                "(SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP=1): %r",
+                                text_part,
+                            )
+                        elif has_precomputed_input:
+                            new_text_parts += [text_part]
+                        else:
+                            raise RuntimeError(
+                                "Mismatch: more multimodal tokens in the prompt "
+                                f"than corresponding data provided for {text_part!r}"
+                            )
+                        # Discard the paired None future so both iterators
+                        # stay aligned for the remaining tokens.
+                        next(futures_iter)
+                        continue
                     result = await asyncio.wrap_future(next(futures_iter))
 
                     is_precomputed, new_imgs, new_vids, new_auds = (
