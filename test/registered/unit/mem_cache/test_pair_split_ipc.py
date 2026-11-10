@@ -98,3 +98,35 @@ class TestPairSplitIpcExchange:
 
         assert _HANDLE_BYTES == 128
         assert ctypes.sizeof(cudaIpcMemHandle_t) == _HANDLE_BYTES
+
+
+class _FakeCudaRTLibrary:
+    def __init__(self):
+        self.requested_ptr = None
+
+    def cudaIpcGetMemHandle(self, ptr):
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+            cudaIpcMemHandle_t,
+        )
+
+        self.requested_ptr = ptr
+        return cudaIpcMemHandle_t()
+
+
+def test_export_rejects_offset_tensor(monkeypatch):
+    """m6 (docs/v100/CODE_REVIEW_TODO_20261110.md): the wire protocol
+    exports one handle per tensor and the consumer opens it as the tensor's
+    start. A tensor offset inside its storage would export the wrong window
+    (currently masked by the per-layer fresh-allocation layout); refuse it
+    loudly at boot instead."""
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        cudaIpcMemHandle_t,
+    )
+    from sglang.srt.mem_cache import pair_split_ipc as mod
+
+    monkeypatch.setattr(mod, "CudaRTLibrary", _FakeCudaRTLibrary)
+    base = torch.zeros(16, dtype=torch.float16)
+    assert mod._tensor_ipc_bytes(base) == bytes(cudaIpcMemHandle_t().internal)
+    offset = torch.zeros(32, dtype=torch.float16)[16:]
+    with pytest.raises(ValueError, match="allocation base"):
+        mod._tensor_ipc_bytes(offset)

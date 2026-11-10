@@ -30,7 +30,20 @@ _HANDLE_BYTES = 128
 
 
 def _tensor_ipc_bytes(tensor: torch.Tensor) -> bytes:
-    """Serialize one CUDA tensor's IPC handle."""
+    """Serialize one CUDA tensor's IPC handle.
+
+    The handle names the allocation base and the consumer opens it as the
+    tensor's start, so the export contract requires ``data_ptr`` to be the
+    storage base. Pool tensors are fresh per-layer allocations; a view
+    (offset inside its storage) would silently export the wrong window and
+    is refused here (review m6).
+    """
+    if tensor.untyped_storage().data_ptr() != tensor.data_ptr():
+        raise ValueError(
+            "IPC export requires tensor data_ptr to be the allocation base; "
+            f"got data_ptr={tensor.data_ptr()} vs storage base="
+            f"{tensor.untyped_storage().data_ptr()} (offset view?)"
+        )
     lib = CudaRTLibrary()
     handle = lib.cudaIpcGetMemHandle(tensor.data_ptr())
     return bytes(handle.internal)
