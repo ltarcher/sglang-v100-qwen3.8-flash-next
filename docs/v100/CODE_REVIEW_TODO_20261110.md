@@ -203,12 +203,19 @@
     `test_qwen4_exp_ple_prep.py::TestPleChunkStashRelease`（release pop/未知 slot
     no-op/record→release 生命周期/release_kv_cache 接线端到端，TDD 红灯先行）；
     prep+staged 两套件 83 passed；ruff 干净。
-- [ ] m17. `_mixed_tail_mask` 回退防御缺口
+- [x] **m17. `_mixed_tail_mask` 回退防御缺口**（2026-11-10 结案）
   - `layers/attention/qwen_sparse_attn_backend.py:782-796`。把任何 prefix 非对齐行判为
     decode tail，且 mixed 批整体跳过 prefix 对齐 assert（:842-843）。触发前提（非对齐
     prefill 行进 mixed 批）被 schedule_policy.py:1945-1953 页对齐 snap 保护，属回退加固
     而非可达缺陷。
-  - 修复：对非 tail 行保留 assert（零 sync）：`(prefix_lens[~tails] % ratio == 0).all()`。
+  - **结案结论（非 tail 行保留 device assert，零 sync）**：`_qsa_build_write_plan` 在
+    mixed 批下不再整体跳过对齐不变量，改为 `torch._assert_async((prefix_lens[~mix_tails]
+    % ratio == 0).all())`（async assert，无 D2H sync）；非 tail 行若 prefix 非对齐即
+    响亮失败，防止半写共享压缩组；全 tail 批的空集断言恒真零开销；非 mixed 批严格断言
+    不变。回归 `test_qwen_sparse_sm70_routing.py::TestMixedTailPrefixAlignmentAssert`
+    （CPU 上直测 write plan：aligned+exempt tail 通过/mixed 非 tail 非对齐 RuntimeError/
+    非 mixed 非对齐 RuntimeError/全 tail 通过，TDD 红灯先行），全套件 33 passed；ruff
+    干净（存量行格式遗留不动）。
 - [ ] m18. 混批预算 inflight 溢出整体 clear 丢弃全部在途采样
   - `managers/scheduler_components/mixed_prefill_budget.py:365-366`。应 FIFO 逐条驱逐。
   - 修复：改 pop 最旧一条。确定性不受影响（纯本地函数）。

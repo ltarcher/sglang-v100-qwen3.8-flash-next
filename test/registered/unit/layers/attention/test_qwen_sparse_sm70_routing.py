@@ -377,3 +377,84 @@ def test_grouped_prefill_guard_does_not_block_pure_extend():
         QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
             _GuardSentinelBackend(), q, k, v, forward_batch, topk, cu, scale
         )
+
+
+class TestMixedTailPrefixAlignmentAssert:
+    """m17 (docs/v100/CODE_REVIEW_TODO_20261110.md): on a mixed-chunk batch
+    only the exempt decode tails may carry a ratio-misaligned prefix — a
+    misaligned prefill row would leave a shared group half-written. The
+    alignment invariant must stay asserted (device-side, zero sync) for the
+    non-tail rows instead of being skipped wholesale for mixed batches."""
+
+    RATIO = 2
+
+    def _backend(self):
+        backend = object.__new__(QwenSparseAttnBackend)
+        backend.token_to_kv_pool = SimpleNamespace(qsa_compress_ratio=self.RATIO)
+        return backend
+
+    def _forward_batch(self, extend_lens):
+        return SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
+            input_ids=torch.zeros(int(sum(extend_lens)), dtype=torch.int64),
+        )
+
+    def _write_plan(self, backend, sequence_lengths, extend_lens, mix_tails):
+        width = 16
+        token_slot_table = torch.arange(
+            len(sequence_lengths) * width, dtype=torch.int64
+        ).reshape(len(sequence_lengths), width)
+        return backend._qsa_build_write_plan(
+            forward_batch=self._forward_batch(extend_lens),
+            speculative_paged=False,
+            token_slot_table=token_slot_table,
+            sequence_lengths=torch.tensor(sequence_lengths, dtype=torch.int64),
+            mix_tails=mix_tails,
+        )
+
+    def test_mixed_batch_aligned_prefill_and_exempt_tail_passes(self):
+        # Row 0: prefill with a ratio-aligned shared prefix (4). Row 1: decode
+        # tail resuming at its own length (prefix 3, misaligned, exempt).
+        backend = self._backend()
+        plan = self._write_plan(
+            backend,
+            sequence_lengths=[8, 4],
+            extend_lens=[4, 1],
+            mix_tails=torch.tensor([False, True]),
+        )
+        assert plan is not None
+
+    def test_mixed_batch_misaligned_prefill_row_fails_loud(self):
+        # Row 1 is NOT a tail but carries a misaligned prefix (3): the
+        # invariant is violated and must be asserted even on a mixed batch.
+        backend = self._backend()
+        with pytest.raises(RuntimeError):
+            self._write_plan(
+                backend,
+                sequence_lengths=[8, 4],
+                extend_lens=[4, 1],
+                mix_tails=torch.tensor([False, False]),
+            )
+
+    def test_non_mixed_batch_misaligned_row_still_fails_loud(self):
+        backend = self._backend()
+        with pytest.raises(RuntimeError):
+            self._write_plan(
+                backend,
+                sequence_lengths=[8, 4],
+                extend_lens=[4, 1],
+                mix_tails=None,
+            )
+
+    def test_mixed_batch_all_tails_passes(self):
+        # Every row is an exempt tail: the non-tail subset is empty and the
+        # vacuous assert passes without a sync.
+        backend = self._backend()
+        plan = self._write_plan(
+            backend,
+            sequence_lengths=[4, 5],
+            extend_lens=[1, 1],
+            mix_tails=torch.tensor([True, True]),
+        )
+        assert plan is not None

@@ -838,9 +838,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         # one group whose members come from the pending ring. The tail rows
         # are derived by _mixed_tail_mask, so on mixed batches every row is
         # either aligned or an exempt tail; on every non-mixed extend the
-        # alignment invariant is asserted strictly.
+        # alignment invariant is asserted strictly. On mixed batches the
+        # invariant stays asserted for the non-tail rows (review m17): a
+        # misaligned prefill row there would half-write a shared group.
+        # Device-side async asserts, zero sync.
         if mix_tails is None:
             torch._assert_async((prefix_lens % ratio == 0).all())
+        else:
+            torch._assert_async((prefix_lens[~mix_tails] % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
