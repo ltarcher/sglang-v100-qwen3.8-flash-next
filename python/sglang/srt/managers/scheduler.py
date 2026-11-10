@@ -1464,6 +1464,16 @@ class Scheduler(
             or self.chunked_prefill_size is None
         ):
             return
+        # DP attention: every scheduler replica serves its own request stream,
+        # but the controller synchronizes through broadcast_pyobj on the WORLD
+        # group -- the pending-drain path runs a different number of times per
+        # DP group and the collective mismatches into a hang. Refuse to arm
+        # (review M4, 2026-11-10).
+        if get_parallel().attn_dp_enabled:
+            logger.info(
+                "Mixed prefill budget controller off: not supported with DP attention"
+            )
+            return
         self.mixed_prefill_budget = MixedPrefillBudgetControl(
             chunked_prefill_size=self.chunked_prefill_size,
             target_ms=target_ms,

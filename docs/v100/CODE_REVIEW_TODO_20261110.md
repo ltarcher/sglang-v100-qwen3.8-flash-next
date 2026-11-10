@@ -72,13 +72,18 @@
     （4 个 `test_dense_prefill_retains_mtp_seed_indices` 失败为 HEAD=dd981328e3 存量、
     git stash 验证与本次改动无关）；ruff check/format 对改动行干净。
 
-- [ ] **M4. 混批预算 head-of-line broadcast 在 DP attention 下死锁**
+- [x] **M4. 混批预算 head-of-line broadcast 在 DP attention 下死锁**（2026-11-10 结案）
   - 位置：`managers/scheduler_components/mixed_prefill_budget.py:276-309`；
     init 门 `scheduler.py:1452-1477` 无 dp_size 检查
   - 触发：`SGLANG_MIXED_PREFILL_STEP_LATENCY_MS>0` + DP attention。pending 非空即
     `broadcast_pyobj(src=0)`（CPU 集体），DP 下各 rank 调用次数不同 → 集体失配挂死。
-  - 修复：init 门加 dp_size 禁用（镜像 DynamicChunkSizer 的 PP-only 模式），或改
-    per-TP-group 广播。
+  - **结案结论（选项 a：init 门禁用）**：`maybe_init_mixed_prefill_budget` 增加
+    `get_parallel().attn_dp_enabled` 硬前置（失败-关闭；选项 b 的 per-TP-group 广播需
+    重设计 rank-deterministic 协议，DP attention 未启用，无必要）。回归测试追加至
+    `test_mixed_prefill_budget.py::TestMaybeInitMixedPrefillBudgetGate`：DP attention
+    拒绝布防 / 非 DP 正常布防（align 透传）/ target=0 仍禁用。TDD 红灯先行（DP 用例
+    失败）后实现；全套件 30 passed。DP attention 下该开关混批 chunk 回到原始
+    chunked_prefill_size 行为，与其他 DP-attention 不支持特性一致。
 
 - [ ] **M5. chunk-ahead serve 路径无宽度防护**（1/2 验证器确认，带保留）
   - 位置：`models/qwen4_exp.py:1206-1217`

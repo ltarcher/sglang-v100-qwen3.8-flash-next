@@ -4,9 +4,17 @@ Ports of 1Cat vLLM #860; the controller math is exercised on CPU with plain
 numbers, the timing pipeline with duck-typed CUDA events.
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
 from sglang.srt.managers.scheduler_components.mixed_prefill_budget import (
     MixedPrefillBudget,
@@ -566,6 +574,69 @@ class TestMixedPrefillBudgetControlRankSync(CustomTestCase):
         self.assertEqual(len(follower._pending), 0)
         self.assertEqual(leader.budget._fit, [0.0] * 5)
         self.assertEqual(follower.budget._fit, [0.0] * 5)
+
+
+class TestMaybeInitMixedPrefillBudgetGate(CustomTestCase):
+    """Boot gate for maybe_init_mixed_prefill_budget (review M4, 2026-11-10).
+
+    The controller synchronizes ranks through broadcast_pyobj on the WORLD
+    group (src=0, CPU collective). Under DP attention each scheduler replica
+    serves a different request stream: the pending-queue path that drains the
+    broadcast runs a different number of times per DP group, so the world
+    collective mismatches and the engine hangs. DP attention must refuse to
+    arm the controller at boot, mirroring the other hard prerequisites.
+    """
+
+    def _make_scheduler(self):
+        s = object.__new__(Scheduler)
+        s.enable_overlap = True
+        s.is_mixed_chunk = True
+        s.chunked_prefill_size = 4096
+        s.page_size = 64
+        s.mixed_prefill_budget = None
+        return s
+
+    def _run_gate(self, s, attn_dp_enabled):
+        env = {"SGLANG_MIXED_PREFILL_STEP_LATENCY_MS": "250"}
+        parallel = SimpleNamespace(
+            world_group=SimpleNamespace(rank=0),
+            attn_dp_enabled=attn_dp_enabled,
+        )
+        with (
+            patch.dict(os.environ, env),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            Scheduler.maybe_init_mixed_prefill_budget(s)
+        return s.mixed_prefill_budget
+
+    def test_dp_attention_refuses_to_arm(self):
+        s = self._make_scheduler()
+        self.assertIsNone(self._run_gate(s, attn_dp_enabled=True))
+
+    def test_without_dp_attention_controller_arms(self):
+        s = self._make_scheduler()
+        control = self._run_gate(s, attn_dp_enabled=False)
+        self.assertIsNotNone(control)
+        self.assertEqual(control.budget.align, 64)
+
+    def test_target_zero_still_disables(self):
+        s = self._make_scheduler()
+        env = {"SGLANG_MIXED_PREFILL_STEP_LATENCY_MS": "0"}
+        parallel = SimpleNamespace(
+            world_group=SimpleNamespace(rank=0), attn_dp_enabled=False
+        )
+        with (
+            patch.dict(os.environ, env),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            Scheduler.maybe_init_mixed_prefill_budget(s)
+        self.assertIsNone(s.mixed_prefill_budget)
 
 
 if __name__ == "__main__":
