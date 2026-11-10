@@ -216,9 +216,15 @@
     （CPU 上直测 write plan：aligned+exempt tail 通过/mixed 非 tail 非对齐 RuntimeError/
     非 mixed 非对齐 RuntimeError/全 tail 通过，TDD 红灯先行），全套件 33 passed；ruff
     干净（存量行格式遗留不动）。
-- [ ] m18. 混批预算 inflight 溢出整体 clear 丢弃全部在途采样
+- [x] **m18. 混批预算 inflight 溢出整体 clear 丢弃全部在途采样**（2026-11-10 结案）
   - `managers/scheduler_components/mixed_prefill_budget.py:365-366`。应 FIFO 逐条驱逐。
-  - 修复：改 pop 最旧一条。确定性不受影响（纯本地函数）。
+  - **结案结论（FIFO 驱逐最旧一条）**：溢出时 `pop(next(iter(self._inflight)))` 仅驱逐
+    插入序最旧的一条（dict 保插入序），其余并发 forward 的样本存活，采样流不再被
+    破坏；被驱逐条目由 `process_batch_result` 的 `pop(key, None)` 无害忽略，确定性
+    不受影响（纯本地函数）。回归 `test_mixed_prefill_budget.py::
+    TestMixedPrefillBudgetControl::test_inflight_overflow_evicts_oldest_only`（饱和
+    +1 条后：最旧被逐、其余存活、窗口恒等于 MAX_INFLIGHT_STEPS，TDD 红灯先行），
+    全套件 31 passed；ruff 干净。
 - [ ] m19. compose 与 serve 脚本 mixed-chunk 默认值分叉（原 major 降级：属 eb6cedfdf3
     有意启用并已登记 README）
   - `docker/v100-compose-qwen38-mtp.yaml:63`、`docker/v100-compose.yaml:70`（默认 750）
