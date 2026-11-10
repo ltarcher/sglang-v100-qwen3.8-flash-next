@@ -90,6 +90,8 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
       extra_env+=(-e "SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=$AHEAD")
     fi
   fi
+  # Deterministic CUDA for the long_prompt non-determinism investigation
+  extra_env+=(-e SGLANG_FORCE_DETERMINISTIC="${SGLANG_FORCE_DETERMINISTIC:-0}")
   log "starting $backend server on :$PORT (logs: $OUT/server_$backend.log)"
   local attempt
   for attempt in 1 2 3; do

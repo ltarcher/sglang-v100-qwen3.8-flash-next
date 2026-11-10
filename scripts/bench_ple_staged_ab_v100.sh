@@ -98,6 +98,7 @@ run_server() { # $1 = backend (pinned|staged)
     -e SGLANG_V100_DECODE_CUDA_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_longctx_decode \
     -e SGLANG_V100_NVFP4_MOE_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_nvfp4_moe \
     -e SGLANG_JIT_CACHE_DIR=/root/sglang-v100-jit/jit \
+    -e SGLANG_FORCE_DETERMINISTIC="${SGLANG_FORCE_DETERMINISTIC:-0}" \
     -e PYTHONPATH=/w/python \
     "${extra_env[@]}" \
     "$IMAGE" /opt/venv/bin/python -m sglang.launch_server \

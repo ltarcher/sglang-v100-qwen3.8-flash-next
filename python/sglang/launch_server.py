@@ -5,6 +5,33 @@ import os
 import sys
 import warnings
 
+# Optional deterministic CUDA config.  Default off (perf first).
+# On 2026-11-10 we traced a long_prompt (~33k token) staged-arm degradation
+# where staged/pinned prefill first-token argmax flipped sporadically across
+# boots: the staged PLE gather has a small but intrinsic numeric delta vs the
+# pinned path (different memory-access pattern → different reduction order),
+# and non-deterministic CUDA (cudnn autotune, split-KV reduction ordering)
+# amplifies that delta enough to flip argmax.  When it flips to token 248044
+# ("<|im_start|>"), MTP verify rejects every draft token (accept_rate=0.0),
+# pure-greedy decode falls into a self-consistent loop attractor.
+# Forcing deterministic CUDA (cudnn.deterministic=True, cudnn.benchmark=False,
+# CUBLAS_WORKSPACE_CONFIG=:4096:8) stabilises the staged/pinned delta below
+# argmax-flip threshold and eliminates the degradation (oracle: 32/32
+# token_ids bit-exact match between staged and pinned arms, MTP verify
+# first_mismatch_step=4 every round — perfect accept).
+# Perf cost on V100 is small (cudnn autotune disabled) but not zero, so this
+# is opt-in via env var.  Production can set SGLANG_FORCE_DETERMINISTIC=1
+# if reproducibility outweighs marginal throughput.
+if os.environ.get("SGLANG_FORCE_DETERMINISTIC") == "1":
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    import torch
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    print("[SGLANG_FORCE_DETERMINISTIC] CUBLAS_WORKSPACE_CONFIG=:4096:8, cudnn.deterministic=True, benchmark=False, tf32=False", flush=True)
+
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import prepare_server_args
