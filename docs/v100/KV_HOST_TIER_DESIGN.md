@@ -506,11 +506,21 @@ device 池可缩,但长文 decode 撞 host page-in spill 悬崖)。
 
 | # | 待办 | 类型 | 质量风险 | 前置 / 堵点 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | verify replay 索引语义:与并行会话(gdn_backend)改动协调,PR6 池越界同类区域重点测 | 正确性 | 有 | 需与 gdn_backend 改动同窗口验证,重点回归 PR6 池越界区域 | 未开工 |
-| 2 | 索引重映射与 radix/retract 释放路径的一致性(三种槽位并存) | 正确性 | 有 | 需构造 retract + radix 驱逐与 tier 页入并发的用例 | 未开工 |
+| 1 | verify replay 索引语义:与并行会话(gdn_backend)改动协调,PR6 池越界同类区域重点测 | 正确性 | 有 | 需与 gdn_backend 改动同窗口验证,重点回归 PR6 池越界区域 | CPU 侧验收(2026-11-10):PR6 区域=verify 图 replay 全宽 tier 表(`_tier3_refresh_graph_tables`)从 req_to_token 重取,padding 行/尾列是已释放请求的陈旧逻辑槽;新单测锁定映射对全 int32 域垃圾值只路由 padding 窗口(FULL 读侧 map_slot_table 此前零覆盖,已补)。协调结论:gdn_backend 的 mamba replay state 索引是独立索引空间(HybridLinearAttnBackend + replay_state_indices_validator),不经 map_slot_table,无语义二义。真机剩余:MTP verify × tier × 3×131k 准入回归(见下) |
+| 2 | 索引重映射与 radix/retract 释放路径的一致性(三种槽位并存) | 正确性 | 有 | 需构造 retract + radix 驱逐与 tier 页入并发的用例 | CPU 协议验收(2026-11-10):free 路径是纯 allocator 簿记(qsa_kv_pool 无 free override、tier 无释放 hook),一致性全由 tag 协议承载(save-at-steal + "重分配先全量重写才可读" + PAIR owner 守卫);新单测构造 radix 驱逐→复用→页入回退、retract 未镜像 pending 写被复用、PAIR 释放对家页守卫、混合交错序列四类用例,逐 incarnations 验读。真机剩余:radix 驱逐与页入的 GPU 级竞态(见下) |
 | 3 | 4×1M 在 fp16+复制下无解;去复制改造的工程量与 attention TP 正确性风险 | 容量 | 有 | 杠杆 2 pair-split 已解决 ×2(§6.1);×4 还需镜像减半 + 杠杆 3 叠加,且组件 5 准入先行(两次 4×256K 实测不可行,§6.1) | 死路(当前形态) |
 | 4 | host pinned 内存上限(cgroup/numatune)在目标机实测;`SGLANG_NUMA_BIND_V2=0` 为前提 | 测量 | 无 | 生产 compose 已按 125G 内存裁剪 hicache;实测仅补记录 | 未开工 |
 | 5 | Phase 2 阶梯补 512K prefill 点,收窄 §4.2 外推带并回填 §4 表格(262k 锚点已实测 2026-10-30:prefill 2296 tok/s / 输出 85-93 tok/s / warm radix 0.68s;decode 按 -14%/倍增外推) | 测量 | 无 | 生产容器空闲窗口跑一次 512K 阶梯 bench(`/tmp/bench_ctx_ladder_distinct.py` 口径);与 #4 可同窗完成 | 未开工 |
+
+#1/#2 真机回归清单(生产容器空闲窗口一次性完成,复用 AGENTS 数值验证纪律):
+
+1. MTP verify × tier:target-only 与 `--spec` 两模式同输入输出一致 + accept 长度不回退
+   (production 8110 compose 即可,层数据已有基线 accept 2.20-2.45)。
+2. PR6 越界区域:3×131k 并发准入(即 PR#6 修复的场景)+ warm radix 第二轮,输出无
+   乱码/cached_prompt_tokens 正常;tier 计数器 `gather_unvalid`/`host_dev_mismatch`/
+   `peer_miss` 必须为 0。
+3. radix 驱逐 × 页入:长前缀灌满逻辑池(>phys)后换新请求强制 radix 驱逐,第二轮请求
+   输出与首轮 cold 一致性抽检 + 上述计数器仍为 0。
 
 附:杠杆 3(NVMe 冷层)为无质量风险的实质优化,但前置 = §7 质量门 4
 局部性实测(1×1M 形态),而 1M 需 YaRN、YaRN 在 3 并发形态已因 warmup
