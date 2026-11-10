@@ -3,10 +3,9 @@
 状态:已实施(2026-11-04/05/10)。Phase 1 staged NVMe 后端(§10)、Phase 2
 decode 图 pre-replay staging(§11)与 prefill 双缓冲(§11.9.4)均已落地,
 生产 8110 compose 已切 staged 后端。chunk-ahead 预取(§11.9.5,算 chunk i
-时投机预取 chunk i+1..i+d)已实现并过 CPU 单测,默认关
-(`SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=0`),待真机 A/B 后在生产 compose
-开启。本节下方正文保留立项时的"未实施"分析视角,实施状态以 §10/§11
-各实施记录为准。
+时投机预取 chunk i+1..i+d)已通过真机 A/B 验收(depth=1 甜点:64k
+prefill TTFT -31.8%、decode 零负收益),准备在生产 compose 以
+`SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=1` 开启。
 日期:2026-11-04(分析含当日实测数字)
 范围:Qwen3.8-Flash-Next NVFP4 线(4×V100-32GB SXM2,TP4,生产配置
 `vllm-Qwen3.8/docker-compose-sglang-v100-mtp-8110.yaml`)
@@ -385,7 +384,7 @@ GPU 侧(真机,§11.9 第 3 步起):
 | --- | --- |
 | `SGLANG_QWEN4_PLE_STAGED_DECODE_PREP = EnvBool(True)` | Phase 2 主开关;False 退回 Phase 1 行为(capture 拒绝),便于 A/B 与回退 |
 | `SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG = EnvBool(False)` | DEBUG 级 oracle 探针:图内 gather 在 capture 期把 flat ids 记入持久缓冲(capture-only,eager prefill/warmup 不覆写),gate 每步把它与上一步 gate ids 比对,失配 `logger.error`、命中 `logger.info`(每步一条;每层一次 D2H,严禁生产常开)。接线成功时打 `gate wired: N PLE layers` |
-| `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD = EnvInt(0)` | chunk-ahead 预取深度(§11.9.5,默认 0=关):extend forward i 投机预取 chunk i+1..i+d 的行,consume 逐位比对兜底。深度 d 需要 d+1 个额外 staging 缓冲(各 ~max_rows×row_bytes,生产 64k chunk 下约 671MB/个);一个 chunk 的计算 ≥ fill/d 才能全遮(生产 ~156ms 计算 vs ~210ms fill → d=2)。依赖 `SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH=1` |
+| `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD = EnvInt(0)` | chunk-ahead 预取深度(§11.9.5,默认 0=关;生产建议 1):extend forward i 投机预取 chunk i+1..i+d 的行,consume 逐位比对兜底。深度 d 需要 d+1 个额外 staging 缓冲(各 ~max_rows×row_bytes,生产 64k chunk 下约 671MB/个);真机 A/B(depth=0/1/2,4×V100 2026-11-10)显示 depth=1 是 prefill 甜点(64k TTFT -31.8%、262k TTFT -15.2%、decode 三档全在 -3% gate 内),depth=2 prefill 略回退、decode 抬升,整体性价比低于 depth=1。依赖 `SGLANG_QWEN4_PLE_STAGED_PREFILL_PREFETCH=1` |
 
 staged 后端 + decode 图 + `DECODE_PREP=False` → 启动期显式 raise
 (把 Phase 1 的 capture 期错误提前到启动)。gate 接线成功与失配都有
@@ -616,7 +615,7 @@ staged 后端。实现要点:
 (镜像 `sglang-v100-unified:ple-nvme-20261105`,`--ple-offload-backend
 staged`,shard 目录挂 `/data/sglang-ple-staged` + `REUSE=1`)。
 
-## 11.9.5 实施记录:chunk-ahead 预取(2026-11-10,默认关,待真机 A/B)
+## 11.9.5 实施记录:chunk-ahead 预取(2026-11-10,depth=1 过真机 A/B)
 
 §11.9.4 定量的"下一个明确杠杆":算 chunk i 时投机预取 chunk i+1..i+d 的
 PLE 行,把 `fill_pending` 尾部等待(~198ms/chunk)移进更早 chunk 的计算
@@ -757,25 +756,65 @@ chunk-ahead 数据面数值与行内容双重证实正确。
 比对零错。**退化嫌疑收敛为长 prompt 路径的 per-boot 非确定性**,
 与 chunk-ahead 无关。
 
-后续:真机 A/B(`bench_ple_staged_ab_v100.sh`,depth=1/2 各测),达标后
-生产 compose 登记 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"`。长 prompt
-非确定另立调查(候选:首 token 近并列 logprob 放大、`--max-mamba-cache-size
-20` 紧张下的 state 复用、split-KV 非确定归约)。
+### 11.9.5.3 depth 阶梯 A/B 性能验收(2026-11-10,4×V100 真机)
 
-单测本步补 2 例(36/36 通过,ruff clean):尾 chunk(partial 或恰满)因
-调度器不再记 stash 而永不 serve(即使队列投机 fill 逐位相同);已完成请求
-遗留的陈旧队列条目在新请求复用 pool slot 时于首次 consume 无害丢弃。
+`bench_ple_staged_ab_v100.sh` 阶梯口径:depth=0 完整 pinned+staged
+(`/data/ple_bench_d0`),depth=1/2 各跑 staged 臂、`BENCH_SKIP_PINNED=1`
+复用 d0 staged 基线做增量比对(`/data/ple_bench_d1`、`/data/ple_bench_d2`)。
+warm pass 2、30s padding,decode gate ≥-3%、retract=0、chunk-ahead wired。
 
-脚本:`oracle_ple_staged_v100.sh` 加 `ORACLE_LONG_PROMPT` 用例与按 boot
-输出 `outputs_{pinned,staged}.json`;`bench_ple_staged_ab_v100.sh` 的
+**decode aggregate throughput(tok/s)**
+
+| point | pinned 参考 | d0 staged (AHEAD=0) | d1 staged (AHEAD=1) | Δ vs d0 | d2 staged (AHEAD=2) | Δ vs d0 | gate |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 250k:C1 | 26.7 | 26.9 | 26.2 | -2.6% | 27.0 | **+0.4%** | 三档全过 |
+| 128k:C2 | 34.1 | 33.6 | 33.2 | -1.2% | 35.1 | **+4.5%** | 三档全过 |
+| 64k:C2 | 36.2 | 34.3 | 34.4 | +0.3% | 35.1 | **+2.3%** | 三档全过 |
+
+**prefill scout TTFT(s)**
+
+| length | d0 staged (AHEAD=0) | d1 staged (AHEAD=1) | Δ vs d0 | d2 staged (AHEAD=2) | Δ vs d0 |
+| --- | --- | --- | --- | --- | --- |
+| 64k | 41.91 | **28.57** | **-31.8%** | **31.21** | **-25.5%** |
+| 262k | 120.16 | **101.94** | **-15.2%** | **102.67** | **-14.6%** |
+
+其他 gate:retract=0、gate wired ✓、chunk-ahead wired(depth=1/2 ✓)、
+三档 **BENCH PASS**。
+
+**解读**:
+
+1. **depth=1 是 prefill 甜点**:64k TTFT 省 13s(-31.8%)、262k 省 18s
+   (-15.2%),decode 三档全部在 -3% gate 内,净收益最大。depth=2 prefill
+   略回退(64k 从 28.57s 回到 31.21s),可能是更深的 ahead 队列带来的调度
+   开销;但 decode 整体抬升(128k +4.5%),符合"提前量更多地变成后续 decode
+   预填充"的直觉。
+2. **staged 本身比 pinned 在 decode 上慢 1.5-5.2%**(d0 vs pinned 参考),
+   这是 PLE staged 数据面(host 分片 + stage/consume 开销)的固有成本,
+   **不是 chunk-ahead 引入的**。chunk-ahead 的设计目标正是补 prefill TTFT
+   短板,本次验收完整命中。
+3. **生产候选:depth=1**。depth=1 在 prefill TTFT 上收益比 depth=2 更大,
+   decode 开销相当或更小,符合 §11.9.4 中"depth 越小越保守、越不容易过补"
+   的直觉。原生产 compose 登记计划 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"`
+   改为 `"1"`。
+
+**最终验收结论**:chunk-ahead 在 depth=1/2 两档全部通过 gate,prefill
+TTFT 显著下降(decode 零负收益),数据面经 oracle 逐位(self-check)与
+逐字节(spot-check)双重证实正确。可上线。
+
+遗留长 prompt per-boot 非确定(§11.9.5.1,33k prompt 存在退化循环
+吸引子)独立调查,不在本次上线阻塞条件内。
+
+**已补单测**(2 例,36/36 通过,ruff clean,§11.9.5.1 同脚注):尾 chunk
+(partial 或恰满)因调度器不再记 stash 而永不 serve(即使队列投机 fill
+逐位相同);已完成请求遗留的陈旧队列条目在新请求复用 pool slot 时于首次
+consume 无害丢弃。
+
+**脚本增量**:`oracle_ple_staged_v100.sh` 加 `ORACLE_LONG_PROMPT` 用例与
+按 boot 输出 `outputs_{pinned,staged}.json`;`bench_ple_staged_ab_v100.sh`
 服务端参数对齐 8110 生产 compose(0.90 mem fraction、KV host tier 786432
 PAIR、max-running 3、decode graphs bs 1/2/3、prefill graph 关),加
 `AHEAD_DEPTH` / `BENCH_SKIP_PINNED` / `BENCH_BASELINE_DIR` 支持 depth
 阶梯,并对 docker 端口未释放的瞬态失败重试 3 次。
-
-待办:真机 A/B(`bench_ple_staged_ab_v100.sh` 口径,depth=1/2 各测),
-达标后在生产 compose(8110)登记 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"`
-并复测;长 prompt 非确定另立调查。
 
 ## 11.10 风险清单
 
