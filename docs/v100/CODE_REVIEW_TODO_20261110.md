@@ -102,27 +102,47 @@
 
 ### Minor
 
-- [ ] m6. IPC 导出假设 data_ptr==分配基址（1/2 确认，带保留）
+- [x] **m6. IPC 导出假设 data_ptr==分配基址（1/2 确认，带保留）**（2026-11-10 结案）
   - `mem_cache/pair_split_ipc.py:35-132`。当前逐层独立大块分配下 data_ptr==基址成立，
     且偏移指针会使 GetMemHandle 响亮报错（非静默）；属分配器布局脆弱性。
-  - 修复：按 torch IPC 语义记录 base+offset，或加基址断言。
-- [ ] m7. `_peer_tags` 镜像无消费者死代码；`_CNT_P3_PEER_MISS` 从未自增
+  - **结案结论（选项 b：基址断言 fail-loud）**：`_tensor_ipc_bytes` 导出前断言
+    `tensor.data_ptr == untyped_storage().data_ptr()`（分配基址），偏移视图在
+    boot 期响亮 ValueError 拒绝而非依赖 GetMemHandle 的下游报错；torch IPC 语义的
+    base+offset 重构留待分配器布局实际变化时再做。回归
+    `test_pair_split_ipc.py::test_export_rejects_offset_tensor`（fake CudaRTLibrary，
+    CPU 可跑：偏移视图被拒、基址张量放行；1 passed 2 skipped GPU-only）。
+- [x] **m7. `_peer_tags` 镜像无消费者死代码；`_CNT_P3_PEER_MISS` 从未自增**（2026-11-10 结案）
   - `mem_cache/kv_host_tier.py:1244-1314`。每 forward n_layers 次 D2D 拷贝纯开销。
-  - 修复：删除 `_refresh_peer_tags` 调用链或接上消费者；挂上计数器。
-- [ ] m8. phase3 下 graph replay 路径 step_seq 双增（replay 的 flush 缺 eager :1079 的对称守卫）
+  - **结案结论（选项 a：删除调用链）**：`_refresh_peer_tags` 整条链与 `_peer_tags`
+    镜像一并删除（grep 确认无任何消费者），`_CNT_P3_PEER_MISS` 随之失去意义一并
+    清理；每 forward 省 n_layers 次 D2D。KV tier CPU 套件回归通过。
+- [x] **m8. phase3 下 graph replay 路径 step_seq 双增（replay 的 flush 缺 eager :1079 的对称守卫）**（2026-11-10 结案）
   - `layers/attention/qwen_sparse_attn_backend.py:1429-1432`（legacy 分支 :1466-1467 同）。
-  - 修复：replay 路径补 `if not phase3` 守卫。影响仅日志节奏。
-- [ ] m9. IPC 交换用 world rank 配对 attn_tp_rank^1；无偶数 tp 校验
+  - **结案结论**：replay 与 legacy replay 两处 flush 补齐 `if not phase3` 守卫，
+    与 eager 路径对称。回归测试追加至 `test_qwen_sparse_sm70_routing.py`（4 用例，
+    全套件 29 passed）：phase3 replay/legacy flush 不再 bump、非 phase3 正常 bump。
+- [x] **m9. IPC 交换用 world rank 配对 attn_tp_rank^1；无偶数 tp 校验**（2026-11-10 结案）
   - `mem_cache/pair_split_ipc.py:117-122`。attn-TP 组≠world（DP/PP）或奇数 tp 时
     挂死/交叉映射。生产 attn_tp==world 且 TP4 偶数，不受影响。
-  - 修复：加 attn_tp==world 与偶数 tp 断言。
-- [ ] m10. `QSA_P3_FORCE_HOST`/`QSA_P3_CHECK` 裸读 os.environ，绕过 environ.py 契约
+  - **结案结论**：IPC 配对门加两条 boot 断言：`attn_tp_size == world_size` 与
+    attn_tp_size 偶数，不满足时启动期 fail-loud（错误信息点名 DP/PP/奇数 TP 不支持
+    PAIR IPC 交换）。回归测试覆盖奇数 tp、attn_tp≠world 两种拒绝形态。
+- [x] **m10. `QSA_P3_FORCE_HOST`/`QSA_P3_CHECK` 裸读 os.environ，绕过 environ.py 契约**（2026-11-10 结案）
   - `mem_cache/kv_host_tier.py:1035-1036`。同文件其他 SGLANG_SM70_QSA_* 已入册。
-  - 修复：迁移到 environ.py 注册（遵循 env-var-conventions）。
-- [ ] m11. staged 后端下 update_weights_from_disk 必然失败
+  - **结案结论**：environ.py 注册 `SGLANG_V100_KV_TIER_P3_FORCE_HOST`/`_P3_CHECK`
+    （EnvBoolWithAlias 保留 `QSA_P3_FORCE_HOST`/`QSA_P3_CHECK` 旧名别名 +
+    DeprecationWarning，遵循 env-var-conventions），kv_host_tier.py 调用点迁移到
+    `envs.*.get()`。回归 `test_environ.py::TestP3DebugSwitches`（别名回退/新名优先/
+    未设默认）；KV tier CPU 子集 30 passed 2 skipped；KV_HOST_TIER_DESIGN.md 同步。
+- [x] **m11. staged 后端下 update_weights_from_disk 必然失败**（2026-11-10 结案）
   - `models/qwen4_exp.py:1297-1345`。1 行 dummy + `_staged_materialized` 永久短路，
     权重更新无法落地且 NVMe 表永不刷新。仅影响热更新端点，serve 不用。
-  - 修复：update 路径强制 re-materialize 或启动期拒绝组合。
+  - **结案结论（选项 b：启动期拒绝组合，fail-loud）**：`_release_loading_table`
+    释放 PLE 表后给 dummy 参数挂 `_reject_weight_update` 标记，
+    `update_weights_from_disk` 检测到 staged 后端在位即拒绝并给出复用 staged 表的
+    指引（强制 re-materialize 需重新构建 12.2GiB NVMe 表，热更新端点不值得）。
+    回归 `test_qwen4_exp_ple_prep.py::TestStagedWeightUpdateGuard`（staged 后端拒绝、
+    非 staged 正常放行）；prep 41 passed + staged 25 passed。
 - [ ] m12. `stage_async` 对 n>max_rows 直接 ValueError 杀 scheduler
   - `models/qwen4_exp_ple_staged.py:338-343`。阈值 262144 行 = 16384 tokens（已实测核实）；
     `chunked_prefill_size=-1` 或 >16384 的合法配置首条长 prefill 崩溃。
