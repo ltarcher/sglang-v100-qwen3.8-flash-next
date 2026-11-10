@@ -319,8 +319,11 @@ def _submit_ple_chunk_ahead(
         stash_tokens, dtype=torch.long, device=ngram_context.device
     ).unsqueeze(0)
     merged = torch.cat([ngram_context, next_tokens], dim=1)
-    windows = merged.unfold(1, embedding0.ngram_size, 1)[:, l_i:]
-    total_windows = windows.shape[1]
+    # 2D [W, ngram] windows — the shape the real forward passes to
+    # _hash_contexts (unfold there is indexed down to 2D by req_indices/
+    # token_offsets); _shift_right_ignore_eos inside unpacks exactly 2 dims.
+    windows = merged.unfold(1, embedding0.ngram_size, 1)[:, l_i:].squeeze(0)
+    total_windows = windows.shape[0]
     for entry in entries:
         embedding = entry.embedding
         ahead = embedding.ngram_embedding._staged_ahead

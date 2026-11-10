@@ -334,10 +334,12 @@ class FakeNGramEmbedding:
         return self.main_ids
 
     def _hash_contexts(self, contexts: torch.Tensor, *, decode_sized=False):
+        # Real contract (qwen4_exp.py): 2D [W, ngram] in, [W, heads] out.
+        assert contexts.dim() == 2, f"expected 2D windows, got {tuple(contexts.shape)}"
         self.contexts_seen.append(contexts.detach().clone())
         return (
             (contexts.sum(dim=-1, keepdim=True) % 251)
-            .expand(-1, -1, self.ngram_heads)
+            .expand(-1, self.ngram_heads)
             .to(torch.long)
         )
 
@@ -350,9 +352,8 @@ class FakeReq:
 
 
 def _fake_hash(contexts: torch.Tensor, heads=2) -> torch.Tensor:
-    return (
-        (contexts.sum(dim=-1, keepdim=True) % 251).expand(-1, -1, heads).to(torch.long)
-    )
+    assert contexts.dim() == 2
+    return (contexts.sum(dim=-1, keepdim=True) % 251).expand(-1, heads).to(torch.long)
 
 
 def _make_staged_table(tmp_path, tag: str, seed: int = 3):
@@ -606,12 +607,12 @@ class TestPleChunkAheadPrefetch:
         merged = torch.tensor([[100, 101, 1, 2, 3, 4] + stash])
         windows = merged.unfold(1, 3, 1)
         assert len(emb.contexts_seen) == 1
-        assert torch.equal(emb.contexts_seen[0], windows[:, 4:12])
+        assert torch.equal(emb.contexts_seen[0], windows[:, 4:12].squeeze(0))
 
         queue = host._staged_ahead._queue
         assert len(queue) == 2
-        exp1 = self._fake_hash(windows[:, 4:8]).reshape(-1).numpy()
-        exp2 = self._fake_hash(windows[:, 8:12]).reshape(-1).numpy()
+        exp1 = self._fake_hash(windows[:, 4:8].squeeze(0)).reshape(-1).numpy()
+        exp2 = self._fake_hash(windows[:, 8:12].squeeze(0)).reshape(-1).numpy()
         assert queue[0][0] == 5 and np.array_equal(queue[0][1], exp1)
         assert queue[1][0] == 5 and np.array_equal(queue[1][1], exp2)
         _PLE_CHUNK_STASH.clear()
@@ -636,7 +637,7 @@ class TestPleChunkAheadPrefetch:
 
         # Real forward for chunk i+1: cat([[101, 7], [10, 11, 12, 13]]).
         real_ctx = torch.tensor([[101, 7, 10, 11, 12, 13]])
-        assert torch.equal(emb.contexts_seen[0], real_ctx.unfold(1, 3, 1))
+        assert torch.equal(emb.contexts_seen[0], real_ctx.unfold(1, 3, 1).squeeze(0))
         _PLE_CHUNK_STASH.clear()
 
     def test_second_forward_consumes_serve(self, tmp_path, monkeypatch):
