@@ -283,9 +283,21 @@
     readback 时防回归桩命中（红灯实证），恢复后 3 passed（绿灯）；ruff 干净。
     GPU 侧 `test_grouped_sparse_prefill_sm70.py` 需真机（本机无 V100），留待
     目标机跑 smoke + grouped A/B 数字确认。
-- [ ] m24. A/B 脚本对任意 --base 无守卫调 /flush_cache
-  - `scripts/ab_qsa_grouped_quality_v100.py:267-315`。误指 11435 生产端口会清 radix 缓存。
-  - 修复：拒绝生产端口或要求 `--assume-idle`。
+- [x] **m24. A/B 脚本对任意 --base 无守卫调 /flush_cache**（2026-11-10 结案）
+  - `scripts/ab_qsa_grouped_quality_v100.py`（原 :267-315，每次 arm 两处
+    POST /flush_cache：冷 prefill 基线 + G1 同 boot 复跑）。误指 11435 生产端口
+    会清 radix 缓存。
+  - **结案结论（生产端口拒绝 + 显式 --assume-idle 旁路）**：新增
+    `ensure_idle_test_target(base, assume_idle)`——`urlparse(base).port == 11435`
+    （共享 V100 生产端点，`SGLANG_V100_HOST/PORT` 约定）且未带 `--assume-idle`
+    时 `SystemExit` 并给出出路（指向空闲测试 boot 如 :8110，或显式确认 idle）；
+    `run()` 入口第一行调用（先于 tokenizer 加载与任何网络请求），`run` 子命令
+    新增 `--assume-idle` 开关，docstring usage 同步。旁路仅接受显式 CLI flag、
+    不设 env 变量，避免惯性复制生产地址时静默穿透。新增 CPU 单测
+    `test_ab_qsa_flush_guard.py`（拒绝/旁路/空闲端口三态 + run 接线端到端：
+    生产端口时 0 次 flush、空闲端口时恰 2 次 flush；importlib 加载脚本模块，
+    TDD 红灯先行）5 passed；CLI 实测 `run --base :11435` 打印拒绝消息退出；
+    ruff 干净。
 
 ## 误报剔除记录（勿重报）
 

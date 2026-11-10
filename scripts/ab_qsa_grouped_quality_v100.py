@@ -7,7 +7,9 @@ temperature=0, fixed max_new_tokens, ignore_eos) with top-2 output logprobs,
 so any flag-induced divergence is measured against the boot-to-boot noise
 floor (A1 vs A2) instead of a single run.
 
-Usage (engine must be idle; each arm = one boot + one command):
+Usage (engine must be idle; each arm = one boot + one command; --base must
+NOT be the shared :11435 production endpoint -- that engine's radix cache
+would be wiped by /flush_cache, override only with --assume-idle):
   python scripts/ab_qsa_grouped_quality_v100.py run --arm A1 --base http://127.0.0.1:8110 --out /tmp/ab_grouped
   python scripts/ab_qsa_grouped_quality_v100.py run --arm A2 --base http://127.0.0.1:8110 --out /tmp/ab_grouped
   python scripts/ab_qsa_grouped_quality_v100.py run --arm B  --base http://127.0.0.1:8110 --out /tmp/ab_grouped
@@ -24,6 +26,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -31,6 +34,33 @@ MODEL_PATH = "/data/models/nvidiaQwen3.8-Flash-Next-NVFP4"
 LENGTHS = [1024, 4096, 16384, 32768, 65536, 131072]
 NEAR_TIE_MARGIN = 1e-3
 REQUEST_TIMEOUT = 900
+
+# The shared V100 engine endpoint (SGLANG_V100_HOST/PORT, see AGENTS.md):
+# Qwen and DSV4.1 serve on 11435, and this harness flushes the radix cache
+# twice per arm -- pointed there it would wreck the live engine (m24).
+PRODUCTION_PORT = 11435
+
+
+def ensure_idle_test_target(base: str, assume_idle: bool) -> None:
+    """Refuse the production endpoint unless the operator confirms idle.
+
+    ``run`` POSTs /flush_cache before the sweep and again before the G1
+    rerun; against the shared :11435 production engine that evicts its
+    radix cache (prefix-cache hits vanish until repopulated). The refusal
+    is bypassable only by an explicit --assume-idle, not by an env var,
+    so an operator typing the usual production address cannot blow past
+    it silently.
+    """
+    port = urlparse(base).port
+    if port == PRODUCTION_PORT and not assume_idle:
+        raise SystemExit(
+            f"refusing to target {base}: port {PRODUCTION_PORT} is the shared "
+            "V100 production endpoint (SGLANG_V100_HOST/PORT) and this harness "
+            "POSTs /flush_cache, which would evict its radix cache. Point "
+            "--base at an idle test boot (e.g. http://127.0.0.1:8110) or pass "
+            "--assume-idle to confirm the engine is idle."
+        )
+
 
 # Deterministic filler material (needle haystack). Short sentences with varied
 # digit/content so padding is not a degenerate repeated single token.
@@ -238,6 +268,7 @@ def _thinking_len(text: str) -> int:
 
 
 def run(args) -> int:
+    ensure_idle_test_target(args.base, args.assume_idle)
     tok = _tokenizer()
     tasks = build_tasks(tok)
     out = Path(args.out)
@@ -482,6 +513,12 @@ def main() -> int:
         "--fresh",
         action="store_true",
         help="truncate this arm's JSONL instead of resuming",
+    )
+    pr.add_argument(
+        "--assume-idle",
+        action="store_true",
+        help="confirm the engine behind a production-port --base is idle and "
+        "allow /flush_cache against it (m24 guard bypass)",
     )
     pa = sub.add_parser("analyze")
     pa.add_argument("--out", default="/tmp/ab_grouped")
