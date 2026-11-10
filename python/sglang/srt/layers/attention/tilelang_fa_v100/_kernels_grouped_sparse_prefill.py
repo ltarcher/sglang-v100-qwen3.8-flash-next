@@ -18,6 +18,9 @@ Planner contract:
     function of the selection (never the pool's physical allocation order);
   - every real row keeps all of its own entries in the union, so no live row
     is ever fully masked and sumexp > 0;
+  - the online softmax tolerates fully-masked 64-col tiles (cross-request
+    mixed groups / pad tails): m_i starts finite and is clamped after each
+    reduce (see the guard in the kernel body, mirroring _kernels_paged.py);
   - one scalar readback (max union length -> padded panel width) -- eager
     prefill only; the breakable-graph path keeps the Triton fallback.
 """
@@ -163,6 +166,21 @@ def _grouped_qsa_sparse_prefill_sm70(
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                # Fully-masked tile guard (mirrors _kernels_paged.py): a tile
+                # with no visible column leaves acc_s all -inf, and with a
+                # -inf running max exp2(-inf - -inf) = NaN would poison every
+                # later tile via alpha. NaN-free today only because m_i starts
+                # finite and clear=False accumulates (m_i = max(m_i, tile));
+                # the clamp keeps that invariant explicit instead of depending
+                # on the tilelang reduce semantics.
+                for m in T.Parallel(M):
+                    m_i[m] = T.if_then_else(
+                        m_i[m] == -T.infinity("float32"),
+                        T.cast(0, T.float32),
+                        m_i[m],
+                    )
+                for m in T.Parallel(M):
+                    m_i[m] = T.max(m_i[m], m_i_prev[m])
                 for m in T.Parallel(M):
                     alpha[m] = T.exp2((m_i_prev[m] - m_i[m]) * sm_scale_log2e)
                 for m, bi in T.Parallel(M, BI):
