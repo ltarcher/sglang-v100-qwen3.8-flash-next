@@ -225,11 +225,13 @@
     TestMixedPrefillBudgetControl::test_inflight_overflow_evicts_oldest_only`（饱和
     +1 条后：最旧被逐、其余存活、窗口恒等于 MAX_INFLIGHT_STEPS，TDD 红灯先行），
     全套件 31 passed；ruff 干净。
-- [ ] m19. compose 与 serve 脚本 mixed-chunk 默认值分叉（原 major 降级：属 eb6cedfdf3
-    有意启用并已登记 README）
+- [x] **m19. compose 与 serve 脚本 mixed-chunk 默认值分叉**（2026-11-10 结案）
   - `docker/v100-compose-qwen38-mtp.yaml:63`、`docker/v100-compose.yaml:70`（默认 750）
     vs `scripts/serve_qwen38_flash_next_nvfp4_v100.sh:149`（默认 0）。
-  - 修复：compose 默认改 0，750 作为显式覆盖；或两侧注释登记差异。
+  - **结案结论（注释登记差异，不改行为）**：分叉本身是 eb6cedfdf3 有意为之且已登记
+    README——compose 是"推荐部署"载体故直接启用实测最优 750ms，裸机 serve 脚本保留
+    0 以维持 pre-L3-1 行为需显式 opt-in。三个文件互相补加 divergence note 交叉引用
+    （compose→脚本默认 0、脚本→compose 默认 750 及理由），行为零变更、无测试面。
 - [ ] m20. compose 与 serve 脚本 PLE 后端分叉：脚本 staged NVMe、compose pinned RAM
   - `scripts/serve_qwen38_flash_next_nvfp4_v100.sh:327` vs compose（无
     `--ple-offload-backend`，走默认 pinned）。

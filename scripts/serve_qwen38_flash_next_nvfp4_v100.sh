@@ -145,7 +145,9 @@ export SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE="${SGLANG_HICACHE_FILE_
 # a V100 mixed step has a ~350-650 ms fixed cost, so targets below that are
 # refused by the controller (it warns and runs uncapped); 750 ms is the
 # measured sweet spot. Default 0 = off (plain chunked prefill, longest
-# resident stalls during long prefills).
+# resident stalls during long prefills). Divergence note (review m19): the
+# docker compose files (docker/v100-compose*.yaml) intentionally default this
+# to 750 — the measured sweet spot — while this script keeps 0.
 export SGLANG_MIXED_PREFILL_STEP_LATENCY_MS="${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-0}"
 
 # Docker-v2 tested sizing (README: 4 live requests, full 262K context)

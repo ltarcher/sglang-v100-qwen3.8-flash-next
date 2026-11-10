@@ -67,6 +67,10 @@ services:
       # the measured sweet spot on this box (mixed-step fixed cost floor is
       # 350-650 ms; ladder: resident max gap 1.988 -> 1.080 s, entry TTFT
       # +15%). Set 0 to fall back to plain chunked prefill.
+      # Divergence note (review m19): the bare-metal serve script
+      # (scripts/serve_qwen38_flash_next_nvfp4_v100.sh) defaults this to 0 so
+      # it preserves the pre-L3-1 behavior unless opted in; this compose
+      # intentionally arms 750 (numbers above).
       SGLANG_MIXED_PREFILL_STEP_LATENCY_MS: ${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-750}
       # PCIe cards without NVLink: SGLANG_CUSTOM_AR_ALLOW_PCIE=1.
       SGLANG_CUSTOM_AR_ALLOW_PCIE: ${SGLANG_CUSTOM_AR_ALLOW_PCIE:-0}

@@ -60,6 +60,10 @@ services:
       # controller (it warns and runs uncapped). Ladder (2 resident decodes +
       # 32k entry): resident max gap 1.988 s -> 1.080 s (-46%), cost = entry
       # TTFT 19.5 -> 22.5 s (+15%). Set 0 to disable (plain chunked prefill).
+      # Divergence note (review m19): the bare-metal serve script
+      # (scripts/serve_qwen38_flash_next_nvfp4_v100.sh) defaults this to 0 so
+      # it preserves the pre-L3-1 behavior unless opted in; this standalone
+      # compose intentionally arms 750 (numbers above).
       SGLANG_MIXED_PREFILL_STEP_LATENCY_MS: ${SGLANG_MIXED_PREFILL_STEP_LATENCY_MS:-750}
       SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: "0"
       SGLANG_NUMA_BIND_V2: "0"
