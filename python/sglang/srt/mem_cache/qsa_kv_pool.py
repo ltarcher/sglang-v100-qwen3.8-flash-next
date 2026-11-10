@@ -272,35 +272,30 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self._attach_pair_peer()
 
     def _attach_pair_peer(self) -> None:
-        """IPC-import the pair member's full-KV buffers and tags (PAIR_PARITY).
+        """IPC-import the pair member's full-KV buffers (PAIR_PARITY).
 
         Runs after both ranks allocated their pools: one handle blob each
         way over the TP group, then cudaIpcOpenMemHandle (lazy peer access)
         on the peer's side. The exchange is symmetric, so both ranks finish
-        with the other's buffers mapped.
+        with the other's buffers mapped. Tag tables are deliberately not
+        exchanged: the peer-tag mirror had no consumer and v1 forbids
+        pair-pool oversubscription, so peer pages are always resident
+        (review m7).
         """
         from sglang.srt.mem_cache.pair_split_ipc import exchange_pair_tensors
 
         tier = self.kv_host_tier
         k_buffers = [buf for buf, _ in tier._kv_buffers]
         v_buffers = [buf for _, buf in tier._kv_buffers]
-        # Tags are one (layers, pages+1) allocation: a single handle carries
-        # them all and the consumer slices per layer.
-        ours = [*k_buffers, *v_buffers, tier._p3_tags]
-        opened = exchange_pair_tensors(ours, tier.peer_rank)
+        opened = exchange_pair_tensors(
+            [*k_buffers, *v_buffers], tier.peer_rank
+        )
         n = len(k_buffers)
-        peer_k = opened[:n]
-        peer_v = opened[n : 2 * n]
-        peer_tags_all = opened[2 * n]
-        peer_tags = [
-            peer_tags_all.slice_rows(li * tier._p3_tags.shape[1])
-            for li in range(n)
-        ]
-        tier.attach_peer_buffers(peer_k, peer_v, peer_tags)
+        tier.attach_peer_buffers(opened[:n], opened[n : 2 * n])
         tier.ensure_peer_ready()
         logger.info(
-            "pair-split: imported peer rank %d KV buffers + tags "
-            "(%d layers, %d pages/rank)",
+            "pair-split: imported peer rank %d KV buffers (%d layers, "
+            "%d pages/rank)",
             tier.peer_rank,
             n,
             tier.phys_pages,

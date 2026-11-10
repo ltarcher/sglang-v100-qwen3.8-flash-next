@@ -146,3 +146,22 @@ def test_pair_split_ranking_gate():
         _check_pair_split_ranking(0, 2, 0, 4)  # attn-TP group smaller than world
     with pytest.raises(ValueError, match="whole world"):
         _check_pair_split_ranking(1, 2, 3, 4)  # rank identity mismatch
+
+
+def test_pair_split_exchanges_no_tag_tables():
+    """m7: the per-build peer-tag mirror had no consumer (page-in/gather
+    never read it, and v1 forbids pool oversubscription so peer pages are
+    always resident), yet every build paid n_layers D2D copies for it. The
+    mirror chain is deleted: the IPC exchange must not ship tag tables, and
+    the never-incremented _CNT_P3_PEER_MISS counter slot is gone."""
+    import inspect
+
+    from sglang.srt.mem_cache import kv_host_tier
+
+    assert not hasattr(kv_host_tier.KVHostTier, "_refresh_peer_tags")
+    params = inspect.signature(
+        kv_host_tier.KVHostTier.attach_peer_buffers
+    ).parameters
+    assert list(params) == ["self", "peer_k_buffers", "peer_v_buffers"]
+    assert kv_host_tier._CNT_SLOTS == 20
+    assert not hasattr(kv_host_tier, "_CNT_P3_PEER_MISS")

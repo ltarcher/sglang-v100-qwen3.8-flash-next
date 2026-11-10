@@ -64,7 +64,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import KVHeadLayout, envs
-from sglang.srt.mem_cache.pair_split_ipc import imported_as_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +102,7 @@ _CNT_P3_HOST_DEV_MISMATCH = 18
 # the overwrite. Without this a concurrent reader of that page falls back to
 # the stale host copy and reads the wrong context.
 _CNT_P3_SAVES = 19
-# Pair-split: a page-in fetched a peer-owned page whose row the pair member
-# no longer holds (its tag moved). v1 refuses pair-pool oversubscription at
-# boot, so any nonzero count means the no-oversubscription invariant broke --
-# the affected reads served wrong bytes.
-_CNT_P3_PEER_MISS = 20
-_CNT_SLOTS = 21
+_CNT_SLOTS = 20
 
 # Extend-read gather: rows per program. ROW_ELEMS is one token's K or V row
 # (kv_heads * head_dim); a tile of rows keeps the launches bounded at 512K.
@@ -1163,15 +1157,6 @@ class KVHostTier:
                 f"pair_pages={self.pair_pages}. Raise SGLANG_V100_KV_TIER_PHYS_"
                 "TOKENS (the PAIR total) or lower --max-total-tokens."
             )
-        # Tag mirror of the pair member: refreshed at every build so page-in
-        # knows which of the peer's slots currently hold the pages it reads.
-        # phys layout mirrors ours (both ranks build symmetric pools).
-        self._peer_tags = torch.full(
-            (self.layer_num, self.phys_pages + 1),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
         # Imported peer K/V buffers, set by attach_peer_buffers() after the
         # IPC rendezvous. Kernels never dereference them until then; boot
         # refuses to serve without them.
@@ -1275,13 +1260,16 @@ class KVHostTier:
         uniq.scatter_(0, dest.clamp(max=self._p3_cap - 1), sorted_pages)
         count.copy_(dest[-1] + 1)
 
-    def attach_peer_buffers(self, peer_k_buffers, peer_v_buffers, peer_tags) -> None:
-        """Install the pair member's imported full-KV buffers and tag tables.
+    def attach_peer_buffers(self, peer_k_buffers, peer_v_buffers) -> None:
+        """Install the pair member's imported full-KV buffers.
 
         Called once at boot after the IPC rendezvous; both ranks build
         symmetric pools, so the tensors line up layer-for-layer with ours.
         Serving refuses to start without them under PAIR_PARITY (checked in
-        ensure_peer_ready).
+        ensure_peer_ready). Peer tag tables are deliberately not exchanged:
+        the mirror had no consumer (page-in/gather never read it) and v1
+        forbids pair-pool oversubscription, so peer pages are always
+        resident (review m7).
         """
         if not self.pair_split:
             return
@@ -1291,7 +1279,6 @@ class KVHostTier:
                 f"{self.layer_num}"
             )
         self._peer_kv_buffers = list(zip(peer_k_buffers, peer_v_buffers))
-        self._peer_tags_source = list(peer_tags)
 
     def ensure_peer_ready(self) -> None:
         """Boot-time hard gate: pair-split needs the peer buffers attached."""
@@ -1299,23 +1286,6 @@ class KVHostTier:
             raise RuntimeError(
                 "SGLANG_V100_KV_HEAD_LAYOUT=PAIR_PARITY requires the pair "
                 "member's KV buffers (IPC import failed or was skipped)"
-            )
-
-    def _refresh_peer_tags(self) -> None:
-        """Copy the pair member's tag tables into the local mirror.
-
-        P2P device-to-device, one small copy per layer on the current
-        stream: the build already ordered everything else, so the refresh
-        lands before this forward's page-in and gather.
-        """
-        for li in range(self.layer_num):
-            # The source is an IPC-imported pointer wrapper; torch copy_
-            # needs a real tensor, so wrap the allocation zero-copy.
-            self._peer_tags[li].copy_(
-                imported_as_tensor(
-                    self._peer_tags_source[li], self._peer_tags[li].shape
-                ),
-                non_blocking=True,
             )
 
     def _p3_logical_pages(self, slots: torch.Tensor) -> torch.Tensor:
@@ -1367,11 +1337,6 @@ class KVHostTier:
                 "Phase 3 KV host tier does not support CUDA-graph capture; "
                 "serve with --disable-cuda-graph"
             )
-        if self.pair_split:
-            # Refresh the pair member's tag mirror before this forward's
-            # page-in/gather consult it: after the refresh, "peer tag ==
-            # lp" means the peer's row holds the page's current bytes.
-            self._refresh_peer_tags()
         self.step_seq += 1
         # Bump the generation on-device: the captured page-in kernels load
         # this scalar at replay, so the bump must be a device op ordered
@@ -2018,8 +1983,7 @@ class KVHostTier:
                 "kv_host_tier phase3 stats: steps=%d mirror_pages=%d "
                 "write_restores=%d pagein_restores=%d collisions=%d "
                 "saves=%d host_gather_rows=%d mirror_skips=%d "
-                "gather_unvalid=%d checked_rows=%d host_dev_mismatch=%d "
-                "peer_miss=%d",
+                "gather_unvalid=%d checked_rows=%d host_dev_mismatch=%d",
                 self.step_seq,
                 c[_CNT_P3_MIRROR_PAGES],
                 c[_CNT_P3_WRITE_RESTORES],
@@ -2031,7 +1995,6 @@ class KVHostTier:
                 c[_CNT_P3_GATHER_UNVALID],
                 c[_CNT_P3_CHECKED_ROWS],
                 c[_CNT_P3_HOST_DEV_MISMATCH],
-                c[_CNT_P3_PEER_MISS],
             )
             return
         reads = c[_CNT_READ_HITS] + c[_CNT_READ_MISSES]
