@@ -811,7 +811,9 @@ deterministic CUDA,oracle 实测 staged/pinned 32/32 bit-exact、MTP verify
 **生产落地(8110 compose,2026-11-10)**:`docker-compose-sglang-v100-mtp-8110.yaml`
 已登记 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "1"`(depth=1,2 个额外
 staging 缓冲 ≈ 671MB/个 host RAM)+ `SGLANG_FORCE_DETERMINISTIC: "1"`,
-镜像已按 feature-chunk-ahead 重建,待重启容器生效。
+镜像已按 feature-chunk-ahead 重建。同日生产验收通过:4 rank wired 日志
+`depth=1, buffers=2`;输出连贯;MTP accept 2.20-2.45 / rate 0.40-0.48
+(正常带,无退化签名);deterministic 启动日志齐全。
 
 **已补单测**(2 例,36/36 通过,ruff clean,§11.9.5.1 同脚注):尾 chunk
 (partial 或恰满)因调度器不再记 stash 而永不 serve(即使队列投机 fill

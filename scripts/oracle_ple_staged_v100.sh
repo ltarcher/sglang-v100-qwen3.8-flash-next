@@ -122,7 +122,6 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
     -e HF_HUB_OFFLINE=1 \
     -e SGLANG_V100_KV_HOST_TIER=1 \
     -e SGLANG_V100_KV_HEAD_LAYOUT=1 \
-    -e SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH=1 \
     -e SGLANG_V100_KV_TIER_PHYS_TOKENS=786432 \
     -e SGLANG_V100_DECODE_CUDA_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_longctx_decode \
     -e SGLANG_V100_NVFP4_MOE_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_nvfp4_moe \

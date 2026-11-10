@@ -5,8 +5,8 @@
 Phase 3 最小闭环已实施:S2 矩阵、S3 516K 单请求与 S4(MTP+CUDA graph)
 验收通过(2026-11-01,见 §10.7);§6.1 pair-split 对拆已落地验收
 (2026-11-04)并于 2026-11-05 **转生产**(8110 compose:PAIR_PARITY +
-Phase 3 tier,3×256K 满配,`SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH=1` 暂作
-准入闸门,质量门禁入 CI 后随代码移除);YaRN ×3 并发判死(2026-11-05,
+Phase 3 tier,3×256K 满配;原 TESTBENCH 准入闸门已于 2026-11-10
+随代码移除);YaRN ×3 并发判死(2026-11-05,
 §6.3)。**未做**:组件 5 准入与更大并发(4×256K 两次实测不可行,§6.1
 生产启用记录)、1M/YaRN 线(§7 质量门 3/4)、NVMe KV 冷层(杠杆 3)
 日期:2026-10-30(同日两次修订:§4 以 np=1 实测基准校准;补测 262k 锚点
@@ -308,7 +308,7 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 | SGLANG_V100_KV_TIER_PHYS_TOKENS | 0 | Phase 3 设备池物理 token 数(每 rank;0=关;>0 时逻辑池 modulo 直映射其上,host 镜像覆盖全部逻辑页) |
 | SGLANG_V100_KV_HEAD_LAYOUT | 0(FULL) | 设备池布局:PAIR_PARITY(对拆,§6.1)每 rank 只存奇偶半页,读侧 owner-bit 双指针 P2P 直读对家;需 PHYS_TOKENS>0 且 P2P 探测通过 |
 | SGLANG_V100_KV_HEAD_LAYOUT_BLOCK | 1 | PAIR_PARITY 奇偶组块数(N>1 把 64-token 页并成 N×64 拷贝粒度,须整除 pair 总页数) |
-| SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH | 0 | PAIR_PARITY 服务门:置 1 才允许 boot。生产 8110 compose 已置 1(2026-11-05 转生产,作准入闸门);质量门禁入 CI 后随代码移除 |
+| SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH | ~~已移除~~ | PAIR_PARITY 服务门:置 1 才允许 boot。2026-11-10 随代码移除(env 定义 + kv_host_tier.py boot 检查 + compose/脚本设值);pair-accept 2026-11-04 验收、2026-11-05 转生产在役 |
 
 上线时同步 serve 脚本注释与 README 表格(fork 纪律)。
 
@@ -380,8 +380,8 @@ PAIR 切片 + decode/gather 表消费者接线,2026-11-04 修复 `map_slot_table
 
 - env:`HOST_TIER=1`、`HEAD_LAYOUT=1`(PAIR_PARITY)、`PHYS_TOKENS=786,432`
   (PAIR 总量,每 rank device 池 = PHYS/2 = 393,216;6144 页偶数满足
-  2×block 整除)、`PAIR_SPLIT_TESTBENCH=1`(准入闸门:不设则 boot
-  RuntimeError;质量门禁入 CI 后随代码移除)。
+  2×block 整除)。原 `PAIR_SPLIT_TESTBENCH=1` 准入闸门已于 2026-11-10
+  随代码移除(不设该 env 也可 boot)。
 - 调度:`--max-total-tokens 786,432`(3×262144,factor 1.0 回退)超出
   GPU profile(~426K)的部分由 host mirror 承担(`DISABLE_EXTEND` 不设,
   逻辑扩展开);`--max-running-requests 3` = 3×256K 满配。4×256K 两次
@@ -502,18 +502,20 @@ device 池可缩,但长文 decode 撞 host page-in spill 悬崖)。
 | 3 调度 | 组件 5 准入按常驻工作集;512K×2/×4 默认策略 | 生产可开关 | 512K×4 实测达 §7 门 |
 | 4 1M | YaRN ×4 + 方案 b 流式 prefill + 1M 阶梯 | 新场景 | §7 质量门 + 阶梯记录 |
 
-## 9. 风险与未决问题
+## 9. 风险与未决问题(待办清单,2026-11-10 整理)
 
-- verify replay 索引语义:与并行会话(gdn_backend)改动协调,PR6 池越界
-  同类区域重点测。
-- 索引重映射与 radix/retract 释放路径的一致性(三种槽位并存)。
-- 4×1M 在 fp16+复制下无解,去复制改造的工程量与 attention TP 正确性风险。
-- host pinned 内存上限(cgroup/numatune)需在目标机实测;
-  `SGLANG_NUMA_BIND_V2=0` 为前提。
-- 262k 锚点已实测(2026-10-30,prefill 2296 tok/s / 输出 85-93 tok/s /
-  warm radix 0.68 s);decode 按 -14%/倍增外推,512K/1M prefill 仍为带估计,
-  Phase 2 阶梯补 512K 点收窄并回填 §4 表格。运行时确认 production
-  page_size=64、池 426,240 tokens。
+| # | 待办 | 类型 | 质量风险 | 前置 / 堵点 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | verify replay 索引语义:与并行会话(gdn_backend)改动协调,PR6 池越界同类区域重点测 | 正确性 | 有 | 需与 gdn_backend 改动同窗口验证,重点回归 PR6 池越界区域 | 未开工 |
+| 2 | 索引重映射与 radix/retract 释放路径的一致性(三种槽位并存) | 正确性 | 有 | 需构造 retract + radix 驱逐与 tier 页入并发的用例 | 未开工 |
+| 3 | 4×1M 在 fp16+复制下无解;去复制改造的工程量与 attention TP 正确性风险 | 容量 | 有 | 杠杆 2 pair-split 已解决 ×2(§6.1);×4 还需镜像减半 + 杠杆 3 叠加,且组件 5 准入先行(两次 4×256K 实测不可行,§6.1) | 死路(当前形态) |
+| 4 | host pinned 内存上限(cgroup/numatune)在目标机实测;`SGLANG_NUMA_BIND_V2=0` 为前提 | 测量 | 无 | 生产 compose 已按 125G 内存裁剪 hicache;实测仅补记录 | 未开工 |
+| 5 | Phase 2 阶梯补 512K prefill 点,收窄 §4.2 外推带并回填 §4 表格(262k 锚点已实测 2026-10-30:prefill 2296 tok/s / 输出 85-93 tok/s / warm radix 0.68s;decode 按 -14%/倍增外推) | 测量 | 无 | 生产容器空闲窗口跑一次 512K 阶梯 bench(`/tmp/bench_ctx_ladder_distinct.py` 口径);与 #4 可同窗完成 | 未开工 |
+
+附:杠杆 3(NVMe 冷层)为无质量风险的实质优化,但前置 = §7 质量门 4
+局部性实测(1×1M 形态),而 1M 需 YaRN、YaRN 在 3 并发形态已因 warmup
+内存判死(§6.3)→ 1M×1 内存形态未解前杠杆 3 不可开工。
+运行时确认 production page_size=64、池 426,240 tokens。
 
 ## 10. Phase 3 实施设计(最小闭环,512K×1)
 

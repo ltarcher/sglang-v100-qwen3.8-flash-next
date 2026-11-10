@@ -1718,13 +1718,6 @@ class Envs:
     # for better P2P bandwidth at coarser page-in granularity). Must divide
     # the pair-total physical page count.
     SGLANG_V100_KV_HEAD_LAYOUT_BLOCK = EnvInt(1)
-    # Testbench escape for PAIR_PARITY serving: the owner-bit dual-pointer
-    # read path is implemented and pair-accept validated (2026-11-04), and
-    # the 8110 production compose enables PAIR_PARITY with this flag set
-    # (2026-11-05) as an admission gate -- boots refuse to serve without it
-    # until the quality gates move into CI, at which point the flag and the
-    # check are removed together.
-    SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)

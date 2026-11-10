@@ -1089,18 +1089,13 @@ class KVHostTier:
         # both compute the same head and each stores its parity half.
         self.pair_rank_bit = rank & 1
         self.peer_rank = rank ^ 1
-        # v1 scaffolding lands the ownership map, write-side parity guards
+        # v1 scaffolding landed the ownership map, write-side parity guards
         # and the IPC rendezvous; the read path (owner-bit dual-pointer
         # decode/gather tables, docs/v100/KV_HOST_TIER_DESIGN.md §6.1 v2)
-        # is wired by the _p3_gather_kernel PAIR slice below. Serving under
-        # PAIR_PARITY still requires the testbench opt-in until the quality
-        # gates pass.
-        if not envs.SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH.get():
-            raise RuntimeError(
-                "SGLANG_V100_KV_HEAD_LAYOUT=PAIR_PARITY read path is gated "
-                "behind SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH=1 until the "
-                "pair-split quality gates pass"
-            )
+        # is wired by the _p3_gather_kernel PAIR slice below. The former
+        # SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH admission gate was removed on
+        # 2026-11-10: pair-accept validated (2026-11-04) and serving in
+        # production since 2026-11-05.
         if self.logical_pages > self.pair_pages:
             raise ValueError(
                 "Pair-split v1 requires the logical pool to fit the PAIR-total "
