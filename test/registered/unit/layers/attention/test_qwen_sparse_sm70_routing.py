@@ -246,3 +246,62 @@ def test_selection_skip_rejects_decode_and_speculation(mode):
             None,
             skip_prefill_selection=True,
         )
+
+
+class _GuardSentinelBackend:
+    """Stub backend whose ``req_to_token`` access proves the mixed-batch
+    guard let a batch through to the grouped planner."""
+
+    @property
+    def req_to_token(self):
+        raise AssertionError("grouped-prefill guard must not block this batch")
+
+
+def _eligible_grouped_prefill_args():
+    rows = 256
+    q = torch.randn(rows, 6, 256, dtype=torch.float16)
+    kv = torch.randn(rows, 1, 256, dtype=torch.float16)
+    topk = torch.zeros(rows, 64, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, rows], dtype=torch.int32)
+    return q, kv, kv, topk, cu_seqlens_q, 0.0625
+
+
+def test_grouped_prefill_guard_blocks_rewritten_mixed_batch():
+    # M3 (docs/v100/CODE_REVIEW_TODO_20261110.md): eager_runner rewrites
+    # MIXED -> EXTEND before metadata init, so the mixed identity only
+    # survives in _original_forward_mode. The guard must read it, or
+    # mixed-chunk batches reach the grouped planner and corrupt decode
+    # tails.
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        _original_forward_mode=ForwardMode.MIXED,
+    )
+    q, k, v, topk, cu, scale = _eligible_grouped_prefill_args()
+    result = QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
+        _GuardSentinelBackend(), q, k, v, forward_batch, topk, cu, scale
+    )
+    assert result is None
+
+
+def test_grouped_prefill_guard_blocks_direct_mixed_batch():
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.MIXED,
+        _original_forward_mode=None,
+    )
+    q, k, v, topk, cu, scale = _eligible_grouped_prefill_args()
+    result = QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
+        _GuardSentinelBackend(), q, k, v, forward_batch, topk, cu, scale
+    )
+    assert result is None
+
+
+def test_grouped_prefill_guard_does_not_block_pure_extend():
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        _original_forward_mode=None,
+    )
+    q, k, v, topk, cu, scale = _eligible_grouped_prefill_args()
+    with pytest.raises(AssertionError, match="must not block"):
+        QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
+            _GuardSentinelBackend(), q, k, v, forward_batch, topk, cu, scale
+        )

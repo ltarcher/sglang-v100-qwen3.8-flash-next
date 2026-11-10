@@ -2453,7 +2453,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         # tail_rows handling above); the grouped planner assumes the uniform
         # valid-first -1-padding layout of pure extend rows and would corrupt
         # tail outputs -- keep those batches on the Triton path.
-        if forward_batch.forward_mode == ForwardMode.MIXED:
+        # The eager runner rewrites MIXED to EXTEND before metadata init, so
+        # forward_mode == MIXED is always False here; the mixed identity
+        # arrives via _original_forward_mode (see eager_runner.execute).
+        if (
+            forward_batch.forward_mode == ForwardMode.MIXED
+            or forward_batch._original_forward_mode == ForwardMode.MIXED
+        ):
             return None
         R = q.shape[0]
         if not (
