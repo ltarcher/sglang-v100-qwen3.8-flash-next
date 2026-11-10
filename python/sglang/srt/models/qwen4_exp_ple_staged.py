@@ -342,6 +342,7 @@ class PleRowStaging:
                 "(raise SGLANG_QWEN4_PLE_STAGED_MAX_ROWS)"
             )
         ids_np = self._to_ids_np(ids)
+        self._staged_vocab_start = int(vocab_start)
         self._wait_pending()
         slots, rows = self._plan_fill(ids_np, vocab_start, vocab_end)
         if self._pool is None or len(rows) <= 32:

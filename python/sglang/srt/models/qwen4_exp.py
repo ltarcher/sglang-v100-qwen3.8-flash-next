@@ -1166,6 +1166,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # at consume time — gather directly, no fill and no D2H.
             if envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get():
                 self._debug_verify_prefill_ids(staging, flat_ids, n)
+                self._debug_spot_check_serve_rows(staging, n)
+                logger.info(
+                    "PLE chunk-ahead serve gather: n=%d sum(flat)=%d sum(staged)=%d",
+                    n,
+                    int(flat_ids.sum()),
+                    int(staging._staged_ids.sum()),
+                )
             self._staged_ahead_hits += 1
         elif not capturing:
             t0 = time.perf_counter()
@@ -1209,6 +1216,52 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             BLOCK_D=self._block_d,
         )
         return output
+
+    def _debug_spot_check_serve_rows(self, staging, n: int) -> None:
+        """PREP_DEBUG oracle for the chunk-ahead serve path: byte-compare a
+        sample of the serve buffer's rows against a synchronous re-read of the
+        table file. The id checks prove ids alignment only; this proves the
+        ROWS the speculative fill left in the buffer are the rows the sync
+        path would have read for the same ids."""
+        import os as _os
+
+        ids_np = staging._staged_ids
+        if ids_np is None or n == 0 or n != ids_np.shape[0]:
+            logger.error("PLE serve row spot-check: ids unavailable (n=%d)", n)
+            return
+        vs = staging._staged_vocab_start
+        shard_rows = staging.table.shard_rows
+        row_bytes = staging.row_bytes
+        fd = staging.table._ensure_open()
+        samples = range(0, n, max(1, n // 256))
+        bad = checked = 0
+        for k in samples:
+            local = int(ids_np[k]) - vs
+            if local < 0 or local >= shard_rows:
+                continue
+            checked += 1
+            want = _os.pread(fd, row_bytes, local * row_bytes)
+            got = staging.buffer[k].numpy().tobytes()
+            if want != got:
+                bad += 1
+                if bad <= 3:
+                    logger.error(
+                        "PLE serve ROW MISMATCH slot=%d id=%d local=%d "
+                        "(buffer bytes != table bytes)",
+                        k,
+                        int(ids_np[k]),
+                        local,
+                    )
+        logger.info(
+            "PLE serve row spot-check: vs=%d shard_rows=%d id_min=%d id_max=%d "
+            "checked=%d mismatches=%d",
+            vs,
+            shard_rows,
+            int(ids_np.min()),
+            int(ids_np.max()),
+            checked,
+            bad,
+        )
 
     def _debug_verify_prefill_ids(
         self, staging, flat_ids: torch.Tensor, n: int

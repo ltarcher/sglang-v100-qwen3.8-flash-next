@@ -32,6 +32,9 @@
 #   ORACLE_PLE_DIR (default /data/sglang-ple-staged; staged table dump,
 #                  ~51 GB, first staged boot materializes it)
 #   ORACLE_MTP     (default 0; 1 = production MTP TARGET_VERIFY oracle)
+#   ORACLE_STAGED_AHEAD (default 0; >0 = chunk-ahead prefetch depth
+#                  §11.9.5 on the staged arm: bit-exactness then also
+#                  covers the speculative staging path)
 # Stop the production engine first: one engine per machine, and the oracle
 # binds all 4 GPUs.
 set -euo pipefail
@@ -43,6 +46,8 @@ IMAGE="${ORACLE_IMAGE:-sglang-v100-unified:latest}"
 PORT="${ORACLE_PORT:-11436}"
 PLE_DIR="${ORACLE_PLE_DIR:-/data/sglang-ple-staged}"
 MTP="${ORACLE_MTP:-0}"
+AHEAD="${ORACLE_STAGED_AHEAD:-0}"
+LONGCASE="${ORACLE_LONG_PROMPT:-0}"
 [[ -f "$MODEL/config.json" ]] || { echo "no config.json at $MODEL" >&2; exit 1; }
 mkdir -p "$OUT" "$PLE_DIR"
 
@@ -81,9 +86,14 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
       -e SGLANG_QWEN4_PLE_STAGED_REUSE=1
       -e SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT=1800
     )
+    if [[ "$AHEAD" != 0 ]]; then
+      extra_env+=(-e "SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=$AHEAD")
+    fi
   fi
   log "starting $backend server on :$PORT (logs: $OUT/server_$backend.log)"
-  docker run -d --name "$name" --gpus all --ipc host \
+  local attempt
+  for attempt in 1 2 3; do
+    docker run -d --name "$name" --gpus all --ipc host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -p "$PORT:$PORT" \
     -v "$MODEL:/data/models/nvfp4:ro" \
@@ -97,14 +107,21 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
     -e SGLANG_SM70_DENSE_GEMV=1 \
     -e SGLANG_SM70_QWEN_FUSIONS=1 \
     -e SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192 \
+    -e SGLANG_SM70_QSA_GROUPED_PREFILL=0 \
+    -e SGLANG_MIXED_PREFILL_STEP_LATENCY_MS=0 \
     -e SGLANG_MAMBA_CONV_DTYPE=float16 \
     -e SGLANG_MAMBA_SSM_DTYPE=float16 \
     -e SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 \
     -e SGLANG_NUMA_BIND_V2=0 \
     -e SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1 \
+    -e SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP=1 \
     -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
     -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
     -e HF_HUB_OFFLINE=1 \
+    -e SGLANG_V100_KV_HOST_TIER=1 \
+    -e SGLANG_V100_KV_HEAD_LAYOUT=1 \
+    -e SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH=1 \
+    -e SGLANG_V100_KV_TIER_PHYS_TOKENS=786432 \
     -e SGLANG_V100_DECODE_CUDA_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_longctx_decode \
     -e SGLANG_V100_NVFP4_MOE_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_nvfp4_moe \
     -e SGLANG_JIT_CACHE_DIR=/root/sglang-v100-jit/jit \
@@ -122,24 +139,33 @@ run_server() { # $1 = backend (pinned|staged); starts + waits for health
       --kv-cache-dtype auto \
       --tensor-parallel-size 4 \
       --host 0.0.0.0 --port "$PORT" \
-      --mem-fraction-static 0.86 \
+      --mem-fraction-static 0.90 \
       --context-length 262144 \
-      --max-running-requests 4 \
+      --max-total-tokens 786432 \
+      --max-running-requests 3 \
       --max-mamba-cache-size 20 \
       --mamba-radix-cache-strategy extra_buffer \
       --mamba-full-memory-ratio 0.2 \
       --chunked-prefill-size 4096 \
       --max-prefill-tokens 4096 \
-      --cuda-graph-max-bs-decode 4 \
-      --cuda-graph-bs-decode 1 2 4 \
-      --disable-prefill-cuda-graph \
+      --cuda-graph-backend-prefill disabled \
+      --cuda-graph-max-bs-decode 3 \
+      --cuda-graph-bs-decode 1 2 3 \
       --ple-offload-embedding \
       --warmups sampling \
       --sleep-on-idle \
-      "${extra[@]}" >/dev/null 2>&1 || {
-        log "docker run failed for $backend" >&2
-        return 1
-      }
+      "${extra[@]}" >>"$OUT/docker_run_$backend.err" 2>&1 && break
+    # Transient failure (typically: the previous arm's 11436 bind not yet
+    # released after docker rm -f). Drop the half-created container, wait,
+    # retry; the real server log streams via docker logs below either way.
+    log "docker run failed for $backend (attempt $attempt/3)" >&2
+    tail -5 "$OUT/docker_run_$backend.err" >&2
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    if [[ "$attempt" == 3 ]]; then
+      return 1
+    fi
+    sleep 5
+  done
   # `docker run -d` detaches, so the container's stdout never reaches the
   # redirect above; stream the real server log via `docker logs -f` instead.
   docker logs -f "$name" >"$OUT/server_$backend.log" 2>&1 &
@@ -165,10 +191,10 @@ staged materialization can take a while)..."
 }
 
 collect() { # $1 = backend, $2 = outfile; identical request sequence per run
-  python3 - "$PORT" "$2" <<'PYEOF'
+  python3 - "$PORT" "$2" "$AHEAD" "$LONGCASE" <<'PYEOF'
 import json, sys, time, urllib.request
 
-port, out_path = sys.argv[1], sys.argv[2]
+port, out_path, ahead, long_case = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 url = f"http://127.0.0.1:{port}/generate"
 
 PROMPTS = [
@@ -221,6 +247,18 @@ time.sleep(0.6)
 results["ov_1"] = gen(PROMPTS[1], 72)
 time.sleep(0.6)
 results["ov_2"] = gen(PROMPTS[2], 48)
+# 4) long multi-chunk prefill (chunk-ahead arms only): the short prompts above
+#    fit in one chunked_prefill_size=4096 chunk, so the §11.9.5 speculative
+#    staging never engages; this ~30k-token prompt crosses ~8 chunk
+#    boundaries and walks the ahead FIFO (submit i+1..i+d while i computes,
+#    bit-exact consume check on every chunk). Deterministic repeated text so
+#    both boots send byte-identical input.
+if ahead != "0" or long_case == "1":
+    para = ("The canal barge carried coal downriver at a steady pace, "
+            "passing locks and mills whose wheels turned in the current. "
+            "Engineers surveyed the towpath while laborers unloaded crates "
+            "at the wharf, and the toll clerk recorded every manifest. ")
+    results["long_prefill"] = gen(para * 700, 32)
 
 def canon(r):
     mi = r["meta_info"]
@@ -260,6 +298,14 @@ check_server_log() { # $1 = backend; gate self-check
     local hits
     hits=$(grep -c "gate ids == in-graph ids" "$logfile" || true)
     log "staged gate self-check: $hits matching steps, 0 mismatches"
+    if [[ "$AHEAD" != 0 ]]; then
+      if ! grep -q "PLE chunk-ahead prefetch wired" "$logfile"; then
+        log "FAIL: staged boot has no 'PLE chunk-ahead prefetch wired' line"
+        return 1
+      fi
+      grep "PLE chunk-ahead prefetch wired" "$logfile" | head -1 >&2
+      log "staged chunk-ahead arm: depth=$AHEAD"
+    fi
   fi
 }
 

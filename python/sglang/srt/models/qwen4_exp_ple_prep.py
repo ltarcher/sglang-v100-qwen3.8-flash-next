@@ -417,6 +417,15 @@ def prefetch_staged_ple_prefill(model, ple_batch, forward_batch) -> None:
                     vocab_start=entry.vocab_start,
                     vocab_end=entry.vocab_end,
                 )
+            if envs.SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG.get():
+                logger.info(
+                    "PLE chunk-ahead trace: pool=%d stash=%d n=%d serve=%s queued=%d",
+                    pool_idx,
+                    len(stash_tokens),
+                    int(ids_np.shape[0]),
+                    serve is not None,
+                    len(host._staged_ahead._queue),
+                )
         else:
             entry.staging.stage_async(
                 ids_flat,

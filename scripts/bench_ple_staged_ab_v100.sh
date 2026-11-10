@@ -6,9 +6,11 @@
 # TP4, EAGLE 3/1/4, decode CUDA graphs on) and runs scripts/bench_v100.py
 # against each: a prefill scout (64k, ~262k TTFT) and a padding-decode ladder
 # at warm state, two passes per point (pass 1 warms radix + the staged page
-# cache, pass 2 is the measured warm run). Ladder fits the boot's budget
-# (max_total_num_tokens=323072 at mem-fraction 0.86; request validation
-# requires input + 4 MTP draft slots + completion <= 262144):
+# cache, pass 2 is the measured warm run). Server flags mirror the 8110
+# production compose (docker-compose-sglang-v100-mtp-8110.yaml: 0.90 mem
+# fraction, KV host tier 786432 tokens PAIR, max-running-requests 3,
+# decode graphs bs 1 2 3). Ladder request validation requires input + 4 MTP
+# draft slots + completion <= 262144:
 #   C=1 @ ctx 250k (max_new 12000), C=2 @ ctx 128k (12000), C=2 @ 64k (20000)
 # The gate:
 #   - staged warm aggregate decode throughput >= pinned - 3%  (per point)
@@ -20,7 +22,11 @@
 # Usage (repo root, target machine, GPUs idle, no other engine):
 #   bash scripts/bench_ple_staged_ab_v100.sh [MODEL_DIR] [OUT_DIR]
 # Env overrides: ORACLE_IMAGE / ORACLE_PORT (see oracle_ple_staged_v100.sh),
-#   BENCH_SECONDS (default 30), BENCH_SKIP_PREFILL (default 0).
+#   BENCH_SECONDS (default 30), BENCH_SKIP_PREFILL (default 0),
+#   AHEAD_DEPTH (default 0; >0 = chunk-ahead prefetch depth §11.9.5 on the
+#   staged arm), BENCH_SKIP_PINNED=1 (run the staged arm only and diff it
+#   against a previous run's staged results in BENCH_BASELINE_DIR — used for
+#   the chunk-ahead depth ladder where the pinned arm is irrelevant).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,6 +37,9 @@ PORT="${ORACLE_PORT:-11436}"
 PLE_DIR="${ORACLE_PLE_DIR:-/data/sglang-ple-staged}"
 SECONDS_BENCH="${BENCH_SECONDS:-30}"
 SKIP_PREFILL="${BENCH_SKIP_PREFILL:-0}"
+AHEAD="${AHEAD_DEPTH:-0}"
+SKIP_PINNED="${BENCH_SKIP_PINNED:-0}"
+BASELINE_DIR="${BENCH_BASELINE_DIR:-}"
 [[ -f "$MODEL/config.json" ]] || { echo "no config.json at $MODEL" >&2; exit 1; }
 mkdir -p "$OUT"
 
@@ -49,10 +58,15 @@ run_server() { # $1 = backend (pinned|staged)
       -e SGLANG_QWEN4_PLE_STAGED_REUSE=1
       -e SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT=1800
     )
+    if [[ "$AHEAD" != 0 ]]; then
+      extra_env+=(-e "SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD=$AHEAD")
+    fi
   fi
   docker rm -f "$name" >/dev/null 2>&1 || true
   log "starting $backend server on :$PORT (logs: $OUT/server_$backend.log)"
-  docker run -d --name "$name" --gpus all --ipc host \
+  local attempt
+  for attempt in 1 2 3; do
+    docker run -d --name "$name" --gpus all --ipc host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -p "$PORT:$PORT" \
     -v "$MODEL:/data/models/nvfp4:ro" \
@@ -66,14 +80,21 @@ run_server() { # $1 = backend (pinned|staged)
     -e SGLANG_SM70_DENSE_GEMV=1 \
     -e SGLANG_SM70_QWEN_FUSIONS=1 \
     -e SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192 \
+    -e SGLANG_SM70_QSA_GROUPED_PREFILL=0 \
+    -e SGLANG_MIXED_PREFILL_STEP_LATENCY_MS=0 \
     -e SGLANG_MAMBA_CONV_DTYPE=float16 \
     -e SGLANG_MAMBA_SSM_DTYPE=float16 \
     -e SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 \
     -e SGLANG_NUMA_BIND_V2=0 \
     -e SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1 \
+    -e SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP=1 \
     -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
     -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
     -e HF_HUB_OFFLINE=1 \
+    -e SGLANG_V100_KV_HOST_TIER=1 \
+    -e SGLANG_V100_KV_HEAD_LAYOUT=1 \
+    -e SGLANG_V100_KV_PAIR_SPLIT_TESTBENCH=1 \
+    -e SGLANG_V100_KV_TIER_PHYS_TOKENS=786432 \
     -e SGLANG_V100_DECODE_CUDA_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_longctx_decode \
     -e SGLANG_V100_NVFP4_MOE_BUILD_DIR=/root/sglang-v100-jit/ext/sm70_nvfp4_moe \
     -e SGLANG_JIT_CACHE_DIR=/root/sglang-v100-jit/jit \
@@ -91,17 +112,18 @@ run_server() { # $1 = backend (pinned|staged)
       --kv-cache-dtype auto \
       --tensor-parallel-size 4 \
       --host 0.0.0.0 --port "$PORT" \
-      --mem-fraction-static 0.86 \
+      --mem-fraction-static 0.90 \
       --context-length 262144 \
-      --max-running-requests 4 \
+      --max-total-tokens 786432 \
+      --max-running-requests 3 \
       --max-mamba-cache-size 20 \
       --mamba-radix-cache-strategy extra_buffer \
       --mamba-full-memory-ratio 0.2 \
       --chunked-prefill-size 4096 \
       --max-prefill-tokens 4096 \
-      --cuda-graph-max-bs-decode 4 \
-      --cuda-graph-bs-decode 1 2 4 \
-      --disable-prefill-cuda-graph \
+      --cuda-graph-backend-prefill disabled \
+      --cuda-graph-max-bs-decode 3 \
+      --cuda-graph-bs-decode 1 2 3 \
       --ple-offload-embedding \
       --speculative-algorithm EAGLE \
       --speculative-draft-model-path /data/models/nvfp4 \
@@ -110,10 +132,17 @@ run_server() { # $1 = backend (pinned|staged)
       --speculative-num-draft-tokens 4 \
       --warmups sampling \
       --sleep-on-idle \
-      "${extra[@]}" >/dev/null 2>&1 || {
-        log "docker run failed for $backend" >&2
-        return 1
-      }
+      "${extra[@]}" >>"$OUT/docker_run_$backend.err" 2>&1 && break
+    # Transient failure (typically: the previous arm's port bind not yet
+    # released after docker rm -f); drop the half-created container, wait, retry.
+    log "docker run failed for $backend (attempt $attempt/3)" >&2
+    tail -5 "$OUT/docker_run_$backend.err" >&2
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    if [[ "$attempt" == 3 ]]; then
+      return 1
+    fi
+    sleep 5
+  done
   docker logs -f "$name" >"$OUT/server_$backend.log" 2>&1 &
   LOGS_PID=$!
   for _ in $(seq 1 720); do
@@ -165,19 +194,34 @@ bench_backend() { # $1 = backend
 
 trap 'stop_server pinned; stop_server staged' EXIT
 
-run_server pinned
-bench_backend pinned
-stop_server pinned
+if [[ "$SKIP_PINNED" == 1 ]]; then
+  [[ -n "$BASELINE_DIR" && -d "$BASELINE_DIR" ]] || {
+    log "BENCH_SKIP_PINNED=1 needs BENCH_BASELINE_DIR with prior staged results" >&2
+    exit 1
+  }
+  run_server staged
+  bench_backend staged
+  stop_server staged
+else
+  run_server pinned
+  bench_backend pinned
+  stop_server pinned
 
-run_server staged
-bench_backend staged
-stop_server staged
+  run_server staged
+  bench_backend staged
+  stop_server staged
+fi
 
 # A/B summary: pull pass-2 warm decode rows + accept from each output.
-python3 - "$OUT" "$SECONDS_BENCH" <<'PYEOF'
-import glob, os, re, sys
+# BENCH_SKIP_PINNED runs diff the staged arm against BENCH_BASELINE_DIR's
+# staged results (baseline depth-0 staged run) instead of the pinned arm.
+python3 - "$OUT" "$SECONDS_BENCH" "${SKIP_PINNED}" "${BASELINE_DIR:-}" \
+  "${AHEAD}" <<'PYEOF'
+import re, sys
 
-out, seconds = sys.argv[1], float(sys.argv[2])
+out, seconds, skip_pinned, baseline_dir, ahead = (
+    sys.argv[1], float(sys.argv[2]), sys.argv[3] == "1", sys.argv[4], sys.argv[5])
+
 def parse(path):
     row = {}
     for line in open(path):
@@ -188,26 +232,54 @@ def parse(path):
                    "accept": m.group(3)}
     return row
 
-print(f"\n=== A/B summary (warm pass 2, {seconds:.0f}s padding) ===")
-print(f"{'point':>16} {'pinned agg':>12} {'staged agg':>12} {'delta':>8} "
-      f"{'pinned acc':>11} {'staged acc':>11}")
+def parse_prefill_ttft(path):
+    # cmd_prefill rows: "<prompt tokens> <TTFT s> <tok/s>"
+    ttfts = {}
+    for line in open(path):
+        m = re.match(r"\s*(\d+)\s+([\d.]+)\s+\d+\s*$", line)
+        if m:
+            ttfts[int(m.group(1))] = float(m.group(2))
+    return ttfts
+
+print(f"\n=== A/B summary (warm pass 2, {seconds:.0f}s padding, "
+      f"staged arm ahead_depth={ahead}) ===")
+print(f"{'point':>16} {'base agg':>12} {'staged agg':>12} {'delta':>8} "
+      f"{'base acc':>11} {'staged acc':>11}")
 fail = []
 for point in ("250000:C1", "131072:C2", "65536:C2"):
     ctx, c = point.split(":")
-    p = parse(f"{out}/bench_pinned_decode_{ctx}_pass2.txt")
+    if skip_pinned:
+        pa = parse(f"{baseline_dir}/bench_staged_decode_{ctx}_pass2.txt")
+    else:
+        pa = parse(f"{out}/bench_pinned_decode_{ctx}_pass2.txt")
     s = parse(f"{out}/bench_staged_decode_{ctx}_pass2.txt")
-    if not p or not s:
+    if not pa or not s:
         print(f"{point:>16}  MISSING RESULTS")
         fail.append(point)
         continue
-    delta = (s["agg"] - p["agg"]) / p["agg"] * 100
-    print(f"{point:>16} {p['agg']:>10.1f}  {s['agg']:>10.1f}  {delta:>+6.1f}%  "
-          f"{p['accept']:>11} {s['accept']:>11}")
+    delta = (s["agg"] - pa["agg"]) / pa["agg"] * 100
+    print(f"{point:>16} {pa['agg']:>10.1f}  {s['agg']:>10.1f}  {delta:>+6.1f}%  "
+          f"{pa['accept']:>11} {s['accept']:>11}")
     if delta < -3.0:
         fail.append(point)
-    if p["accept"] != "n/a" and s["accept"] != "n/a" \
-            and float(s["accept"]) < float(p["accept"]):
+    if pa["accept"] != "n/a" and s["accept"] != "n/a" \
+            and float(s["accept"]) < float(pa["accept"]):
         fail.append(f"{point}-accept")
+
+# Prefill TTFT scout (chunk-ahead's primary target is the prefill tail wait;
+# reported only when both sides ran the prefill scout).
+if not skip_pinned:
+    pf_a, pf_s = f"{out}/bench_pinned_prefill.txt", f"{out}/bench_staged_prefill.txt"
+else:
+    pf_a, pf_s = (f"{baseline_dir}/bench_staged_prefill.txt",
+                  f"{out}/bench_staged_prefill.txt")
+ttft_a, ttft_s = parse_prefill_ttft(pf_a), parse_prefill_ttft(pf_s)
+if ttft_a and ttft_s:
+    print("\nprefill scout TTFT (s):")
+    for n in sorted(set(ttft_a) & set(ttft_s)):
+        d = (ttft_s[n] - ttft_a[n]) / ttft_a[n] * 100
+        print(f"  {n:>8}: base {ttft_a[n]:>7.2f}  staged {ttft_s[n]:>7.2f}  "
+              f"{d:>+6.1f}%")
 
 staged_log = f"{out}/server_staged.log"
 # "retract" only counts scheduler retraction lines, not the server_args dump
@@ -220,6 +292,15 @@ if retracts:
     fail.append("retract")
 gate = "gate wired" in open(staged_log, errors="ignore").read()
 print(f"staged gate wired: {gate}")
+if ahead != "0":
+    wired = "PLE chunk-ahead prefetch wired" in open(
+        staged_log, errors="ignore").read()
+    print(f"staged chunk-ahead wired (depth={ahead}): {wired}")
+    if not wired:
+        fail.append("chunk-ahead-not-wired")
+    for line in open(staged_log, errors="ignore"):
+        if "ahead_hits=" in line:
+            print("  " + line.strip()[-160:])
 
 print("\nBENCH PASS" if not fail else f"\nBENCH FAIL: {fail}")
 PYEOF
