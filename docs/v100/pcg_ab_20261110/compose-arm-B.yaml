@@ -1,0 +1,336 @@
+# SGLang-V100 MTP 变体, 对外端口 8110 (4x V100-32G, TP4)。参数与
+# docker-compose-sglang-v100.yaml (11435) 完全一致, 仅端口/容器名不同。
+#
+# 与裸机脚本 scripts/serve_qwen38_flash_next_nvfp4_v100.sh 的差异(本机事实):
+#  1. 本机 4 卡全部 PXB/PIX 互联, 无 NVLink (nvidia-smi topo -m)。脚本硬编码
+#     NCCL_P2P_LEVEL=NVL, 在这里必须改成 PXB, 并按脚本注释给 PCIe-only 机器
+#     开 SGLANG_CUSTOM_AR_ALLOW_PCIE=1 (custom all-reduce 才肯在 P2P 走 PCIe
+#     时启用, 1stage 单次推送, 128KiB 上限)。
+#  2. 本机内存 125G / 无 swap, 低于 README 要求的 160G 地板。hierarchical
+#     cache (--hicache-size 8) 实测要 ~134G, 开了必被 OOM kill。基准测试
+#     (随机 prompt, 无前缀复用) 用不到 host/disk 缓存层, 整块去掉;
+#     radix cache 仍留在 GPU 池内。PLE n-gram 表 (51G) 走
+#     --ple-offload-embedding + --ple-offload-backend staged (NVMe 分层,
+#     docs/v100/PLE_NVME_TIER_DESIGN.md): 物化 12.8GiB/rank shard 文件到
+#     /data/sglang-ple-staged 后加载副本即释放 (Shmem 67.9G -> 0.78G,
+#     MemAvailable 39.5G -> 107.6G), gather 经 pinned staging buffer 逐行
+#     读 shard。与 pinned 后端逐位一致 (ORACLE_MTP=1 296-token oracle
+#     通过); 代价: prefill 每 4096-token chunk ~200ms NVMe 随机行 IO
+#     (64k TTFT -16% / 262k -10%, 2026-11-05 裁决接受), warm decode
+#     与 pinned 差距在几个点内 (A/B 记录见设计文档 §11.9.4)。
+#  3. MTP 开启 (EAGLE 3 steps / 4 draft tokens), 对齐 vLLM 侧
+#     docker-compose-v150-flashnext-nvfp4.yaml 的 MTP+3 定案, 也与 README
+#     性能表口径一致 (prefill ~3000 tok/s, 单流 decode ~100 tok/s)。
+#     不要 MTP 就删掉 command 末尾 --speculative-* 五行。
+#
+# 其余参数逐项来自 serve 脚本 (含各 OOM 闸门的取值理由, 见脚本注释):
+#   --mem-fraction-static 0.86 / --chunked-prefill-size 4096 /
+#   --max-prefill-tokens 4096 / --max-running-requests 3 /
+#   --max-mamba-cache-size 20 / --mamba-radix-cache-strategy extra_buffer /
+#   --mamba-full-memory-ratio 0.2 / --ple-offload-embedding
+#
+# 端口 8110: 与 docker-compose-v150-flashnext-nvfp4.yaml 的 vLLM 端口相同,
+# 且 4 张卡只能供一个推理服务用 -- 两者 (以及 11435 的 sglang 实例) 绝不能同时起。
+# restart "no": 基准用途, 崩了直接看日志, 不要 crash-loop 把现场冲掉。
+services:
+  sglang-v100:
+    #image: sglang-v100:latest
+    # mm-tokdrop-20261106 (2026-11-06): latest 重建, 含 zcode 占位 token 容错
+    # (SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP) 与此前 ple-nvme-20261105 全部内容。
+    # 回滚: 改回 sglang-v100-unified:ple-nvme-20261105。
+    image: sglang-v100-unified:chunk-ahead
+    # ple-nvme-20261105: PLE staged NVMe 分层后端 (docs/v100/PLE_NVME_TIER_DESIGN.md)
+    #image: sglang-v100-unified:ple-nvme-20261105
+    container_name: sglang-v100-qwen38-pcg-test
+    restart: "no"
+    # py-spy 采样 boot 期加载/捕获热点所需 (engine 进程在容器内, 需 ptrace 权限)
+    cap_add:
+      - SYS_PTRACE
+    network_mode: bridge
+    ipc: host
+    environment:
+      # ---- PCIe-only 拓扑 (无 NVLink) ----
+      NCCL_P2P_LEVEL: PXB
+      SGLANG_CUSTOM_AR_ALLOW_PCIE: "1"
+      SGLANG_CUSTOM_ALLREDUCE_ALGO: 1stage
+      # ---- V100 运行时 (同 serve 脚本) ----
+      SGLANG_SM70_FORCE_FP16: "1"
+      SGLANG_SM70_DENSE_GEMV: "1"
+      SGLANG_SM70_QWEN_FUSIONS: "1"
+      SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS: "8192"
+      # ---- 分组稀疏 prefill (L2-b, 2026-11-08 启用) ----
+      # QSA chunked prefill 从 packed gather + Triton FMA 核 (35.7ms/发) 切到
+      # 分组 TileLang WMMA 核 (并集索引直读 fp16 池, ~5.9ms/发); 每层每 chunk
+      # 一次 sort-based GPU planner (~10.7ms, 单次 readback)。4×V100 实测:
+      # 冷 65,601-token prefill 29.0 → 25.2s 中位 (+13~18%), decode/8k/
+      # 前缀缓存三臂不变。breakable-graph 路径自动回退 Triton (本形态 prefill
+      # 图本就 disabled)。注意: tilelang 缓存已在 sglang-v100-jit 卷, 但
+      # 换 kernel 源码后首条长 prefill 仍会一次性付 ~10 个 U_pad bucket 的
+      # JIT 编译 (~1-4 分钟)。回滚: 改 "0" 即回 Triton packed 路径。
+      # (2026-11-08 曾因用户反馈质量/速度问题临时回滚复测, 后确认问题源为
+      #  WorkBuddy 侧上下文记忆污染, 与引擎无关, 复测正常后恢复启用。)
+      # (2026-11-08 第二次质量异常报告: group fill ON 时质量异常, OFF 复测
+      #  正常——本次开关对照干净, 与上次记忆污染不同。引擎侧 A/B ≤2k 逐位
+      #  一致、≥4k 零翻转, 理论上只有 fp16 归约序 (3e-5~5e-4) 蝴蝶分叉;
+      #  待受控 A/B (同 prompt 双跑分叉率/thinking 长度) 定案前保持 OFF。)
+      # (2026-11-09 第三次对照定案: WorkBuddy 鹈鹕任务 ON 3/3 失败(21-24 min
+      #  重写螺旋 + 3 次 Write 缺 file_path) vs 同 prompt OFF 1/1 干净完成
+      #  (2.4 min/1 次 Write/0 报错)。逐轮实测有效速率两臂同带(42-64 vs
+      #  52-67 tok/s)——耗时倍增 = 生成量倍增, 静态 A/B 矩阵(§8.1)测不到的
+      #  尾部风险: fp16 归约序扰动使近并列 argmax 翻转概率升高, 翻转落在工具
+      #  调用参数 JSON 时代价灾难性(参数缺失→自疑螺旋)。生产保持 OFF;
+      #  grouped 降级为离线/非工具负载开关(纯续写/批量探针可吃 +13~18%)。
+      #  找回收益的正确路径: 先做确定性治理(内核选择固定/batch-invariant)。
+      #  详见 docs/v100/PREFILL_LEVERS_PLAN.md §8.2; ON 臂 shim 日志归档
+      #  /data/develop/l2b_work/shim_debug_groupON_20261107-09.log.gz。)
+      SGLANG_SM70_QSA_GROUPED_PREFILL: "0"
+      SGLANG_MAMBA_CONV_DTYPE: float16
+      SGLANG_MAMBA_SSM_DTYPE: float16
+      # ---- 自适应 mixed-prefill 预算 (L3-1, 2026-11-08) ----
+      # >0 启用 scheduler 预算控制器, 与 command 里的 --enable-mixed-chunk
+      # 成对出现 (控制器仅在 mixed chunk + overlap 都开时生效)。750ms 是本机
+      # 实测甜点档: V100 混批步固定成本地板 350-650ms (12 层 QSA 稀疏 prefill
+      # × ~29.5ms), 低于地板的目标会被控制器拒绝 (WARNING 后放开限幅)。
+      # ladder 实测 (2 常驻 decode + 32k 入场, 4×V100): 常驻最长输出间隙
+      # 1.988s → 1.080s (−46%), 代价入场 TTFT 19.5 → 22.5s (+15%)。
+      # 注意 (2026-11-08 L2-b 启用后): 地板标定基于 Triton 稀疏核 (×29.5ms);
+      # grouped 核后每 chunk 稀疏开销 ~16.6ms, 混批步固定成本同步下移,
+      # 750ms 甜点档建议按 §2 ladder 重标 (回滚/重标前先按原值观察)。
+      # 回滚 (2026-11-08 15:23 boot 实证, 生产已回 0): 混批步固定成本实测
+      # ~660ms + 1.3ms/tok (预算采样 512→1346ms / 256→670ms), 750ms 目标下
+      # 常驻每个混合批只进 1 token → 另一流 77k prefill 期间常驻 decode 崩到
+      # ~2.8 tok/s (日志: 28→10.7→5.3→2.8), 入场 prefill 在 mixed 模式仅
+      # ~320-640 tok/s (纯 chunked 2100), 窗口反而拉长 4-6 倍。长 prompt +
+      # 低并发是净负收益; 待混批步固定成本打下来后仅对短 prompt 持续进场
+      # 场景重评 (docs/v100/PREFILL_LEVERS_PLAN.md §2/§7)。
+      SGLANG_MIXED_PREFILL_STEP_LATENCY_MS: "0"
+      SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION: "0"
+      SGLANG_NUMA_BIND_V2: "0"
+      # ---- KV host tier + PAIR 去复制 (docs/v100/KV_HOST_TIER_DESIGN.md) ----
+      # 2026-11-05 生产启用: 流式 KV (Phase 3 直映射 + 逻辑扩展) + PAIR_PARITY
+      # 去复制布局。2026-11-04 验收: PAIR 臂 gen 探针 6/6 hit、lp 逐 token 偏差
+      # 落 FULL 自噪声包络、phase3 计数器全零、代码与 dev-ltarcher HEAD 逐字节
+      # 一致 (镜像 streamkv-20261104)。原 TESTBENCH=1 准入闸门已于 2026-11-10
+      # 随代码移除 (pair-accept 已验收 + 生产在役, 不设该 env 也可 boot);
+      # 读写路径 (owner-bit dual-pointer IPC 零拷贝) 均已接线并验收。
+      SGLANG_V100_KV_HOST_TIER: "1"
+      # PAIR_PARITY: PHYS 是 PAIR 总量, 每 rank 分一半 (device 池 = PHYS/2)。
+      # PAIR 硬约束 logical_pages <= pair_pages => PHYS 必须 >= 逻辑预算
+      # 786,432 (factor 1.0, 3×262144), 页数 6144 为偶数满足 2×block 整除
+      # (block=1)。YaRN 实验组回退记录见 --context-length 注释。
+      SGLANG_V100_KV_HEAD_LAYOUT: "1"
+      SGLANG_V100_KV_TIER_PHYS_TOKENS: "786432"
+      # 不设 SGLANG_V100_KV_TIER_DISABLE_EXTEND (默认开扩展): --max-total-tokens
+      # 786432 超出 GPU profile (~426K), 超出部分由 host mirror 承担。
+      # Host 内存账 (2026-11-05 实测标定): mirror 12.6KB/tok/rank —— L=1,048,576
+      # 时 12GiB/rank (分配后 MemAvailable 剩 39G); 786,432 时 ~36G 总, 充裕。
+      # PLE staged 服务期为 mmap 不吃 pinned。
+      # GPU 账 (2026-11-05 四次 boot 实测标定): device KV 11.44KB/tok/rank +
+      # draft ~1.0KB/tok/rank; 图捕获后余量 3.23GB (本组 boot 实证健康);
+      # warmup 惰性 triton 加载真实需求 ~2.1-2.4GB —— 图捕获后 <3.0GB 的配置
+      # 会死在 warmup (YaRN 1.35/1.2 两组死亡数据, 见 --context-length 注释)。
+      # 图像预处理(多模态请求)默认跑在 launcher 进程的 cuda:0 上,而静态池已按
+      # 0.88 占满同卡:48-214MiB 的 resize/stack 临时张量在 16-164MiB 余量里必炸
+      # (2026-10-18 OOM,图像请求全 500)。强制回 CPU —— 本来最后也要 .to("cpu")。
+      SGLANG_FORCE_CPU_IMAGE_PREPROCESSING: "1"
+      # zcode agent 兼容 (2026-11-06): 文本里的图片占位 token 多于实际附带图片时,
+      # 丢弃多余占位符继续处理而非 500 ("More 'IMAGE' tokens found than
+      # corresponding data provided")。默认关 (上游严格报错), 仅此引擎开启。
+      SGLANG_ENABLE_MM_UNMATCHED_TOKEN_DROP: "1"
+      SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      # 模型在本地目录, 不走 hf-mirror 探测
+      HF_HUB_OFFLINE: "1"
+      # 两个 SM70 CUDA JIT 扩展默认编译到容器 /tmp (临时层, compose 重建即清空),
+      # 每次重建容器都要重编 longctx_decode (~110s) + nvfp4_moe (~170s)。
+      # 指到 sglang-v100-jit 卷 (与 triton/tilelang 缓存同卷) 后只在源码变化时重编。
+      SGLANG_V100_DECODE_CUDA_BUILD_DIR: /root/sglang-v100-jit/ext/sm70_longctx_decode
+      SGLANG_V100_NVFP4_MOE_BUILD_DIR: /root/sglang-v100-jit/ext/sm70_nvfp4_moe
+      # 第四套 JIT 缓存 (sglang/kernels/jit 框架: small_gemm/dense_gemv/hc_*/qwen_gdn/
+      # qsa/speculative_tree 等按形状派生的 sm70 内核) 默认写 ~/.cache/sglang/jit,
+      # 在容器可写层, recreate 即清空 -> 每次 boot 的 CUDA graph 捕获窗重付 ~280s
+      # 冷编译 (4 rank 经 flock 串行, boot#4 py-spy 实证)。指到卷后仅首 boot 编译。
+      SGLANG_JIT_CACHE_DIR: /root/sglang-v100-jit/jit
+      # PLE staged NVMe 分层 (docs/v100/PLE_NVME_TIER_DESIGN.md): shard 文件
+      # 放 /data (宿主目录直挂, oracle/bench 已物化好, REUSE=1 校验 header
+      # 一致即复用, 免每次 boot 重写 51G); 指到 $HOME 的话容器可写层会存满。
+      SGLANG_QWEN4_PLE_STAGED_DIR: /data/sglang-ple-staged
+      SGLANG_QWEN4_PLE_STAGED_REUSE: "1"
+      # chunk-ahead 预取 (docs/v100/PLE_NVME_TIER_DESIGN.md §11.9.5): 算 chunk
+      # i 时投机预取 chunk i+1..i+depth 的 PLE 行, 消除 fill_pending 尾部等待
+      # (~198ms/chunk); 消费侧逐位比对, 失配自动回退原路径。真机 A/B
+      # (depth=0/1/2, 4×V100 2026-11-10): depth=1 是 prefill 甜点(64k TTFT
+      # -31.8% / 262k -15.2%, decode 三档全在 -3% gate 内); depth=2 prefill
+      # 略回退 (64k -25.5%)、decode 整体抬升, 性价比低于 depth=1。
+      # depth=1 需 2 个额外 staging 缓冲 (~671MB/个 host RAM)。
+      SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "1"
+      # CUDA 确定性治理 (docs/v100/PLE_NVME_TIER_DESIGN.md §11.10 风险 #7):
+      # staged PLE gather 固有数值差 + 非 det CUDA 放大 → depth=0 staged 偶发
+      # prefill 首 token argmax 翻到 248044 ("<|im_start|>") → MTP 全拒绝 →
+      # 自洽循环退化。强制 deterministic 后 oracle 实测 staged/pinned 32/32
+      # token_ids bit-exact、MTP verify 全 accept。代价是 cudnn autotune 失效,
+      # 生产可接受 (reproducibility > marginal throughput)。
+      SGLANG_FORCE_DETERMINISTIC: "1"
+    volumes:
+      - /data/models/nvidiaQwen3.8-Flash-Next-NVFP4:/data/models/nvidiaQwen3.8-Flash-Next-NVFP4:ro
+      # PLE staged shard 文件 (12.8GiB/rank ×4, materialize 一次写后只读)
+      - /data/sglang-ple-staged:/data/sglang-ple-staged
+      # FlashInfer/tilelang/triton JIT 缓存持久化 (首次 serve 编译一次)
+      - sglang-v100-jit:/root/sglang-v100-jit
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ports:
+      - "8110:8110"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8110/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["/opt/venv/bin/python", "-m", "sglang.launch_server"]
+    command:
+      - --trust-remote-code
+      - --model-path
+      - /data/models/nvidiaQwen3.8-Flash-Next-NVFP4
+      - --served-model-name
+      - qwen38-flash-next-nvfp4
+      - --dtype
+      - float16
+      - --quantization
+      - modelopt_fp4
+      - --reasoning-parser
+      - auto
+      - --tool-call-parser
+      - auto
+      - --attention-backend
+      - tilelang_fa_v100
+      - --linear-attn-prefill-backend
+      - tilelang
+      - --linear-attn-decode-backend
+      - triton
+      - --kv-cache-dtype
+      - auto
+      - --tensor-parallel-size
+      - "4"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8110"
+      # 0.90 (2026-10-10): 0.86 时 KV 池 327,360 token,2 并发长上下文不够(各仅 163K)。
+      # 每 +0.01 ≈ +28K token(12.3KB/token/rank);0.92 → ~495K(2 并发各 ~247K),
+      # 运行时保留 ~2.8GB(prefill 激活+图+NCCL)。0.94 算术够 2×262K 满额但保留只剩
+      # ~2.1GB,mid-prefill OOM 风险,未实测不上。首个 recreate 后需 2×~240K 并发实测。
+      # (2026-10-31 tier 验证窗口临时降到 0.86,已恢复 0.90。)
+      # (2026-10-31 Phase 2 验证窗口再次临时 0.86 + tier PAGEIN;位一致性 +
+      #  261k 三臂通过后已恢复 0.90。tier env 四行保持注释。) 
+      - --mem-fraction-static
+      - "0.90"
+      # YaRN 实验结论 (2026-11-05, 四次 boot 实测): PAIR + MTP + 3 并发形态下
+      # YaRN 无内存空间, 已回退 factor 1.0 (原生 262144)。完整参数组与死亡数据
+      # 存档 docs/v100/KV_HOST_TIER_DESIGN.md §6.3:
+      # - factor 1.35 (353894): 图捕获后 1.06GB => warmup OOM
+      # - factor 1.2  (314572): 图捕获后 2.08GB => warmup triton 惰性加载
+      #   (_fused_gate_sigmoid_mul_add / _fused_sigmoid_mul / linear-attn
+      #   _fwd_kernel) 压到 0.09GB, silu 80MB OOM
+      # - warmup 真实需求 ~2.1-2.4GB (图捕获后), 300K (省 0.15GB) 不够,
+      #   需图后 >=3.0GB => L<=~800K => 单流 <=266K ≈ factor 1.0
+      # - 若未来需 >256K: 去 MTP (省 ~1.0GB) 或改 FULL 布局 (省 ~1.6GB,
+      #   长文 decode 撞 host spill 悬崖), 见设计文档决策表。
+      - --context-length
+      - "262144"
+      # 3 (2026-11-05): 方案 A = 3 并发 × 256K 满配。4×256K 两次实测不可行:
+      # PAIR 硬约束 device 池 >= logical/2 (524,288 tok = 6.0GB/rank), 激活余量
+      # 仅剩 20MiB, warmup 20MiB 分配即 OOM。3 并发池 393,216 tok (4.5GB/rank)。
+      - --max-running-requests
+      - "3"
+      # 786,432 (2026-11-05): 3×262144 (factor 1.0 回退), 页对齐 6144 页 (偶数)。
+      # YaRN 实验组 (943872/1068032) 均因 warmup 需求 ~2.4GB 无法满足而回退,
+      # 详见 --context-length 注释与 docs/v100/KV_HOST_TIER_DESIGN.md §6.3。
+      # 超出 GPU profile (~426K) 的部分由 KV tier host mirror 承担
+      # (SGLANG_V100_KV_TIER_DISABLE_EXTEND 不设); PAIR 约束要求 PHYS >= 此值
+      # (env 已配 786432)。本组 2026-11-05 boot 验证健康 (图后 3.23GB)。
+      - --max-total-tokens
+      - "786432"
+      - --max-mamba-cache-size
+      - "20"
+      # 1024 实测更差 (2026-10-10 boot#4): prefill 中位 2049 tok/s (4096 时 ~3000),
+      # decode 无增益。4096 时 chunk 流期间 running decode 停摆 (2026-11-08):
+      # 曾由 L3-1 预算控制器限幅 (--enable-mixed-chunk), 已回滚——见下方
+      # --enable-mixed-chunk 注; 现为纯 chunked prefill, 停摆窗口 ~2s×chunk 数。
+      - --chunked-prefill-size
+      - "4096"
+      - --max-prefill-tokens
+      - "4096"
+      # --enable-mixed-chunk 已摘除 (2026-11-08, 原 L3-1 与预算 env 成对启用):
+      # 混批步固定成本 ~660ms 使长 prompt 并发下常驻 decode 崩到 ~3 tok/s
+      # (证据见上方 env 块回滚注), 生产回纯 chunked prefill (prefill-first,
+      # 常驻流在另一流 prefill 窗口停摆, 4096 chunk ~2s×19 ≈ 37s)。重启恢复:
+      # 加回本行 + env SGLANG_MIXED_PREFILL_STEP_LATENCY_MS 改回 "750"。
+      # SXM2 sync 合并回归 #8(2026-10-09):合并把 prefill CUDA graph 默认开上,
+      # 其新 backend 用 >12.4 的 driver API;本机驱动 550.54.15(CUDA 12.4)
+      # 捕获即撞 CUDA error 35(insufficient driver)。GLM 生产 compose 本来就
+      # prefill disabled 未暴露。显式关掉(与 GLM 生产形态一致);Qwen prefill
+      # 图此前从未启用过,关闭无性能回归。
+      - --sleep-on-idle
+      # 4 (2026-10-12): 原 3 使 bs=4 decode 每步走 eager(spec verify 16-token
+      # 前向无图),实测 lockstep 4 并发仅 4.2 tok/s/流;bs≤3 图路径 139-157
+      # tok/s 聚合正常。加 bs=4 图预计多占 ~0.2-0.5GB 捕获内存(挤池,原捕获后
+      # avail 2.99GB)。若捕获 OOM 或池缩水过狠,回退本文件 .bak-graphbs3-20261012。
+      # ── 4 并发启用说明(2026-10-12 实测,PR6 镜像 fp16 KV,数据已核)────────
+      # 启用:下方 --max-running-requests 改 "4" + --cuda-graph-max-bs-decode 改 "4"
+      # (bs 列表已含 4),重启即 4way。实测暖区聚合 8k/16k/32k/64k/96k =
+      # 130/168/162/195/172 tok/s,3way×131K=87.6(三请求同飞,准入余量生效);
+      # 代价:池 473,792 → 465,472(-1.75%),2 并发口径池变小但 usage 峰值仅 0.54。
+      # 冷区 4way 仍 prefill 串行饥饿(4×96K wall 158s,机制与配置无关);
+      # 回归证据:pre-PR6(regress-pre-pr6)同阶梯冷曲线逐档重合,PR6 零回归。
+      # 3 (2026-11-05): 随 3 并发方案 A 收到 3 (3 并发 decode bs≤3, bs=4 图纯占
+      # 捕获内存)。bs 列表同步去 4。4 并发 lockstep 数据 (bs=4 eager 4.2 tok/s/
+      # 流 vs 图路径 139-157 聚合) 留档见下方 2026-10-12 注释。
+      - --cuda-graph-max-bs-decode
+      - "3"
+      - --cuda-graph-bs-decode
+      - "1"
+      - "2"
+      - "3"
+      - --mamba-radix-cache-strategy
+      - extra_buffer
+      - --mamba-full-memory-ratio
+      - "0.2"
+      - --enable-cache-report
+      - --enable-metrics
+      # 51G PLE 表必须 offload 到 host (否则 GPU 侧 create_weights OOM);
+      # staged 后端把加载副本换成 NVMe shard 文件, pinned 常驻从 ~48G 降到
+      # ~1G staging (内存收益是本次切换的主目标, 见文件头注释 #2)。
+      - --ple-offload-embedding
+      # staged = L3 NVMe shard + L0 pinned staging; decode 走 compute-ahead
+      # prep gate (CUDA 图兼容), prefill 走 stage_async/fill_pending 双缓冲。
+      # 回退 pinned: 删掉本行即可 (env 与 volume 留着无害)。
+      - --ple-offload-backend
+      - staged
+      # ---- MTP (EAGLE 3 steps / topk 1 / 4 draft tokens) ----
+      # 2026-09-28: 草稿层 FP8-block experts 在 sm70 上走
+      # SM70FP8BlockMoEDequantMethod (加载时反量化成 FP16, TurboMind FP16
+      # MoE runner), 解决 TP4 下 640/4=160 列无法按 128-block 切 scale 的问题。
+      - --speculative-algorithm
+      - EAGLE
+      - --speculative-draft-model-path
+      - /data/models/nvidiaQwen3.8-Flash-Next-NVFP4
+      - --speculative-num-steps
+      - "3"
+      - --speculative-eagle-topk
+      - "1"
+      - --speculative-num-draft-tokens
+      - "4"
+
+volumes:
+  # 固定名: 不带 compose 项目前缀, 便于用 docker run 单独跑 smoke 时复用同一份
+  sglang-v100-jit:
+    name: sglang-v100-jit
