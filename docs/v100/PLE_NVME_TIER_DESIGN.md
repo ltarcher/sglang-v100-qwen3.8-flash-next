@@ -801,8 +801,17 @@ warm pass 2、30s padding,decode gate ≥-3%、retract=0、chunk-ahead wired。
 TTFT 显著下降(decode 零负收益),数据面经 oracle 逐位(self-check)与
 逐字节(spot-check)双重证实正确。可上线。
 
-遗留长 prompt per-boot 非确定(§11.9.5.1,33k prompt 存在退化循环
-吸引子)独立调查,不在本次上线阻塞条件内。
+长 prompt per-boot 非确定性退化已后续溯源并根治(§11.10 风险 #7):
+staged PLE gather 固有数值差 + 非 det CUDA 放大 → depth=0 staged 偶发
+prefill 首 token argmax 翻到 248044(`<|im_start|>`) → MTP 全拒绝 →
+自洽循环。`SGLANG_FORCE_DETERMINISTIC=1` 在 launch_server.py 入口强制
+deterministic CUDA,oracle 实测 staged/pinned 32/32 bit-exact、MTP verify
+全 accept。
+
+**生产落地(8110 compose,2026-11-10)**:`docker-compose-sglang-v100-mtp-8110.yaml`
+已登记 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "1"`(depth=1,2 个额外
+staging 缓冲 ≈ 671MB/个 host RAM)+ `SGLANG_FORCE_DETERMINISTIC: "1"`,
+镜像已按 feature-chunk-ahead 重建,待重启容器生效。
 
 **已补单测**(2 例,36/36 通过,ruff clean,§11.9.5.1 同脚注):尾 chunk
 (partial 或恰满)因调度器不再记 stash 而永不 serve(即使队列投机 fill

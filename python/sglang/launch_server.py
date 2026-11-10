@@ -5,6 +5,11 @@ import os
 import sys
 import warnings
 
+# Import environ early — this module is stdlib-only (no torch), so loading
+# it before any torch import is safe.  We need envs.SGLANG_FORCE_DETERMINISTIC
+# below to decide whether to force CUDA-level deterministic behaviour.
+from sglang.srt.environ import envs  # noqa: E402
+
 # Optional deterministic CUDA config.  Default off (perf first).
 # On 2026-11-10 we traced a long_prompt (~33k token) staged-arm degradation
 # where staged/pinned prefill first-token argmax flipped sporadically across
@@ -20,9 +25,8 @@ import warnings
 # token_ids bit-exact match between staged and pinned arms, MTP verify
 # first_mismatch_step=4 every round — perfect accept).
 # Perf cost on V100 is small (cudnn autotune disabled) but not zero, so this
-# is opt-in via env var.  Production can set SGLANG_FORCE_DETERMINISTIC=1
-# if reproducibility outweighs marginal throughput.
-if os.environ.get("SGLANG_FORCE_DETERMINISTIC") == "1":
+# is opt-in via env var (see envs.SGLANG_FORCE_DETERMINISTIC in environ.py).
+if envs.SGLANG_FORCE_DETERMINISTIC.get():
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     import torch
     torch.use_deterministic_algorithms(True, warn_only=True)

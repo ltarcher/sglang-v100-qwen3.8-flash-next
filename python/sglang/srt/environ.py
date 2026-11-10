@@ -1510,6 +1510,16 @@ class Envs:
     # ===================================================================
     # Deterministic inference and all-reduce
     # ===================================================================
+    # Force CUDA-level deterministic behaviour before any torch import:
+    # cudnn.deterministic=True, cudnn.benchmark=False, fixed CUBLAS workspace,
+    # tf32 disabled, torch.use_deterministic_algorithms(True).  This is a
+    # coarse-grained "reproducibility override" used when fp16 reduction-order
+    # non-determinism amplifies small gather-path numeric deltas enough to flip
+    # prefill first-token argmax (observed on V100 staged PLE).  Default off:
+    # cudnn autotune and tf32 are performance wins; opt in when reproducibility
+    # > marginal throughput.  Enforced at launch_server.py top (before any
+    # torch import), not consumed from code.
+    SGLANG_FORCE_DETERMINISTIC = EnvBool(False)
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
