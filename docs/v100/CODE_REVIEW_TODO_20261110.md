@@ -268,10 +268,21 @@
     TDD 红灯先行）4 passed；GPU 侧 `test_kv_host_tier_pair_gpu_kernels.py` 需真机
     （本机无 V100），e5m2+PAIR 的端到端验证留待目标机。ruff 干净（`Path` 存量
     未用 import 不动）。
-- [ ] m23. grouped planner 第二个隐藏 D2H 同步
-  - `tilelang_fa_v100/_kernels_grouped_sparse_prefill.py:257`。`int(group_slot[-1])`
+- [x] **m23. grouped planner 第二个隐藏 D2H 同步**（2026-11-10 结案）
+  - `tilelang_fa_v100/_kernels_grouped_sparse_prefill.py:271`。`int(group_slot[-1])`
     隐式 .item()，与 docstring "one scalar readback" 相悖。
-  - 修复：host 侧按形状算上界。
+  - **结案结论（host 侧形状上界，bound 只高估）**：key 宽度判决改为纯 host 推导
+    `max_group_slot = ((R-1)//group_rows) * bs + (bs-1)`——每个 slot 都是
+    g*bs+batch 且 g ≤ (R-1)//group_rows、batch ≤ bs-1，上界只高估，最坏情形是
+    提前一个 regime 用 int64 key（多 4 字节/entry），不会腐蚀 plan。隐式
+    `int(group_slot[-1])` 消除，planner 唯一 readback 恢复为 docstring 声明的
+    显式 `int(u_local.max().item())`。新增 CPU 单测
+    `test_grouped_union_plan_cpu.py`（`torch.Tensor.__int__` 桩防回归 + int32/
+    int64 双 regime 各与纯 python 参考逐元素比对 uidx/mask，mask 按重复出现
+    计数对齐 planner 的 index_add_ 累加语义；register_cpu_ci）：临时回退到旧
+    readback 时防回归桩命中（红灯实证），恢复后 3 passed（绿灯）；ruff 干净。
+    GPU 侧 `test_grouped_sparse_prefill_sm70.py` 需真机（本机无 V100），留待
+    目标机跑 smoke + grouped A/B 数字确认。
 - [ ] m24. A/B 脚本对任意 --base 无守卫调 /flush_cache
   - `scripts/ab_qsa_grouped_quality_v100.py:267-315`。误指 11435 生产端口会清 radix 缓存。
   - 修复：拒绝生产端口或要求 `--assume-idle`。

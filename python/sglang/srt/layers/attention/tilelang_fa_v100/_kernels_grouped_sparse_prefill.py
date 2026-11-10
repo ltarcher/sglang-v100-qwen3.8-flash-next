@@ -271,8 +271,14 @@ def build_grouped_union_plan(
     group_slot = g * bs + batch
     # int32 keys fit while the largest group slot stays under 2**11 (the
     # shifted slot then tops out just below INT32_MAX); otherwise int64.
+    # The bound is computed host-side from shapes only (review m23): every
+    # slot is g*bs + batch with g <= (R-1)//group_rows and batch <= bs-1, so
+    # reading the actual last entry would be a second hidden D2H sync. The
+    # bound can only overestimate, which just means falling back to int64
+    # keys one regime early.
+    max_group_slot = ((R - 1) // group_rows) * bs + (bs - 1)
     int32_keys = (
-        int(group_slot[-1]) + 1 < (1 << (31 - LOGICAL_BITS))
+        max_group_slot + 1 < (1 << (31 - LOGICAL_BITS))
         and max_context_len < _LOGICAL_SENTINEL
     )
 
