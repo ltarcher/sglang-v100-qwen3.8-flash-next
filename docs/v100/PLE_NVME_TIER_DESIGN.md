@@ -639,9 +639,12 @@ PLE 行,把 `fill_pending` 尾部等待(~198ms/chunk)移进更早 chunk 的计�
 - **流水线深度 = 缓冲数 − 1**:`PleAheadStaging`(`qwen4_exp_ple_staged.py`)
   持 depth+1 个 `PleRowStaging`(各带自己的 IO 线程池)+ FIFO 队列(条目含
   pool_idx 与 ids)。forward i 消费队首(chunk i 的行,即 forward i-1 提交
-  的投机 fill),`wait_and_match` 等待 pending 后与 forward 自算 ids
-  `np.array_equal` 逐位比对:**命中 → 该缓冲成为本轮 serve,主 staging 完全
-  跳过 fill;未命中/队首 pool 不符 → 丢弃该条目,走原 stage_async 路径**。
+  的投机 fill),`wait_and_match` 先在 host 侧与 forward 自算 ids
+  `np.array_equal` 逐位比对(pending fill 的 ids 在 `stage_async` 时即已
+  固定,比较零等待;review m13),**仅命中才等待 pending 完成**:**命中 →
+  该缓冲成为本轮 serve,主 staging 完全跳过 fill;未命中/队首 pool 不符 →
+  丢弃该条目、不付任何 IO 等待,走原 stage_async 路径**(refill 路径
+  `stage`/`stage_async` 复用缓冲前自会等待未完 fill)。
   然后 submit chunk i+1..i+d(ids 逐位去重:滑窗每轮重推全窗口,已排队项
   跳过;队列 ≤ d)。稳态:chunk j 在 forward j−d 提交、forward j 消费,
   遮盖 d 个 forward;d=2(3 缓冲,~2GB host)即全遮生产 64k chunk 的

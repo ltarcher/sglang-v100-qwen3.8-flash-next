@@ -156,10 +156,18 @@
     模型 init 期读取安全。回归 `test_qwen4_exp_ple_staged.py::TestEnsureMaxRowsForPrefill`
     （默认兼容 no-op / 超容自动上调 / 显式过小拒绝 / 显式相容放行 / -1+None+0 拒绝，
     TDD 红灯先行）；staged 30 passed、prep 41 passed；ruff 干净。
-- [ ] m13. chunk-ahead miss 路径先等满整个 fill 再比较 ids
+- [x] **m13. chunk-ahead miss 路径先等满整个 fill 再比较 ids**（2026-11-10 结案）
   - `models/qwen4_exp_ple_staged.py:520-534`。ids_np 本已是 host 侧 numpy，可先比较再等；
     miss 时白付整段 NVMe 随机行 IO 于关键路径。默认 CHUNK_AHEAD=0 生产不受影响。
-  - 修复：先比 ids 再决定等待。
+  - **结案结论（先比后等）**：`wait_and_match` 改为先取 pending fill 在
+    `stage_async` 时即固定的 host ids（无 pending 则取已 staged ids）与 forward
+    自算 ids 逐位比对，仅命中才 `_wait_pending` 阻塞；miss 立即返回 False、零
+    IO 等待，fill 继续后台运行（refill 路径 `stage`/`stage_async` 复用缓冲前
+    自会等待未完 fill，无竞态）。`PleAheadStaging.consume` 调用点不变，miss 丢
+    条目语义不变。PLE_NVME_TIER_DESIGN.md §11.9.5 同步。回归
+    `test_qwen4_exp_ple_prep.py::TestPleRowWaitAndMatchCompareBeforeWait`（miss
+    不调 `_wait_pending` 且 fill 仍在后台 + hit 等待且缓冲内容正确，TDD 红灯
+    先行）；prep+staged 两套件 73 passed；ruff 干净。
 - [ ] m14. pinned 分配失败静默回退 pageable，GPU 上 kernel 解引用 UB
   - `models/qwen4_exp_ple_staged.py:251-259`。
   - 修复：CUDA 可用时 fail-loud，不降级。

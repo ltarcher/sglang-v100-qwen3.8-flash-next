@@ -400,6 +400,43 @@ class TestPleRowWaitAndMatch:
         assert staging.wait_and_match(np.arange(4, dtype=np.int64)) is False
 
 
+class TestPleRowWaitAndMatchCompareBeforeWait:
+    """m13 (docs/v100/CODE_REVIEW_TODO_20261110.md): the staged/pending ids
+    are host-side numpy, so a chunk-ahead MISS must be decided without paying
+    the outstanding fill's IO wait on the critical path; only a match blocks."""
+
+    def _make_async_fill(self, tmp_path, tag):
+        table_u8, staged = _make_staged_table(tmp_path, tag)
+        staging = PleRowStaging(staged, max_rows=64, io_threads=2)
+        ids_np = np.arange(64, dtype=np.int64)
+        staging.stage_async(torch.from_numpy(ids_np), 0, 1 << 62)
+        return table_u8, staging, ids_np
+
+    def test_miss_returns_without_waiting(self, tmp_path, monkeypatch):
+        _, staging, ids_np = self._make_async_fill(tmp_path, "wm4")
+        called = []
+        orig = staging._wait_pending
+
+        def spying():
+            called.append(True)
+            return orig()
+
+        monkeypatch.setattr(staging, "_wait_pending", spying)
+
+        assert staging.wait_and_match(ids_np + 100) is False
+        assert called == [], "a host-side id mismatch must not wait on the fill"
+        assert staging._pending is not None, "the fill kept running in background"
+        staging._wait_pending()  # drain before tmp_path teardown
+
+    def test_hit_still_waits_for_fill(self, tmp_path):
+        table_u8, staging, ids_np = self._make_async_fill(tmp_path, "wm5")
+
+        assert staging.wait_and_match(ids_np) is True
+        assert staging._pending is None
+        got = staging.buffer[:64]
+        assert torch.equal(got, table_u8[ids_np.tolist()])
+
+
 class TestPleAheadStaging:
     def _make(self, tmp_path, tag: str, depth: int, max_rows: int = 64):
         table_u8, staged = _make_staged_table(tmp_path, tag)

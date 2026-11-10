@@ -396,19 +396,28 @@ class PleRowStaging:
 
     def wait_and_match(self, ids_np: np.ndarray) -> bool:
         """Chunk-ahead consume check (docs/v100/PLE_NVME_TIER_DESIGN.md
-        §11.9.5): block until this buffer's speculative fill completed, then
-        compare its id set against ``ids_np`` — the ids the consuming forward
-        computed itself from the real batch. The staged fill was derived
-        speculatively from the previous forward's merged context, so a
-        bit-exact match is the only trust basis; any mismatch sends the
-        caller back to the synchronous path."""
-        self._wait_pending()
-        staged = self._staged_ids
-        return (
+        §11.9.5): compare this buffer's id set against ``ids_np`` — the ids
+        the consuming forward computed itself from the real batch — and only
+        block when they match, so the fill can be trusted. The staged fill was
+        derived speculatively from the previous forward's merged context, so a
+        bit-exact match is the only trust basis; any mismatch sends the caller
+        back to the synchronous path.
+
+        The ids live host-side either way (a pending fill's ids are fixed at
+        ``stage_async`` time), so the compare runs before any wait (review
+        m13): a miss must not pay the outstanding fill's IO latency on the
+        critical path — the fill keeps running in the background and every
+        refill path (``stage``/``stage_async``) waits for it before reuse."""
+        pending = self._pending
+        staged = pending[0] if pending is not None else self._staged_ids
+        if not (
             staged is not None
             and staged.shape[0] == ids_np.shape[0]
             and np.array_equal(staged, ids_np)
-        )
+        ):
+            return False
+        self._wait_pending()
+        return True
 
     def stage(self, ids: torch.Tensor, vocab_start: int, vocab_end: int) -> int:
         """Fill staging for ``ids`` (1D global ids). Returns the slot count.
