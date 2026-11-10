@@ -743,6 +743,113 @@ class TestPleChunkAheadPrefetch:
         assert host._staged_serve is None
         _PLE_CHUNK_STASH.clear()
 
+    def test_final_partial_chunk_never_serves(self, tmp_path, monkeypatch):
+        # The scheduler records no stash once a request is fully prefilled
+        # (record_ple_chunk_ahead skips end >= len(fill_ids)), so the final
+        # chunk — partial or exactly full — never pops a stash and never
+        # consults the ahead queue: it always gathers from the main staging,
+        # even when its speculative fill (submitted by the previous forward)
+        # is bit-exact. The stale fill lingers in the queue until a later
+        # consume drains it (see test_stale_entries_harmless_across_requests).
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        table_u8, host, emb, entry, model = self._wire(tmp_path, "pf8")
+        fb = FakeForwardBatch(5)
+
+        # Chunk 1 of 3 (fill [1..10] -> chunks 4+4+2): queue empty, so the
+        # main staging takes chunk 1's fill and chunks 2+3 are submitted.
+        emb.main_ids = _fake_hash(
+            torch.tensor([[100, 101, 1, 2, 3, 4]]).unfold(1, 3, 1).squeeze(0)
+        )
+        _PLE_CHUNK_STASH[5] = [5, 6, 7, 8, 9, 10]
+        prefetch_staged_ple_prefill(
+            model, FakePleBatch(torch.tensor([[100, 101, 1, 2, 3, 4]])), fb
+        )
+        assert host._staged_serve is None
+        assert len(host._staged_ahead._queue) == 2
+
+        # Chunk 2 (full): its speculative fill is bit-exact -> serve hit.
+        ctx2 = torch.tensor([[3, 4, 5, 6, 7, 8]])
+        emb.main_ids = _fake_hash(ctx2.unfold(1, 3, 1).squeeze(0))
+        _PLE_CHUNK_STASH[5] = [9, 10]
+        prefetch_staged_ple_prefill(model, FakePleBatch(ctx2), fb)
+        serve = host._staged_serve
+        assert serve is not None
+        serve_ids = emb.main_ids.reshape(-1).numpy()
+        assert np.array_equal(serve._staged_ids, serve_ids)
+        assert torch.equal(
+            serve.buffer[:8].view(torch.uint8), table_u8[serve_ids.tolist()]
+        )
+        # The gather consumes the serve once (consume-once semantics).
+        host._staged_serve = None
+
+        # Final partial chunk (2 tokens < cs): no stash recorded, no consume
+        # — main path even though the queued fill for it is bit-exact.
+        ctx3 = torch.tensor([[7, 8, 9, 10]])
+        emb.main_ids = _fake_hash(ctx3.unfold(1, 3, 1).squeeze(0))
+        prefetch_staged_ple_prefill(model, FakePleBatch(ctx3), fb)
+        assert host._staged_serve is None
+        assert np.array_equal(entry.staging._staged_ids, [24, 24, 27, 27])
+        stale_ids = host._staged_ahead._queue[0][1]
+        assert np.array_equal(stale_ids, entry.staging._staged_ids)
+        _PLE_CHUNK_STASH.clear()
+
+    def test_stale_entries_harmless_across_requests(self, tmp_path, monkeypatch):
+        # A finished request leaves its unconsumed speculative fills in the
+        # queue (its final chunk never consumes). When a new request reuses
+        # the pool slot, the first consume drops the stale head on the ids
+        # mismatch and the fresh request serves normally afterwards — stale
+        # entries cost at most one dropped consume, never wrong rows.
+        import sglang.srt.models.qwen4_exp_ple_prep as prep
+
+        monkeypatch.setattr(prep, "_chunked_prefill_size", lambda: 4)
+        monkeypatch.setenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", "2")
+        _PLE_CHUNK_STASH.clear()
+        _, host, emb, entry, model = self._wire(tmp_path, "pf9")
+        fb = FakeForwardBatch(5)
+
+        # Request 1: fill [1..6] -> chunks 4+2 (final partial). Its chunk-2
+        # speculative fill is never consumed.
+        ctx1 = torch.tensor([[100, 101, 1, 2, 3, 4]])
+        emb.main_ids = _fake_hash(ctx1.unfold(1, 3, 1).squeeze(0))
+        _PLE_CHUNK_STASH[5] = [5, 6]
+        prefetch_staged_ple_prefill(model, FakePleBatch(ctx1), fb)
+        assert len(host._staged_ahead._queue) == 1
+
+        ctx2 = torch.tensor([[3, 4, 5, 6]])
+        emb.main_ids = _fake_hash(ctx2.unfold(1, 3, 1).squeeze(0))
+        prefetch_staged_ple_prefill(model, FakePleBatch(ctx2), fb)
+        assert host._staged_serve is None  # final chunk: main path
+        assert np.array_equal(entry.staging._staged_ids, [12, 12, 15, 15])
+        assert len(host._staged_ahead._queue) == 1  # stale fill lingers
+
+        # Request 2 reuses pool slot 5: fill [20..29] -> chunks 4+4+2. The
+        # first consume drops request 1's stale head (ids mismatch) and the
+        # main staging takes the fill.
+        ctx3 = torch.tensor([[200, 201, 20, 21, 22, 23]])
+        emb.main_ids = _fake_hash(ctx3.unfold(1, 3, 1).squeeze(0))
+        _PLE_CHUNK_STASH[5] = [24, 25, 26, 27, 28, 29]
+        prefetch_staged_ple_prefill(model, FakePleBatch(ctx3), fb)
+        assert host._staged_serve is None  # stale head dropped -> sync path
+        assert np.array_equal(
+            entry.staging._staged_ids, emb.main_ids.reshape(-1).numpy()
+        )
+        assert len(host._staged_ahead._queue) == 2  # only request-2 entries
+
+        # Request 2's chunk 2: its speculative fill is bit-exact -> serve
+        # hit; request 1's staleness never leaked into it.
+        ctx4 = torch.tensor([[22, 23, 24, 25, 26, 27]])
+        emb.main_ids = _fake_hash(ctx4.unfold(1, 3, 1).squeeze(0))
+        _PLE_CHUNK_STASH[5] = [28, 29]
+        prefetch_staged_ple_prefill(model, FakePleBatch(ctx4), fb)
+        serve = host._staged_serve
+        assert serve is not None
+        assert np.array_equal(serve._staged_ids, emb.main_ids.reshape(-1).numpy())
+        _PLE_CHUNK_STASH.clear()
+
     def test_disabled_env_keeps_legacy_behavior(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD", raising=False)
         _PLE_CHUNK_STASH.clear()
