@@ -266,6 +266,78 @@ def _eligible_grouped_prefill_args():
     return q, kv, kv, topk, cu_seqlens_q, 0.0625
 
 
+class _RecordingTier:
+    """Fake KV host tier recording flush() calls (m8: replay flush guard)."""
+
+    def __init__(self, phase3):
+        self.phase3 = phase3
+        self.pagein = False
+        self.flush_calls = []
+
+    def flush(self, out_cache_loc):
+        self.flush_calls.append(out_cache_loc)
+
+
+def _make_replay_backend(tier, gpu_kernel):
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._kv_host_tier = tier
+    backend._require_chain_speculation = lambda *a, **k: None
+    backend._is_speculative_paged_mode = lambda mode: False
+    backend._update_qsa_cuda_graph_metadata = lambda *a, **k: None
+    backend._tier3_refresh_graph_tables = lambda *a, **k: None
+    if gpu_kernel:
+        backend._can_replay_with_gpu_kernels = lambda metadata, seq_lens: True
+        backend._replay_cuda_graph_metadata_gpu = lambda *a, **k: None
+    else:
+        backend._can_replay_with_gpu_kernels = lambda metadata, seq_lens: False
+    metadata = SimpleNamespace(
+        sequence_lengths=torch.zeros(4, dtype=torch.int32),
+        row_req_pool_indices=torch.zeros(4, dtype=torch.int32),
+        indexer_metadata=SimpleNamespace(
+            graph_prefix_lengths=torch.zeros(4, dtype=torch.int32)
+        ),
+    )
+    backend._cuda_graph_metadata = {(ForwardMode.DECODE, 4): metadata}
+    backend.forward_metadata = None
+    return backend
+
+
+@pytest.mark.parametrize("gpu_kernel", [False, True])
+def test_replay_flush_skipped_under_phase3(gpu_kernel):
+    # m8 (docs/v100/CODE_REVIEW_TODO_20261110.md): phase3 bumps step_seq in
+    # on_build_phase3 (also reached via _tier3_refresh_graph_tables on
+    # replay); an unguarded flush(None) would bump it a second time -- the
+    # replay path must mirror the eager build's `if not phase3` guard.
+    tier = _RecordingTier(phase3=True)
+    backend = _make_replay_backend(tier, gpu_kernel)
+    backend._replay_cuda_graph_metadata(
+        bs=4,
+        req_pool_indices=torch.zeros(4, dtype=torch.int64),
+        seq_lens=torch.tensor([10, 11, 12, 13]),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        seq_lens_cpu=None,
+        out_cache_loc=None,
+    )
+    assert tier.flush_calls == []
+
+
+@pytest.mark.parametrize("gpu_kernel", [False, True])
+def test_replay_flush_still_runs_without_phase3(gpu_kernel):
+    tier = _RecordingTier(phase3=False)
+    backend = _make_replay_backend(tier, gpu_kernel)
+    backend._replay_cuda_graph_metadata(
+        bs=4,
+        req_pool_indices=torch.zeros(4, dtype=torch.int64),
+        seq_lens=torch.tensor([10, 11, 12, 13]),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        seq_lens_cpu=None,
+        out_cache_loc=None,
+    )
+    assert tier.flush_calls == [None]
+
+
 def test_grouped_prefill_guard_blocks_rewritten_mixed_batch():
     # M3 (docs/v100/CODE_REVIEW_TODO_20261110.md): eager_runner rewrites
     # MIXED -> EXTEND before metadata init, so the mixed identity only

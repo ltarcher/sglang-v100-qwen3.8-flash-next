@@ -1426,9 +1426,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             self.forward_metadata = metadata
             self._tier3_refresh_graph_tables(metadata, out_cache_loc)
-            if self._kv_host_tier is not None:
+            if self._kv_host_tier is not None and not self._kv_host_tier.phase3:
                 # Captured writes are baked into the graph; Phase 1 only
                 # advances the tier step here (no out_cache_loc available).
+                # Phase 3 already bumped step_seq in on_build_phase3 above,
+                # so flushing here would double-count it.
                 self._kv_host_tier.flush(None)
             return
         if seq_lens_cpu is None:
@@ -1463,7 +1465,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         self.forward_metadata = metadata
         self._tier3_refresh_graph_tables(metadata, out_cache_loc)
-        if self._kv_host_tier is not None:
+        if self._kv_host_tier is not None and not self._kv_host_tier.phase3:
+            # Mirror the eager build guard: phase3's step_seq was already
+            # bumped by on_build_phase3 in _tier3_refresh_graph_tables.
             self._kv_host_tier.flush(None)
 
     def _ensure_tier3_graph_buffers(self, metadata_rows: int) -> None:
