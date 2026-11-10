@@ -480,6 +480,43 @@ class TestEnsureMaxRowsForPrefill:
                 ensure_max_rows_for_prefill(16)
 
 
+class TestRowStagingPinnedFailLoud:
+    """m14 (docs/v100/CODE_REVIEW_TODO_20261110.md): a pinned staging
+    allocation failure on a CUDA machine must fail loudly — the gather kernel
+    dereferences the buffer by data_ptr, so a silent pageable fallback is
+    undefined behavior on GPU. Only driver-less (CPU test) environments may
+    fall back."""
+
+    def test_pin_failure_fails_loud_when_cuda_available(self, monkeypatch, tmp_path):
+        table = _make_staged(16, ROW_BYTES, str(tmp_path), "pin1")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        orig_empty = torch.empty
+
+        def failing_empty(*args, **kwargs):
+            if kwargs.get("pin_memory"):
+                raise RuntimeError("cannot pin memory")
+            return orig_empty(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", failing_empty)
+        with pytest.raises(RuntimeError, match="pinned"):
+            PleRowStaging(table, max_rows=16, io_threads=1)
+
+    def test_pin_failure_falls_back_without_cuda(self, monkeypatch, tmp_path):
+        table = _make_staged(16, ROW_BYTES, str(tmp_path), "pin2")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        orig_empty = torch.empty
+
+        def failing_empty(*args, **kwargs):
+            if kwargs.get("pin_memory"):
+                raise RuntimeError("cannot pin memory")
+            return orig_empty(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", failing_empty)
+        staging = PleRowStaging(table, max_rows=16, io_threads=1)
+        assert staging.buffer.shape == (16, ROW_BYTES)
+        assert not staging.buffer.is_pinned()
+
+
 class TestEnvDefaults:
     def test_staged_env_defaults(self):
         assert envs.SGLANG_QWEN4_PLE_STAGED_DIR.get() != ""

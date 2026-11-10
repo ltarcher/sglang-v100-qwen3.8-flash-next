@@ -256,6 +256,18 @@ class PleRowStaging:
                 (max_rows, self.row_bytes), dtype=torch.uint8, pin_memory=True
             )
         except (RuntimeError, AssertionError):
+            if torch.cuda.is_available():
+                # The gather kernel dereferences buffer.data_ptr() directly:
+                # a silent pageable fallback would be undefined behavior on
+                # GPU (review m14), so fail loudly instead. This is usually a
+                # locked-memory limit (ulimit -l) or host RAM exhaustion.
+                raise RuntimeError(
+                    "PLE staged staging failed to allocate its pinned buffer "
+                    f"({max_rows} x {self.row_bytes} bytes). Raise the locked "
+                    "memory limit (ulimit -l) or free host RAM; falling back "
+                    "to pageable memory is not an option — the gather kernel "
+                    "dereferences the buffer pointer directly."
+                ) from None
             # CPU-only test environments (and engines without a visible CUDA
             # driver) cannot pin; the gather kernel never touches this path
             # there anyway.

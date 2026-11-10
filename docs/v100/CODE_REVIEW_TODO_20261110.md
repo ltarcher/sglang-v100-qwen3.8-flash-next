@@ -168,9 +168,16 @@
     `test_qwen4_exp_ple_prep.py::TestPleRowWaitAndMatchCompareBeforeWait`（miss
     不调 `_wait_pending` 且 fill 仍在后台 + hit 等待且缓冲内容正确，TDD 红灯
     先行）；prep+staged 两套件 73 passed；ruff 干净。
-- [ ] m14. pinned 分配失败静默回退 pageable，GPU 上 kernel 解引用 UB
+- [x] **m14. pinned 分配失败静默回退 pageable，GPU 上 kernel 解引用 UB**（2026-11-10 结案）
   - `models/qwen4_exp_ple_staged.py:251-259`。
-  - 修复：CUDA 可用时 fail-loud，不降级。
+  - **结案结论（CUDA 可用时 fail-loud）**：`PleRowStaging.__init__` pinned 分配
+    失败时以 `torch.cuda.is_available()` 分流——GPU 机器直接 RuntimeError（错误
+    信息点名 gather kernel 直接解引用 buffer 指针、pageable 回退即 UB，并给出
+    `ulimit -l`/host RAM 两条出路），仅无 CUDA driver 的 CPU 测试环境保留 pageable
+    回退（该环境 gather kernel 永不触达此路径）。回归
+    `test_qwen4_exp_ple_staged.py::TestRowStagingPinnedFailLoud`（CUDA 可用 +
+    pin 失败 → RuntimeError；无 CUDA + pin 失败 → 非 pinned 回退，TDD 红灯先行）；
+    prep+staged 两套件 75 passed；ruff 干净。
 - [ ] m15. staged shard 文件名/meta 不含 checkpoint 指纹
   - `models/qwen4_exp_ple_staged.py:56-60`。REUSE=1（默认 0）时同形状异权重 checkpoint
     静默互用 12.2GiB 表。
