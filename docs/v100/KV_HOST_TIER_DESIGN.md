@@ -88,7 +88,8 @@ Phase 3 实施记录(2026-11-01):
   镜像上一 forward 写页、extend 读 `_p3_gather_kernel`(tag 命中读 device,未命中
   读 pinned host)、decode 读 `page_in_selected_phase3` + `phys_token_slot_table`);
   `qsa_kv_pool.py` 供物理槽视图,`qwen_sparse_attn_backend.py` 接三条路径。
-  调试门控 `QSA_P3_FORCE_HOST`(强制镜像页读 host)/`QSA_P3_CHECK` 与计数器
+  调试门控 `SGLANG_V100_KV_TIER_P3_FORCE_HOST`(强制镜像页读 host,旧名
+  `QSA_P3_FORCE_HOST` 保留一版别名)/`SGLANG_V100_KV_TIER_P3_CHECK` 与计数器
   mirror_pages/write_restores/pagein_restores/collisions/host_gather_rows/
   mirror_skips/gather_unvalid/host_dev_mismatch。另修复 `qsa/qsa_indexer.py`
   未完成迁移:调用方传 `out_dtype` 而 srt shim 旧签名无该参数,4 TP rank 启动即

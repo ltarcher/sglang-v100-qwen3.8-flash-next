@@ -182,5 +182,42 @@ class TestDsv41EngramHostTableDefault(CustomTestCase):
             self.assertFalse(envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get())
 
 
+class TestP3DebugSwitches(CustomTestCase):
+    # m10 (docs/v100/CODE_REVIEW_TODO_20261110.md): the Phase 3 debug
+    # read-path switches were bare os.environ reads under unregistered,
+    # non-SGLANG names; they must go through Envs with the legacy names
+    # kept as DeprecationWarning aliases.
+    def setUp(self):
+        for key in (
+            "QSA_P3_FORCE_HOST",
+            "QSA_P3_CHECK",
+            "SGLANG_V100_KV_TIER_P3_FORCE_HOST",
+            "SGLANG_V100_KV_TIER_P3_CHECK",
+        ):
+            os.environ.pop(key, None)
+            self.addCleanup(os.environ.pop, key, None)
+
+    def test_registered_with_default_off(self):
+        self.assertIs(envs.SGLANG_V100_KV_TIER_P3_FORCE_HOST.get(), False)
+        self.assertIs(envs.SGLANG_V100_KV_TIER_P3_CHECK.get(), False)
+
+    def test_canonical_name_reads_bool(self):
+        envs.SGLANG_V100_KV_TIER_P3_FORCE_HOST.set(True)
+        envs.SGLANG_V100_KV_TIER_P3_CHECK.set(True)
+        self.assertIs(envs.SGLANG_V100_KV_TIER_P3_FORCE_HOST.get(), True)
+        self.assertIs(envs.SGLANG_V100_KV_TIER_P3_CHECK.get(), True)
+
+    def test_legacy_alias_warns_and_forwards(self):
+        os.environ["QSA_P3_FORCE_HOST"] = "1"
+        os.environ["QSA_P3_CHECK"] = "1"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertIs(envs.SGLANG_V100_KV_TIER_P3_FORCE_HOST.get(), True)
+            self.assertIs(envs.SGLANG_V100_KV_TIER_P3_CHECK.get(), True)
+        messages = [str(w.message) for w in caught]
+        self.assertTrue(any("QSA_P3_FORCE_HOST" in m for m in messages))
+        self.assertTrue(any("QSA_P3_CHECK" in m for m in messages))
+
+
 if __name__ == "__main__":
     unittest.main()

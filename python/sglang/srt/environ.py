@@ -1685,6 +1685,16 @@ class Envs:
     # and then garbage-filled, so every subsequent decode read of them must
     # go through page-in. Used by the bit-consistency A/B gate.
     SGLANG_V100_KV_TIER_DEGRADE_FLAG = EnvStr("")
+    # Debug-only Phase 3 read-path switches (production leaves both unset):
+    # FORCE_HOST reads every mirrored page from the host mirror; CHECK counts
+    # device/host disagreements on tag-matched pages. Legacy names kept as
+    # DeprecationWarning aliases for one release.
+    SGLANG_V100_KV_TIER_P3_FORCE_HOST = EnvBoolWithAlias(
+        False, deprecated_name="QSA_P3_FORCE_HOST"
+    )
+    SGLANG_V100_KV_TIER_P3_CHECK = EnvBoolWithAlias(
+        False, deprecated_name="QSA_P3_CHECK"
+    )
     # Phase 3 (docs/v100/KV_HOST_TIER_DESIGN.md §10): shrink the full-KV device
     # pool to this many tokens per rank while the scheduler, allocator,
     # req_to_token and radix tree keep the logical token budget. Logical pages

@@ -91,7 +91,8 @@ _CNT_P3_HOST_GATHER_ROWS = 14
 # invalid), and an extend gather that reads a host page with no valid copy.
 _CNT_P3_MIRROR_SKIPS = 15
 _CNT_P3_GATHER_UNVALID = 16
-# Debug invariants (QSA_P3_CHECK=1): rows whose page is tag-matched, mirrored
+# Debug invariants (SGLANG_V100_KV_TIER_P3_CHECK=1): rows whose page is
+# tag-matched, mirrored
 # (hvalid) and not written by this forward must read identical bytes from the
 # device slot and the host mirror; a mismatch means the tag claims a page the
 # slot does not hold, or the mirror stored another page's bytes.
@@ -1051,8 +1052,8 @@ class KVHostTier:
         # Debug-only read-path switches (production leaves both unset):
         # FORCE_HOST reads every mirrored page from the host mirror, CHECK
         # counts device/host disagreements on tag-matched pages.
-        self._p3_force_host = os.environ.get("QSA_P3_FORCE_HOST") == "1"
-        self._p3_check = os.environ.get("QSA_P3_CHECK") == "1"
+        self._p3_force_host = envs.SGLANG_V100_KV_TIER_P3_FORCE_HOST.get()
+        self._p3_check = envs.SGLANG_V100_KV_TIER_P3_CHECK.get()
 
         self.pagein = False
         self.layer_slot = {gid: i for i, gid in enumerate(self.layer_ids)}
