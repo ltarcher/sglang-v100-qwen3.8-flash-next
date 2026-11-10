@@ -972,3 +972,53 @@ class TestGatherStagedServeWidthGuard:
         assert len(kernel.calls) == 1
         assert kernel.calls[0][0] == (4,)
         assert host._staged_serve is None
+
+
+class TestStagedWeightUpdateGuard:
+    """update_weights_from_disk vs the staged backend (review m11,
+    2026-11-10).
+
+    After materialize, _release_loading_table swaps the full pinned loading
+    table for a 1-row dummy parameter that carries no weight_loader, so an
+    online weight update falls into default_weight_loader and dies on a
+    cryptic shape mismatch while the staged NVMe shard keeps serving stale
+    rows. The loading table is already freed (12+ GiB pinned), so an
+    in-place re-materialize cannot be supported; the placeholder must
+    reject updates with a self-explanatory error instead.
+    """
+
+    def _make_host(self):
+        import torch.nn as nn
+        from types import SimpleNamespace
+
+        from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
+
+        host = object.__new__(Qwen4ExpPinnedHostEmbedding)
+        nn.Module.__init__(host)
+        host.embedding_dim = 8
+        host.weight = nn.Parameter(
+            torch.empty(4, 8, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        host._staged_table = SimpleNamespace(path="p", shard_rows=4, row_bytes=8)
+        return host
+
+    def test_released_placeholder_rejects_weight_update(self):
+        host = self._make_host()
+        host._release_loading_table()
+        dummy = host.get_parameter("weight")
+        assert dummy.shape == (1, host.embedding_dim)
+        loader = getattr(dummy, "weight_loader", None)
+        assert loader is not None, "dummy must carry an explicit guard"
+        with pytest.raises(RuntimeError, match="staged"):
+            loader(dummy, torch.empty(4, 8, dtype=torch.float8_e4m3fn))
+
+    def test_untouched_loading_table_still_loadable(self):
+        # Non-materialized staged table (or pinned/file backend): the real
+        # table stays installed, no guard is attached, the generic loader
+        # keeps working.
+        host = self._make_host()
+        host._staged_table = None
+        host._release_loading_table()
+        assert host.get_parameter("weight").shape == (4, host.embedding_dim)
+        loader = getattr(host.get_parameter("weight"), "weight_loader", None)
+        assert loader is None

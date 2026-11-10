@@ -1350,6 +1350,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         dummy = nn.Parameter(
             torch.empty((1, self.embedding_dim), dtype=dtype), requires_grad=False
         )
+
+        # update_weights_from_disk would otherwise fall into the generic
+        # default_weight_loader (the dummy has no weight_loader) and die on a
+        # cryptic shape mismatch while the staged NVMe shard keeps serving
+        # stale rows. The loading table is already freed, so an in-place
+        # re-materialize cannot be supported; fail loud with the reason.
+        def _reject_weight_update(param, loaded_weight, *args, **kwargs):
+            raise RuntimeError(
+                "update_weights_from_disk is not supported with the PLE "
+                "staged backend: the pinned loading table was released after "
+                "materialization and the staged shard file cannot be "
+                "refreshed in place. Restart the server on the new checkpoint."
+            )
+
+        dummy.weight_loader = _reject_weight_update
         self.register_parameter("weight", dummy)
         # Collect now so the finalizer (cudaHostUnregister + munmap) runs
         # deterministically and boot-time memory accounting sees the freed
