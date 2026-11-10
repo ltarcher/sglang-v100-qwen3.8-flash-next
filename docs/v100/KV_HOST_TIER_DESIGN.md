@@ -506,21 +506,27 @@ device 池可缩,但长文 decode 撞 host page-in spill 悬崖)。
 
 | # | 待办 | 类型 | 质量风险 | 前置 / 堵点 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | verify replay 索引语义:与并行会话(gdn_backend)改动协调,PR6 池越界同类区域重点测 | 正确性 | 有 | 需与 gdn_backend 改动同窗口验证,重点回归 PR6 池越界区域 | CPU 侧验收(2026-11-10):PR6 区域=verify 图 replay 全宽 tier 表(`_tier3_refresh_graph_tables`)从 req_to_token 重取,padding 行/尾列是已释放请求的陈旧逻辑槽;新单测锁定映射对全 int32 域垃圾值只路由 padding 窗口(FULL 读侧 map_slot_table 此前零覆盖,已补)。协调结论:gdn_backend 的 mamba replay state 索引是独立索引空间(HybridLinearAttnBackend + replay_state_indices_validator),不经 map_slot_table,无语义二义。真机剩余:MTP verify × tier × 3×131k 准入回归(见下) |
-| 2 | 索引重映射与 radix/retract 释放路径的一致性(三种槽位并存) | 正确性 | 有 | 需构造 retract + radix 驱逐与 tier 页入并发的用例 | CPU 协议验收(2026-11-10):free 路径是纯 allocator 簿记(qsa_kv_pool 无 free override、tier 无释放 hook),一致性全由 tag 协议承载(save-at-steal + "重分配先全量重写才可读" + PAIR owner 守卫);新单测构造 radix 驱逐→复用→页入回退、retract 未镜像 pending 写被复用、PAIR 释放对家页守卫、混合交错序列四类用例,逐 incarnations 验读。真机剩余:radix 驱逐与页入的 GPU 级竞态(见下) |
+| 1 | verify replay 索引语义:与并行会话(gdn_backend)改动协调,PR6 池越界同类区域重点测 | 正确性 | 有 | 需与 gdn_backend 改动同窗口验证,重点回归 PR6 池越界区域 | CPU 侧验收(2026-11-10):PR6 区域=verify 图 replay 全宽 tier 表(`_tier3_refresh_graph_tables`)从 req_to_token 重取,padding 行/尾列是已释放请求的陈旧逻辑槽;新单测锁定映射对全 int32 域垃圾值只路由 padding 窗口(FULL 读侧 map_slot_table 此前零覆盖,已补)。协调结论:gdn_backend 的 mamba replay state 索引是独立索引空间(HybridLinearAttnBackend + replay_state_indices_validator),不经 map_slot_table,无语义二义。真机剩余:MTP verify × tier × 3×131k 准入回归(见下) | **真机验收通过(2026-11-10)**:target-only 与 MTP(--spec)双 boot 同输入 3×131k needle 检索,答案逐字符一致(R1A/R1B/R1C 精确命中,R1B 尾部闲聊为 raw completion 格式噪声、两模式同样出现);MTP 模式 accept len 均值 2.15(61 条 decode 日志,基线带 2.20-2.45,不同负载正常波动)。生产配置实况修正:PAIR_PARITY 下 pair_pages=12288=logical_pages,模映射为双射,verify 表 garbage 由 tag 门控兜底(与 CPU 单测判据一致) |
+| 2 | 索引重映射与 radix/retract 释放路径的一致性(三种槽位并存) | 正确性 | 有 | 需构造 retract + radix 驱逐与 tier 页入并发的用例 | CPU 协议验收(2026-11-10):free 路径是纯 allocator 簿记(qsa_kv_pool 无 free override、tier 无释放 hook),一致性全由 tag 协议承载(save-at-steal + "重分配先全量重写才可读" + PAIR owner 守卫);新单测构造 radix 驱逐→复用→页入回退、retract 未镜像 pending 写被复用、PAIR 释放对家页守卫、混合交错序列四类用例,逐 incarnations 验读。真机剩余:radix 驱逐与页入的 GPU 级竞态(见下) | **真机验收通过(2026-11-10)**:3×131k PR6 准入 + warm replay(cached 122,944-130,880/130,893)+ 12 请求过载灌池触发 radix 驱逐 106 次(eviction metrics),全程 needle 精确命中、无乱码;tier 计数器 4 rank 一致全零(steps=6528, mirror_pages=277k 活跃,gather_unvalid/peer_miss/host_dev_mismatch/saves=0——PAIR 双射下预期)。注:PAIR 生产配置无页入(pagein 强制 False),GPU 级页入竞态在本配置不存在,对应风险归 FULL/卷绕配置(未启用) |
 | 3 | 4×1M 在 fp16+复制下无解;去复制改造的工程量与 attention TP 正确性风险 | 容量 | 有 | 杠杆 2 pair-split 已解决 ×2(§6.1);×4 还需镜像减半 + 杠杆 3 叠加,且组件 5 准入先行(两次 4×256K 实测不可行,§6.1) | 死路(当前形态) |
 | 4 | host pinned 内存上限(cgroup/numatune)在目标机实测;`SGLANG_NUMA_BIND_V2=0` 为前提 | 测量 | 无 | 生产 compose 已按 125G 内存裁剪 hicache;实测仅补记录 | 未开工 |
 | 5 | Phase 2 阶梯补 512K prefill 点,收窄 §4.2 外推带并回填 §4 表格(262k 锚点已实测 2026-10-30:prefill 2296 tok/s / 输出 85-93 tok/s / warm radix 0.68s;decode 按 -14%/倍增外推) | 测量 | 无 | 生产容器空闲窗口跑一次 512K 阶梯 bench(`/tmp/bench_ctx_ladder_distinct.py` 口径);与 #4 可同窗完成 | 未开工 |
 
-#1/#2 真机回归清单(生产容器空闲窗口一次性完成,复用 AGENTS 数值验证纪律):
+#1/#2 真机回归记录(2026-11-10 全部完成,生产 compose 容器 sglang-v100-qwen38-8110,
+镜像含 bd170d8e3a;脚本 /tmp/pr9_tier_regression.py 口径:filler+needle raw
+completion,3965 repeats ≈ 130,893 tokens,greedy + ignore_eos):
 
-1. MTP verify × tier:target-only 与 `--spec` 两模式同输入输出一致 + accept 长度不回退
-   (production 8110 compose 即可,层数据已有基线 accept 2.20-2.45)。
-2. PR6 越界区域:3×131k 并发准入(即 PR#6 修复的场景)+ warm radix 第二轮,输出无
-   乱码/cached_prompt_tokens 正常;tier 计数器 `gather_unvalid`/`host_dev_mismatch`/
-   `peer_miss` 必须为 0。
-3. radix 驱逐 × 页入:长前缀灌满逻辑池(>phys)后换新请求强制 radix 驱逐,第二轮请求
-   输出与首轮 cold 一致性抽检 + 上述计数器仍为 0。
+1. MTP verify × tier(条目 1):MTP 模式 3×131k 并发 cold(prefill ~2035 tok/s,
+   TTFT ~105-170s)+ warm replay(cached 122,944-130,880,55s)needle 精确命中;
+   target-only boot(去掉 5 个 --speculative-* 参数)同输入 3×131k needle 精确命中,
+   两模式答案逐字符一致;accept len 均值 2.15(61 条 decode 日志)。
+2. PR6 越界区域(条目 1):3 并发 131k(共 393k)× 12 请求灌池,radix LRU 驱逐
+   106 次(eviction metrics bucket),输出无乱码,驱逐后回放命中正确。
+3. 计数器(两模式):4 rank 一致,write_restores/pagein_restores/collisions/saves/
+   mirror_skips/gather_unvalid/host_dev_mismatch/peer_miss 全零,mirror_pages 活跃。
+4. 生产配置实况:PAIR_PARITY 下 pair_pages==logical_pages,模映射双射,页入路径
+   不激活(pagein 强制 False)——GPU 级"驱逐×页入竞态"在本配置结构性不存在,
+   释放一致性由 tag 门控在双射下平凡成立;FULL/卷绕配置(未启用)才需要该回归。
 
 附:杠杆 3(NVMe 冷层)为无质量风险的实质优化,但前置 = §7 质量门 4
 局部性实测(1×1M 形态),而 1M 需 YaRN、YaRN 在 3 并发形态已因 warmup
