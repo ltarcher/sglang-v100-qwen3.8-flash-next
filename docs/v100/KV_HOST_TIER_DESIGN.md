@@ -551,6 +551,11 @@ free 12 MiB)。因此 Phase 3 最小闭环不是"扩逻辑容量",而是**缩设
 needle 3/3、`host_dev_mismatch=0`)。注意卷绕约束:上下文必须 ≤ PHYS,
 否则 `lp % P` 槽位复用会使召回随超出比单调劣化(150K/156K 边界全过,
 170K 起 1/2,255K@196K PHYS 0/8;PHYS=393,216 无卷绕 3/3 同 nonce 转好)。
+**2026-11-10 起 boot 强制该约束**(代码审查 M2):卷绕不只是召回劣化——同余
+逻辑页会别名同一设备行,write-restore 双 program 非原子竞争 tags/owner、
+decode 消费端不查 tag 静默错读;FULL 布局现要求 `logical_pages <= phys_pages`
+(`_require_full_pool_capacity`),超配请改 PAIR_PARITY(对拆双射允许逻辑页至
+每 rank 物理的 2 倍)或上调 PHYS。卷绕形态需关联重映射 redesign 才可复开。
 
 ### 10.1 容量切分
 

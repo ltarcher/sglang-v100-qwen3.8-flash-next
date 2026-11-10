@@ -930,6 +930,8 @@ class KVHostTier:
         self.phys_slot_base = self.phys_pages * self.page_size
         if envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY:
             self._init_pair_split()
+        else:
+            self._require_full_pool_capacity()
 
         mirror_elems = (
             2
@@ -1056,6 +1058,31 @@ class KVHostTier:
             self._p3_force_host,
             self._p3_check,
         )
+
+    def _require_full_pool_capacity(self) -> None:
+        """FULL layout refuses oversubscription (review M2, 2026-11-10).
+
+        The wraparound mapping ``lp % phys_pages`` is only injective when
+        ``logical_pages <= phys_pages``. Oversubscribed, two live logical
+        pages can be congruent mod phys_pages and alias one device row:
+        their write-restore programs race non-atomically on tags/owner and
+        their stores clobber each other, and decode consumers (which trust
+        page-in without tag checks) read whichever congruent page won the
+        row last -- silent corruption the old experiments logged as
+        monotonically degrading recall (KV_HOST_TIER_DESIGN.md §10 wrap
+        note). Wrapped FULL needs an associative remap redesign before it
+        can be re-enabled; until then the pool must fit.
+        """
+        if self.logical_pages > self.phys_pages:
+            raise ValueError(
+                "FULL layout wraps logical pages with lp % phys_pages, which "
+                "aliases two live pages onto one device row once the pool is "
+                f"oversubscribed: logical_pages={self.logical_pages} > "
+                f"phys_pages={self.phys_pages}. Raise SGLANG_V100_KV_TIER_"
+                "PHYS_TOKENS, lower --max-total-tokens, or use "
+                "SGLANG_V100_KV_HEAD_LAYOUT=PAIR_PARITY (its pair-half "
+                "bijection admits logical pages up to 2x per-rank physical)."
+            )
 
     def _init_pair_split(self) -> None:
         """Pair-split layout (docs/v100/KV_HOST_TIER_DESIGN.md §6.1).

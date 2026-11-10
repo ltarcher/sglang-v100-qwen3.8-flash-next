@@ -41,13 +41,22 @@
 
 ### Major（latent）
 
-- [ ] **M2. FULL 卷绕布局同余页竞态（P3 write-restore/page-in 内核）**
+- [x] **M2. FULL 卷绕布局同余页竞态（P3 write-restore/page-in 内核）**（2026-11-10 结案）
   - 位置：`mem_cache/kv_host_tier.py:344-461`（map_slots 纯模 `lp%phys_pages` 于 :1161）
   - 触发：仅 FULL 布局（未启用；生产 PAIR 被 :1099 boot 双射门控保护）。同一 forward
     两个同余逻辑页并发 program 非原子竞争 tags/owner，消费端（sm70_longctx_decode.cu:122-133、
     qsa/sparse_attn.py:467-476）不查 tag → 静默错 KV；`_p3_mirror` 注释声称的 host 侧
     uniq 校验不存在（`_p3_cap=logical_pages+1`）。
-  - 修复：FULL 模式加 host 侧同余/uniq 页校验，或 gate 为"FULL 不支持 oversubscription"。
+  - **结案结论（选项 b：gate FULL 不支持 oversubscription）**：根因比内核竞态更深——
+    卷绕映射本身非单射，同余双活页无论写（store 互踏）还是读（page-in 无法同时驻留、
+    decode 消费端不查 tag）都不可满足，文档 §10 记录的"召回单调劣化"即此缺陷的症状。
+    新增 `_require_full_pool_capacity`（boot 期 FULL 臂要求 `logical_pages <= phys_pages`，
+    错误信息给出 PHYS_TOKENS/--max-total-tokens/PAIR_PARITY 三条出路；PAIR 双射门
+    :1099 不变）。回归测试 `test_kv_host_tier_full_capacity_gate.py`：超配拒启、
+    容量相容放行、错误信息出路、容量相容时 slot table 单射性 + 超配别名复现。
+    既有 KV tier CPU 套件 31 passed；GPU 内核测试（object 桩、刻意卷绕 fixture）不受
+    boot gate 影响。卷绕形态如需复开须先做关联重映射 redesign（KV_HOST_TIER_DESIGN.md
+    §10 卷绕注记已同步）。
 
 - [x] **M3. Grouped prefill 的 mixed 批守卫是死代码**（2026-11-10 结案）
   - 位置：`layers/attention/qwen_sparse_attn_backend.py:2459-2463`
