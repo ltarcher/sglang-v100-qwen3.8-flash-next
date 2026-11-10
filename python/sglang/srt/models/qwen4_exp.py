@@ -554,6 +554,16 @@ def _offloads_ple(config) -> bool:
     return bool(config.ple_offload_embedding) and not is_building_neighbour_layer()
 
 
+def _staged_checkpoint_fingerprint(config) -> str:
+    """Checkpoint identity mixed into staged shard file names and headers
+    (review m15): REUSE=1 matches shard files by shape/dtype header only, so
+    two checkpoints with identical table shapes would otherwise silently share
+    a 12+ GiB table. The model path is the cheap proxy for a weight hash."""
+    from sglang.srt.models.qwen4_exp_ple_staged import checkpoint_fingerprint
+
+    return checkpoint_fingerprint(getattr(config, "_name_or_path", None))
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -662,6 +672,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+                # Review m15: shard files must not be shared across
+                # checkpoints — mix the model path into the staged name/meta.
+                checkpoint_fingerprint=_staged_checkpoint_fingerprint(config),
             )
         self.ngram_embedding = ngram_embedding
 
@@ -953,6 +966,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         *,
         backend: str = "pinned",
         table_dir: Optional[str] = None,
+        checkpoint_fingerprint: str = "",
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -994,6 +1008,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 dtype=source_weight.dtype,
                 table_dir=table_dir or envs.SGLANG_QWEN4_PLE_STAGED_DIR.get(),
                 tag=shard_tag,
+                # Review m15: REUSE=1 matches shard files by shape/dtype
+                # header only — mix the checkpoint identity into the name and
+                # meta so a different checkpoint never shares a 12+ GiB table.
+                fingerprint=checkpoint_fingerprint,
             )
             host_backend = "pinned"
             logger.warning(

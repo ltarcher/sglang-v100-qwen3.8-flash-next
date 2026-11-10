@@ -178,10 +178,19 @@
     `test_qwen4_exp_ple_staged.py::TestRowStagingPinnedFailLoud`（CUDA 可用 +
     pin 失败 → RuntimeError；无 CUDA + pin 失败 → 非 pinned 回退，TDD 红灯先行）；
     prep+staged 两套件 75 passed；ruff 干净。
-- [ ] m15. staged shard 文件名/meta 不含 checkpoint 指纹
+- [x] **m15. staged shard 文件名/meta 不含 checkpoint 指纹**（2026-11-10 结案）
   - `models/qwen4_exp_ple_staged.py:56-60`。REUSE=1（默认 0）时同形状异权重 checkpoint
     静默互用 12.2GiB 表。
-  - 修复：name/meta 混入模型路径或权重哈希。
+  - **结案结论（模型路径指纹）**：新增 `checkpoint_fingerprint(name_or_path)`
+    （sha1 前 10 位 + 文件系统安全的路径尾，`None`/空 → 空串），`PleStagedTable`
+    构造函数新增 `fingerprint` 参数并混入 shard 文件名（`{tag}_{fingerprint}`）与
+    header meta（显式 `"fingerprint"` 键，旧文件因值不符 → 强制重写）；
+    `Qwen4ExpNGramEmbedding.__init__` 经 `_staged_checkpoint_fingerprint(config)`
+    （取 `config._name_or_path`）传入。不选全量权重哈希：每次 boot 读 12+ GiB
+    不值得，模型路径是足够便宜的代理。回归
+    `test_qwen4_exp_ple_staged.py::TestCheckpointFingerprint`（helper 安全且可区分/
+    异指纹换文件名/异指纹 meta 不符强制重写/同指纹 REUSE 复用，TDD 红灯先行）；
+    prep+staged 两套件 79 passed；ruff 干净。
 - [ ] m16. `_PLE_CHUNK_STASH` 请求完成/中止后不失效
   - `models/qwen4_exp_ple_prep.py:256-292`。slot 复用弹旧条目触发错误投机预读+满额等待
     （正确性由 consume ids 兜底）；多请求批的 stash 亦不被消费。

@@ -63,6 +63,28 @@ def staged_table_file_name(shape, dtype, tag: str) -> str:
     return f"ple_staged_{shape[0]}x{row_bytes}_{_DTYPE_CODES[dtype]}_{tag}.bin"
 
 
+def checkpoint_fingerprint(name_or_path: str | None) -> str:
+    """Short filesystem-safe digest of the checkpoint identity (review m15).
+
+    REUSE=1 matches staged shard files purely by shape/dtype header, so two
+    checkpoints with identical table shapes would silently share a 12+ GiB
+    table. The model path is mixed into the shard file name and header meta
+    so a different checkpoint never picks up another's shard; a full weight
+    hash is not worth the 12 GiB read on every boot. Empty when the identity
+    is unknown (meta then stays backward compatible with fingerprint-less
+    files via the explicit key)."""
+    if not name_or_path:
+        return ""
+    import hashlib
+    import re
+
+    digest = hashlib.sha1(str(name_or_path).encode()).hexdigest()[:10]
+    tail = re.sub(
+        r"[^A-Za-z0-9_.-]+", "-", str(name_or_path).rstrip("/").rsplit("/", 1)[-1]
+    )[-48:]
+    return f"{digest}-{tail}"
+
+
 def _dtype_code(dtype: torch.dtype) -> int:
     if dtype not in _DTYPE_CODES:
         raise ValueError(f"unsupported PLE staged dtype: {dtype}")
@@ -72,16 +94,27 @@ def _dtype_code(dtype: torch.dtype) -> int:
 class PleStagedTable:
     """Dense per-shard PLE row file with a small self-describing header."""
 
-    def __init__(self, shape, dtype: torch.dtype, table_dir: str, tag: str):
+    def __init__(
+        self,
+        shape,
+        dtype: torch.dtype,
+        table_dir: str,
+        tag: str,
+        fingerprint: str = "",
+    ):
         if len(shape) != 2:
             raise ValueError(f"PLE staged table must be 2D, got shape {shape}")
         self.shape = tuple(shape)
         self.dtype = dtype
+        self.fingerprint = fingerprint
         self.row_bytes = shape[1] * torch.tensor([], dtype=dtype).element_size()
         self.shard_rows = int(shape[0])
         self.header_size = _HEADER_STRUCT.size
         os.makedirs(table_dir, exist_ok=True)
-        self.path = os.path.join(table_dir, staged_table_file_name(shape, dtype, tag))
+        name_tag = f"{tag}_{fingerprint}" if fingerprint else tag
+        self.path = os.path.join(
+            table_dir, staged_table_file_name(shape, dtype, name_tag)
+        )
         self.data_offset = self.header_size + len(json.dumps(self._meta()).encode())
         self._fd: int | None = None
 
@@ -122,6 +155,7 @@ class PleStagedTable:
             "shape": list(self.shape),
             "dtype": str(self.dtype),
             "version": PLE_STAGED_VERSION,
+            "fingerprint": self.fingerprint,
         }
 
     def materialize(self, host_table: torch.Tensor, reuse: bool) -> bool:

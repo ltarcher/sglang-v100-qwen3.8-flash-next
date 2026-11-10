@@ -26,6 +26,7 @@ from sglang.srt.models.qwen4_exp_ple_staged import (
     PLE_STAGED_MAGIC,
     PleRowStaging,
     PleStagedTable,
+    checkpoint_fingerprint,
     ensure_max_rows_for_prefill,
     staged_table_file_name,
 )
@@ -478,6 +479,77 @@ class TestEnsureMaxRowsForPrefill:
             self._patch_schedule(monkeypatch, bad)
             with pytest.raises(ValueError, match="chunked_prefill_size"):
                 ensure_max_rows_for_prefill(16)
+
+
+class TestCheckpointFingerprint:
+    """m15 (docs/v100/CODE_REVIEW_TODO_20261110.md): REUSE=1 matches staged
+    shard files purely by shape/dtype header, so two checkpoints with
+    identical table shapes would silently share a 12+ GiB table. The
+    checkpoint identity must be mixed into the file name and the header meta."""
+
+    def test_helper_is_safe_and_distinct(self):
+        a = checkpoint_fingerprint("/data/models/GLM-5.3-Flash-NVFP4")
+        b = checkpoint_fingerprint("/data/models/Qwen3.8-Flash-Next")
+        assert a and b and a != b
+        for ch in "/ \\":  # filesystem-safe
+            assert ch not in a
+        assert checkpoint_fingerprint(None) == ""
+        assert checkpoint_fingerprint("") == ""
+
+    def test_fingerprint_changes_file_name(self, tmp_path):
+        t1 = PleStagedTable(
+            (100, ROW_BYTES),
+            torch.float8_e4m3fn,
+            str(tmp_path),
+            "fp",
+            fingerprint="aaa-model-a",
+        )
+        t2 = PleStagedTable(
+            (100, ROW_BYTES),
+            torch.float8_e4m3fn,
+            str(tmp_path),
+            "fp",
+            fingerprint="bbb-model-b",
+        )
+        assert t1.path != t2.path
+
+    def test_meta_fingerprint_blocks_reuse(self, tmp_path):
+        # Same name (e.g. a stale file from an older build), different
+        # checkpoint: the header meta mismatch must force a rewrite.
+        t1 = PleStagedTable(
+            (100, ROW_BYTES),
+            torch.float8_e4m3fn,
+            str(tmp_path),
+            "fp2",
+            fingerprint="aaa",
+        )
+        t1.materialize(_make_table(100), reuse=False)
+        t2 = PleStagedTable(
+            (100, ROW_BYTES),
+            torch.float8_e4m3fn,
+            str(tmp_path),
+            "fp2",
+            fingerprint="bbb",
+        )
+        assert t2.materialize(_make_table(100, seed=2), reuse=True) is True
+
+    def test_same_fingerprint_reuses(self, tmp_path):
+        t1 = PleStagedTable(
+            (100, ROW_BYTES),
+            torch.float8_e4m3fn,
+            str(tmp_path),
+            "fp3",
+            fingerprint="aaa",
+        )
+        t1.materialize(_make_table(100), reuse=False)
+        t2 = PleStagedTable(
+            (100, ROW_BYTES),
+            torch.float8_e4m3fn,
+            str(tmp_path),
+            "fp3",
+            fingerprint="aaa",
+        )
+        assert t2.materialize(_make_table(100), reuse=True) is False
 
 
 class TestRowStagingPinnedFailLoud:
