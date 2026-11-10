@@ -176,6 +176,16 @@ services:
       - --enable-cache-report
       - --enable-metrics
       - --ple-offload-embedding
+      # Backend: pinned host RAM (the launch default). Divergence note
+      # (review m20): the bare-metal serve script adds --ple-offload-backend
+      # staged (NVMe tier, docs/v100/PLE_NVME_TIER_DESIGN.md) — it releases
+      # the 51 GB loading copy after materializing 12.8 GiB/rank shard files
+      # (bit-exact vs pinned; prefill pays ~200 ms of NVMe random-row IOPS
+      # per 4096-token chunk). This compose deliberately keeps pinned: the
+      # machine facts above (RAM-budgeted, hicache-less) were sized against
+      # pinned, and switching to staged is a measured A/B per §11.9.4, not a
+      # default. To opt in here, append `--ple-offload-backend` / `staged`
+      # plus a SGLANG_QWEN4_PLE_STAGED_DIR env on a non-tmpfs volume.
       # ---- MTP: EAGLE 3 steps / topk 1 / 4 draft tokens ----
       # The draft layer's fp8-block experts dequantize to fp16 at load time
       # (SM70FP8BlockMoEDequantMethod), so TP4's 160-column split works

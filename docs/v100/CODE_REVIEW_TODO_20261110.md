@@ -232,10 +232,16 @@
     README——compose 是"推荐部署"载体故直接启用实测最优 750ms，裸机 serve 脚本保留
     0 以维持 pre-L3-1 行为需显式 opt-in。三个文件互相补加 divergence note 交叉引用
     （compose→脚本默认 0、脚本→compose 默认 750 及理由），行为零变更、无测试面。
-- [ ] m20. compose 与 serve 脚本 PLE 后端分叉：脚本 staged NVMe、compose pinned RAM
+- [x] **m20. compose 与 serve 脚本 PLE 后端分叉：脚本 staged NVMe、compose pinned RAM**（2026-11-10 结案）
   - `scripts/serve_qwen38_flash_next_nvfp4_v100.sh:327` vs compose（无
     `--ple-offload-backend`，走默认 pinned）。
-  - 修复：compose 对齐或注释登记。
+  - **结案结论（注释登记差异，不改行为）**：分叉仅存在于
+    `docker/v100-compose-qwen38-mtp.yaml`（绕过 serve 脚本的独立 compose）；
+    `docker/v100-compose.yaml` 的 qwen38 服务经 entrypoint 调 serve 脚本，自动继承
+    staged，无分叉。该 compose 有意保留 pinned：其机器事实（~125G RAM、无 hicache）
+    按 pinned 尺寸标定，切 staged 属 §11.9.4 的实测 A/B 范畴而非默认值。在其
+    `--ple-offload-embedding` 处补 divergence note（脚本 staged 的收益/代价、本
+    compose 保留 pinned 的原因、opt-in 方法），行为零变更、无测试面。
 - [ ] m21. 多模态 StopIteration 合并语义：混排请求静默丢其他模态 token
   - `multimodal/processors/base_processor.py:1536-1551`（早退点 :1142-1148）。
     纯图像单模态生产不受影响。
