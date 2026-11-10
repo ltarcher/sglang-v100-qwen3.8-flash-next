@@ -1225,6 +1225,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         path would have read for the same ids."""
         import os as _os
 
+        import numpy as np
+
         ids_np = staging._staged_ids
         if ids_np is None or n == 0 or n != ids_np.shape[0]:
             logger.error("PLE serve row spot-check: ids unavailable (n=%d)", n)
@@ -1232,25 +1234,32 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         vs = staging._staged_vocab_start
         shard_rows = staging.table.shard_rows
         row_bytes = staging.row_bytes
+        # File rows start after the shard header + meta JSON (PleStagedTable's
+        # own read path adds the same offset).
+        row_base = staging.table.data_offset
         fd = staging.table._ensure_open()
-        samples = range(0, n, max(1, n // 256))
+        # Random (seeded) slots: a fixed stride aliases with the flattened
+        # [token, head] order — ids of one head live in one vocab range, so a
+        # stride that lands on a single head checks only that head's rows.
+        rng = np.random.default_rng(0)
+        sample = rng.choice(n, size=min(n, 256), replace=False)
         bad = checked = 0
-        for k in samples:
-            local = int(ids_np[k]) - vs
-            if local < 0 or local >= shard_rows:
+        for k in sample:
+            location = int(ids_np[k]) - vs
+            if location < 0 or location >= shard_rows:
                 continue
             checked += 1
-            want = _os.pread(fd, row_bytes, local * row_bytes)
-            got = staging.buffer[k].numpy().tobytes()
+            want = _os.pread(fd, row_bytes, row_base + location * row_bytes)
+            got = staging.buffer[int(k)].numpy().tobytes()
             if want != got:
                 bad += 1
                 if bad <= 3:
                     logger.error(
                         "PLE serve ROW MISMATCH slot=%d id=%d local=%d "
                         "(buffer bytes != table bytes)",
-                        k,
+                        int(k),
                         int(ids_np[k]),
-                        local,
+                        location,
                     )
         logger.info(
             "PLE serve row spot-check: vs=%d shard_rows=%d id_min=%d id_max=%d "

@@ -675,9 +675,78 @@ host embedding `_staged_serve/_staged_ahead/_staged_ahead_hits` +
 等价、滑窗稳态、serve 保护、失配回退、多 req/verify 门控、depth=0 不动
 既有路径);ruff check/format 干净(改动文件)。
 
-待办:真机 A/B(`bench_ple_staged_ab_v100.sh` 口径 + ORACLE_MTP=1 逐位,
-depth=1/2 各测),达标后在生产 compose(8110)登记
-`SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"` 并复测。
+### 11.9.5.1 oracle 多 chunk 覆盖与 4 连跑统计(2026-11-10,4×V100 真机)
+
+§11.9.4 的验收用例均为单 chunk prompt,未触发投机路径。本步给 oracle 加
+`ORACLE_LONG_PROMPT=1`(paragraph × 700 ≈ 32.9k token,32 new token,
+≈9 个 4096 chunk、末块 partial,首块之后全部走 serve),并做 4 连跑统计:
+depth=0 与 depth=2 各 2 次,每 boot 独立重启(pinned 参考 + staged 待测臂
+同 boot 内对比)。
+
+| boot | chunk-ahead | long_prefill(pinned vs staged) |
+| --- | --- | --- |
+| stat0a | 关(control) | staged 退化:248044/248045 循环;pinned 连贯 |
+| stat0b | 关(control) | 逐位一致 |
+| stat2a | depth=2 | token 21 起分叉(均连贯,正常方差量级) |
+| stat2b | depth=2 | token 0 起分叉(均连贯) |
+
+判读(2026-11-10):
+
+1. **退化签名在 depth=0 control 上复现**,且该输出与更早两次 depth=2 boot
+   (`ple_ahead_oracle_d2` / `_trace`)的退化输出**逐位完全相同** → 同一失败
+   模式,与 chunk-ahead 无因果关联;depth=2 本批 0/2 退化。 **chunk-ahead 洗清**。
+2. 退化 boot 为 depth=0:chunk-ahead 的 serve 路径根本未进入(无
+   `_staged_ahead`、无 serve),因此"退化与 chunk-ahead 无关"是结构性
+   结论,不依赖探针。staged 的 §11.9.4 预填路径仍在本用例下生效,故
+   **行内容是否被错读尚未证实**(见下方探针缺陷),`_staged_serve`/行级
+   字节验证须在 depth>0 的复跑中取。
+3. 跨 boot 非确定本身是既有基线:4 次 pinned boot 中 3 个输出逐位相同、
+   1 个独特;所有 boot 的 logprobs 在 token 0 即不同(首 token 近并列)。
+4. 短用例(§11.9.2/§11.9.4 集合)本批 4 跑全部与 pinned 逐位一致。
+5. 退化 boot 的 MTP 签名:`spec_accept_rate=0.0`、`accept=1.03`、
+   `verify_ct=31`(每步仅 1 token,草稿全不中),正常臂为
+   `accept 2.1-2.7 / rate 0.36-0.53 / verify_ct 12-15`。退化输出本身是
+   `<|im_start|>`(248045)控制符循环,即进入自洽的错误吸引子,而非随机噪声。
+6. 退化在 staged 臂 3/6 次出现、pinned 臂 0/4 次(含更早的 d2/trace 两次);
+   样本过小,尚不能断言 staged 特有,但列为首要排查方向。
+
+**遗留问题(独立于 chunk-ahead,未结案)**:~33k token 的单 prompt 存在
+per-boot 非确定的输出吸引子(至少 3 种:两种连贯文本 + 一种退化循环),
+同一 boot 内确定性传播。候选嫌疑(均未证实):首 token 近并列 logprob
+放大、`--max-mamba-cache-size 20` 紧张下的 mamba state 复用、长序列
+split-KV/PAIR 路径的非确定性归约、staged 预填在 9 chunk 长 prompt 下的
+行错读。根因落定前,长 prompt 用例不计入本节的通过判据;A/B 与生产裁决
+以短用例集合 + gate self-check + MTP accept 为准。
+
+调试探针(均 `SGLANG_QWEN4_PLE_STAGED_PREP_DEBUG=1` 门控,默认零开销):
+`_submit_ple_chunk_ahead` 后逐 forward 打印 `pool/stash/n/serve/queued`;
+serve gather 打印 `n/sum(flat)/sum(staged)`;`_debug_spot_check_serve_rows`
+按 256 采样对 serve 缓冲逐行与 shard 文件 `pread` 做字节比对(需
+`stage_async` 记录 `_staged_vocab_start`,已加)。
+
+**探针自身缺陷(本次统计后发现并修正)**:首版 spot-check 有两处错误,
+本次统计跑出的 `mismatches=256` 是假阳性,不可作为证据——(a) 读偏移
+漏了 shard 文件头 `data_offset`,实际比对的是文件头+meta 区;(b) 固定
+步长采样与 `[token, head]` 展平顺序混叠,采样点全落在同一 head,导致
+TP1-3 `checked=0`、只可能检查到 TP0。已改为 `data_offset + local *
+row_bytes` + 固定种子随机采样;在 CPU 容器用真实 shard 文件验证:
+干净 staging → `checked=56 mismatches=0`,注入 1 字节翻转 → 捕获
+`ROW MISMATCH slot=3`。真机 depth=2 复跑取行级证据仍待做。
+
+单测本步补 2 例(36/36 通过,ruff clean):尾 chunk(partial 或恰满)因
+调度器不再记 stash 而永不 serve(即使队列投机 fill 逐位相同);已完成请求
+遗留的陈旧队列条目在新请求复用 pool slot 时于首次 consume 无害丢弃。
+
+脚本:`oracle_ple_staged_v100.sh` 加 `ORACLE_LONG_PROMPT` 用例与按 boot
+输出 `outputs_{pinned,staged}.json`;`bench_ple_staged_ab_v100.sh` 的
+服务端参数对齐 8110 生产 compose(0.90 mem fraction、KV host tier 786432
+PAIR、max-running 3、decode graphs bs 1/2/3、prefill graph 关),加
+`AHEAD_DEPTH` / `BENCH_SKIP_PINNED` / `BENCH_BASELINE_DIR` 支持 depth
+阶梯,并对 docker 端口未释放的瞬态失败重试 3 次。
+
+待办:真机 A/B(`bench_ple_staged_ab_v100.sh` 口径,depth=1/2 各测),
+达标后在生产 compose(8110)登记 `SGLANG_QWEN4_PLE_STAGED_CHUNK_AHEAD: "2"`
+并复测;长 prompt 非确定另立调查。
 
 ## 11.10 风险清单
 
