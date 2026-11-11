@@ -2690,26 +2690,58 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         def _view(**kw):
-            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+            hf = SimpleNamespace(
+                architectures=kw.pop("architectures", ["DeepseekV32ForCausalLM"]),
+                **{k: v for k, v in kw.items() if k == "learnable_sink"},
+            )
             defaults = dict(
                 kv_cache_dtype="auto",
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
+                # The Volta fp16 gate reads the resolved model dtype; a pristine
+                # server-args view has no dtype override to mirror.
+                dtype="auto",
             )
             defaults.update(kw)
             return ResolvedView(
                 SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
+        # Non-DeepSeek architectures keep the user's choice untouched.
+        self.assertEqual(
+            _dsa_kv_cache_dtype_default(_view(architectures=["LlamaForCausalLM"])), {}
+        )
+
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
             override_platform(is_xpu=False),
         ):
+            # A non-DSA deepseek variant keeps the user's choice untouched.
+            with patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
+            ):
+                self.assertEqual(_dsa_kv_cache_dtype_default(_view()), {})
+            # NPU and XPU platforms leave the kv dtype untouched (bf16 native).
+            with override_platform(is_npu=True):
+                self.assertEqual(_dsa_kv_cache_dtype_default(_view()), {})
+            with override_platform(is_xpu=True):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp16")), {}
+                )
             with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
                 # Hopper: auto -> bfloat16
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+                # A DSA backend without an explicit kv dtype warns but proceeds.
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(dsa_prefill_backend="triton")),
                     {"kv_cache_dtype": "bfloat16"},
                 )
                 # alias normalization
@@ -2730,6 +2762,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
                 )
+            with patch("torch.cuda.get_device_capability", return_value=(7, 0)):
+                # Volta fp16 pipeline (SGLANG_SM70_FORCE_FP16=1, the default):
+                # no bf16 kernels exist, so auto mirrors the model's fp16.
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "float16"},
+                )
+                # env=0 opts out of the blanket downgrade: auto -> bfloat16.
+                with envs.SGLANG_SM70_FORCE_FP16.override(False):
+                    self.assertEqual(
+                        _dsa_kv_cache_dtype_default(_view()),
+                        {"kv_cache_dtype": "bfloat16"},
+                    )
+                # Explicit fp16 is legal only under the fp16 pipeline.
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp16")), {}
+                )
+                # Learnable DSA attention sinks demand a bf16 KV cache.
+                with self.assertRaisesRegex(ValueError, "bfloat16 KV cache"):
+                    _dsa_kv_cache_dtype_default(
+                        _view(kv_cache_dtype="float16", learnable_sink=True)
+                    )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
         from sglang.srt.arg_groups.overrides import (

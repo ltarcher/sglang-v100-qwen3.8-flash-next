@@ -6,11 +6,14 @@ each drive their own GPU, which no process-global value can express — the
 device has to come from what the worker was handed.
 """
 
+import contextlib
+import sys
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -84,6 +87,19 @@ class TestFastImageProcessorDevice(CustomTestCase):
         processor = _make(base_gpu_id=3, rl_on_policy_target="fsdp")
         self.assertEqual(self._device(processor), "cpu")
 
+    def test_force_cpu_env_wins_over_everything(self):
+        """SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1: the launcher's device pool is
+        sized to the serving card, so resize/stack temporaries must land on the
+        CPU — this outranks the per-instance base_gpu_id and every platform."""
+        processor = _make(base_gpu_id=3)
+        with envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(True):
+            self.assertEqual(self._device(processor), "cpu")
+
+    def test_force_cpu_env_disabled_falls_through(self):
+        processor = _make(base_gpu_id=3)
+        with envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(False):
+            self.assertEqual(self._device(processor), "cuda:3")
+
     def test_cpu_and_xpu_platforms_win_over_base_gpu_id(self):
         processor = _make(base_gpu_id=3)
         self.assertEqual(self._device(processor, _is_cpu=True), "cpu")
@@ -97,6 +113,69 @@ class TestFastImageProcessorDevice(CustomTestCase):
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
+
+    def test_explicit_device_override_wins_over_base_gpu_id(self):
+        """SGLANG_MM_IMAGE_PROCESSOR_DEVICE pins the device process-wide."""
+        processor = _make(base_gpu_id=3)
+        with envs.SGLANG_MM_IMAGE_PROCESSOR_DEVICE.override("cuda:1"):
+            self.assertEqual(self._device(processor), "cuda:1")
+
+    @contextlib.contextmanager
+    def _on_npu(self, fake_modules):
+        with (
+            patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True),
+            patch.dict(
+                sys.modules,
+                {
+                    f"sglang.srt.hardware_backend.npu.modules.{name}": fake
+                    for name, fake in fake_modules.items()
+                },
+            ),
+        ):
+            yield
+
+    def test_npu_minimax_patches_image_and_video_processors(self):
+        """MiniMax's 10-dim patch tensors exceed the Ascend 8-dim limit."""
+        fake = MagicMock()
+        processor = _make(base_gpu_id=3)
+
+        class MiniMaxVLProcessor:
+            image_processor = object()
+            video_processor = object()
+
+        with self._on_npu({"minimax_m3_processor": fake}):
+            device = processor._fast_image_processor_device(MiniMaxVLProcessor())
+        self.assertEqual(device, "npu")
+        fake.npu_apply_minimax_m3_image_preprocess_patch.assert_called_once_with(
+            MiniMaxVLProcessor.image_processor
+        )
+        fake.npu_apply_minimax_m3_video_preprocess_patch.assert_called_once_with(
+            MiniMaxVLProcessor.video_processor
+        )
+
+    def test_npu_qwen_vl_patches_the_image_preprocessor(self):
+        fake = MagicMock()
+        processor = _make(base_gpu_id=3)
+
+        class QwenVLProcessor:
+            pass
+
+        with self._on_npu({"qwen_vl_processor": fake}):
+            device = processor._fast_image_processor_device(QwenVLProcessor())
+        self.assertEqual(device, "npu")
+        fake.npu_apply_qwen_image_preprocess_patch.assert_called_once_with()
+
+    def test_npu_glm46v_patches_the_image_preprocessor(self):
+        fake = MagicMock()
+        processor = _make(base_gpu_id=3)
+
+        class Glm46VProcessor:
+            pass
+
+        with self._on_npu({"glm46v_processor": fake}):
+            device = processor._fast_image_processor_device(Glm46VProcessor())
+        self.assertEqual(device, "npu")
+        fake.npu_apply_glm46v_image_preprocess_patch.assert_called_once_with()
 
     def test_platform_respects_cuda_compatibility(self):
         processor = _make(base_gpu_id=3)

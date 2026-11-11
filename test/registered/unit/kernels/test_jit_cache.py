@@ -13,7 +13,6 @@ import sys
 
 import msgspec
 import pytest
-
 from sglang.kernels.jit.utils.compile import cache, ninja
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -526,6 +525,37 @@ def test_relative_sources_resolve_against_csrc():
         str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh"),
     )
     assert resolve_sources(["/usr/include/stdio.h"]) == ("/usr/include/stdio.h",)
+
+
+# --------------------------------------------------------------------------
+# cache root (SGLANG_JIT_CACHE_DIR)
+# --------------------------------------------------------------------------
+
+
+_DEFAULT_ROOT = pathlib.Path("~/.cache/sglang/jit").expanduser()
+
+
+def test_cache_root_defaults_to_the_home_cache(monkeypatch):
+    """No env: the JIT cache lives under ~/.cache, surviving container recreation."""
+    monkeypatch.delenv("SGLANG_JIT_CACHE_DIR", raising=False)
+    assert cache.cache_root() == _DEFAULT_ROOT
+
+
+def test_cache_root_honors_the_env_override(monkeypatch, tmp_path):
+    """Production compose points the fourth JIT cache at the sglang-v100-jit
+    volume so the ~280s cold compile is paid once, not per recreate."""
+    monkeypatch.setenv("SGLANG_JIT_CACHE_DIR", str(tmp_path / "jit"))
+    assert cache.cache_root() == tmp_path / "jit"
+
+
+def test_cache_root_empty_env_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv("SGLANG_JIT_CACHE_DIR", "")
+    assert cache.cache_root() == _DEFAULT_ROOT
+
+
+def test_cache_root_expands_a_tilde_override(monkeypatch):
+    monkeypatch.setenv("SGLANG_JIT_CACHE_DIR", "~/somewhere/jit")
+    assert cache.cache_root() == pathlib.Path("~/somewhere/jit").expanduser()
 
 
 if __name__ == "__main__":
