@@ -338,6 +338,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
+    # free() nulls req.kv.req_pool_idx, so the slot row must be captured first.
+    slot_row = int(req.kv.req_pool_idx)
     tree_cache.req_to_token_pool.free(req)
     req.kv.mark_kv_released()
     # The slot is back in the free pool: invalidate any chunk-ahead stash
@@ -347,7 +349,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # mem_cache -> models.
     from sglang.srt.models.qwen4_exp_ple_prep import release_ple_chunk_stash
 
-    release_ple_chunk_stash(int(req.kv.req_pool_idx))
+    release_ple_chunk_stash(slot_row)
 
 
 def _release_overallocated_kv_indices(

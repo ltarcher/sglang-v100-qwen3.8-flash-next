@@ -640,6 +640,11 @@ class TestPleChunkStashRelease:
     def test_release_kv_cache_invalidates_stash(self, monkeypatch):
         # The wiring point: release_kv_cache is the single choke point where a
         # finished/aborted/retracted request returns its req pool slot.
+        # Contract mirrors ReqToTokenPool.free (memory_pool.py): the slot row
+        # lives at req.kv.req_pool_idx (ReqKvInfo) and free() sets it to None.
+        # The stash invalidation must therefore capture the slot BEFORE the
+        # pool free, or it reads None and crashes every release (13e1db78c7
+        # follow-up: int(None) TypeError).
         from sglang.srt.mem_cache import common as mem_common
 
         monkeypatch.setattr(
@@ -652,6 +657,7 @@ class TestPleChunkStashRelease:
             is_kv_released = False
             cache_protected_len = 0
             kv_allocated_len = 10
+            req_pool_idx = 77
 
             def mark_kv_released(self):
                 self.is_kv_released = True
@@ -672,11 +678,11 @@ class TestPleChunkStashRelease:
             class req_to_token_pool:
                 @staticmethod
                 def free(req):
-                    popped.append(req.req_pool_idx)
+                    popped.append(req.kv.req_pool_idx)
+                    req.kv.req_pool_idx = None
 
         req = SimpleNamespace(
             kv=FakeKV(),
-            req_pool_idx=77,
             owned_kv_len=lambda: 10,
             skip_radix_cache_insert=True,
             rid="fake",
