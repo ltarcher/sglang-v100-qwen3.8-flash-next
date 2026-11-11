@@ -1027,14 +1027,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             device_indices = self._empty_match_result.device_indices
         if _unified_radix_debug():
+            # Poison hunt: page-id level evidence. ids_head exposes the actual
+            # served page ids; ids_sum is a cheap order-insensitive fingerprint
+            # for overlap checks against insert/evict logs.
+            if len(device_indices) > 0:
+                ids_head = device_indices[:8].tolist()
+                ids_sum = int(device_indices.sum().item())
+            else:
+                ids_head, ids_sum = [], 0
             logger.info(
                 "[radix-dbg] match done req_key_len=%d full_kv_hit=%d best_len=%d "
-                "serve=%d value_chunks=%s",
+                "serve=%d value_chunks=%s ids_head=%s ids_sum=%d",
                 len(params.key) if params.key is not None else -1,
                 full_kv_hit_length,
                 best_match_device_value_len,
                 len(device_indices),
                 [len(v) for v in value],
+                ids_head,
+                ids_sum,
             )
         result = MatchResult(
             device_indices=device_indices,
@@ -1526,6 +1536,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # on a root path carrying the same base.
         new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+        if _unified_radix_debug():
+            # Poison hunt: page ids stored into the tree by this insert.
+            logger.info(
+                "[radix-dbg] insert new_node key_len=%d ids_head=%s ids_sum=%d",
+                len(key),
+                value[:8].tolist(),
+                int(value.sum().item()),
+            )
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage or self.enable_external_cache_linker:

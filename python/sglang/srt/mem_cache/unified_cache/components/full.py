@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import logging
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
         NodeId,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class FullComponent(TreeComponent):
@@ -178,6 +182,18 @@ class FullComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
+            from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+                _unified_radix_debug,
+            )
+
+            if _unified_radix_debug():
+                # Poison hunt: page ids released back to the allocator.
+                logger.info(
+                    "[radix-dbg] evict free key_len=%d ids_head=%s ids_sum=%d",
+                    len(node.key),
+                    cd.value[:8].tolist(),
+                    int(cd.value.sum().item()),
+                )
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
