@@ -252,6 +252,8 @@ class _GuardSentinelBackend:
     """Stub backend whose ``req_to_token`` access proves the mixed-batch
     guard let a batch through to the grouped planner."""
 
+    _kv_host_tier = None
+
     @property
     def req_to_token(self):
         raise AssertionError("grouped-prefill guard must not block this batch")
@@ -458,3 +460,75 @@ class TestMixedTailPrefixAlignmentAssert:
             mix_tails=torch.tensor([True, True]),
         )
         assert plan is not None
+
+
+def _tier3_phase3(monkeypatch, phase3):
+    tier = _RecordingTier(phase3=phase3)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (7, 0))
+    return tier
+
+
+def test_fused_sm70_prefill_gate_rejects_kv_tier_phase3(monkeypatch):
+    # Phase3 remaps device rows (mod-picked slots; PAIR halves them again),
+    # so a prefill kernel that indexes the pool through the LOGICAL
+    # req_to_token table reads the wrong physical rows. The direct-read
+    # fused single-request route must decline and fall through to the
+    # tier-aware row-by-row gather.
+    _tier3_phase3(monkeypatch, phase3=False)
+    q = _FakeTensor((100, 6, 256), torch.float16)
+    k = _FakeTensor((4096, 1, 256), torch.float8_e5m2)
+    v = _FakeTensor((4096, 1, 256), torch.float8_e5m2)
+    topk = torch.zeros(100, 64, dtype=torch.int32)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.zeros(1, dtype=torch.int64),
+        seq_lens=torch.tensor([1000]),
+    )
+    assert QwenSparseAttnBackend._can_use_sm70_sparse_prefill(q, k, v, batch, topk)
+    assert not QwenSparseAttnBackend._can_use_sm70_sparse_prefill(
+        q, k, v, batch, topk, kv_tier_phase3=True
+    )
+
+
+def test_batched_sm70_prefill_plan_rejects_kv_tier_phase3(monkeypatch):
+    # Same contract for the multi-request per-sequence chunk-prefill plan.
+    _tier3_phase3(monkeypatch, phase3=False)
+    q = _FakeTensor((100, 6, 256), torch.float16)
+    k = _FakeTensor((4096, 1, 256), torch.float8_e5m2)
+    v = _FakeTensor((4096, 1, 256), torch.float8_e5m2)
+    topk = torch.zeros(100, 64, dtype=torch.int32)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.zeros(2, dtype=torch.int64),
+        seq_lens=torch.tensor([1000, 1000]),
+        extend_seq_lens_cpu=[50, 50],
+    )
+    plan = QwenSparseAttnBackend._plan_sm70_sparse_prefill_batched(q, k, v, batch, topk)
+    assert plan == [(0, 0, 50), (1, 50, 100)]
+    assert (
+        QwenSparseAttnBackend._plan_sm70_sparse_prefill_batched(
+            q, k, v, batch, topk, kv_tier_phase3=True
+        )
+        is None
+    )
+
+
+def test_grouped_prefill_guard_blocks_kv_tier_phase3(monkeypatch):
+    # L2-b declared the grouped-prefill route reopenable, but the grouped
+    # planner also resolves slots through the logical req_to_token table:
+    # under phase3 it would corrupt every prefixed chunk (device rows are
+    # mod-remapped, PAIR halves them). The tier guard must precede the
+    # planner like the mixed-batch guard does.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (7, 0))
+    tier = _RecordingTier(phase3=True)
+    backend = _GuardSentinelBackend()
+    backend._kv_host_tier = tier
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        _original_forward_mode=None,
+    )
+    q, k, v, topk, cu, scale = _eligible_grouped_prefill_args()
+    result = QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
+        backend, q, k, v, forward_batch, topk, cu, scale
+    )
+    assert result is None

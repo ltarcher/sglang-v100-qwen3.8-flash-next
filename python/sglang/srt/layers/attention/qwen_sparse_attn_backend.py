@@ -2079,7 +2079,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        if self._can_use_sm70_sparse_prefill(
+        # KV host tier phase3 remaps device rows (slots are picked by modulo
+        # and PAIR halves the per-rank pool), so a kernel that resolves slots
+        # through the LOGICAL req_to_token table reads the wrong physical
+        # rows -- or runs off the pool. The decode side got the same
+        # treatment (sparse decode switches to phys_token_slot_table under
+        # tier3); route these batches to the tier-aware gather below.
+        _tier = self._kv_host_tier
+        tier3 = _tier is not None and _tier.phase3
+        if not tier3 and self._can_use_sm70_sparse_prefill(
             q, k_buffer, v_buffer, forward_batch, topk_indices
         ):
             from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
@@ -2103,8 +2111,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer.scaling,
             )
             return self._pad_extend_output(output, num_output_rows)
-        batched_plan = self._plan_sm70_sparse_prefill_batched(
-            q, k_buffer, v_buffer, forward_batch, topk_indices
+        batched_plan = (
+            None
+            if tier3
+            else self._plan_sm70_sparse_prefill_batched(
+                q, k_buffer, v_buffer, forward_batch, topk_indices
+            )
         )
         if batched_plan is not None:
             from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
@@ -2134,7 +2146,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
             return self._pad_extend_output(output, num_output_rows)
-        if envs.SGLANG_SM70_QSA_GROUPED_PREFILL.get():
+        if not tier3 and envs.SGLANG_SM70_QSA_GROUPED_PREFILL.get():
             grouped = self._forward_sm70_grouped_sparse_prefill(
                 q,
                 k_buffer,
@@ -2150,8 +2162,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
-        _tier = self._kv_host_tier
-        if _tier is not None and _tier.phase3:
+        if tier3:
             # Phase 3: the prefix spans more logical pages than the device
             # pool holds, so gather row-by-row from the device slot or the
             # pinned host mirror (tag decides) instead of index_select over
@@ -2369,7 +2380,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _plan_sm70_sparse_prefill_batched(
-        q, k_buffer, v_buffer, forward_batch, topk_indices
+        q, k_buffer, v_buffer, forward_batch, topk_indices, *, kv_tier_phase3=False
     ):
         """Per-sequence sm70 chunk-prefill plan for multi-request chunks.
 
@@ -2378,7 +2389,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         over its packed row range (cu_seqlens_q order) instead of falling
         back to the materializing gather path. Returns a list of
         (seq_id, row_start, row_end) or None when ineligible.
+
+        ``kv_tier_phase3``: the KV host tier's phase3 remaps device rows, so
+        the plan's logical ``req_to_token`` addressing would read the wrong
+        physical rows -- decline and let the tier-aware gather handle it.
         """
+        if kv_tier_phase3:
+            return None
         batch = forward_batch.req_pool_indices.numel()
         if not (
             forward_batch.forward_mode.is_extend()
@@ -2417,10 +2434,14 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _can_use_sm70_sparse_prefill(
-        q, k_buffer, v_buffer, forward_batch, topk_indices
+        q, k_buffer, v_buffer, forward_batch, topk_indices, *, kv_tier_phase3=False
     ) -> bool:
+        # ``kv_tier_phase3``: logical req_to_token slots do not address the
+        # phase3 device pool (mod-remapped rows, PAIR-halved per rank) -- the
+        # direct-read kernel must fall through to the tier-aware gather.
         return (
-            forward_batch.forward_mode.is_extend()
+            not kv_tier_phase3
+            and forward_batch.forward_mode.is_extend()
             and q.is_cuda
             and torch.cuda.get_device_capability(q.device) == (7, 0)
             and q.dtype == torch.float16
@@ -2469,6 +2490,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.forward_mode == ForwardMode.MIXED
             or forward_batch._original_forward_mode == ForwardMode.MIXED
         ):
+            return None
+        # KV host tier phase3 remaps device rows (mod-picked slots, PAIR
+        # halves the per-rank pool); the grouped planner resolves slots
+        # through the logical req_to_token table and would corrupt every
+        # prefixed chunk. Same guard the mixed-batch check above uses the
+        # method body for: keep it here so future callers cannot bypass the
+        # forward_extend call-site check.
+        _tier = self._kv_host_tier
+        if _tier is not None and _tier.phase3:
             return None
         R = q.shape[0]
         if not (
