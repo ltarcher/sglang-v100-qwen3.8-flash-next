@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_device_sm, is_host_cpu_arm64
+from sglang.srt.utils.common import is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,9 @@ def handle_xpu_backends(server_args: Any):
 def handle_sm70_backends(server_args: Any):
     # V100 (sm70) serves on SGLang's packaged TileLang attention kernels; no
     # separately installed FlashAttention-V100 extension is required.
-    if not get_platform().is_cuda or get_device_sm() != 70:
+    # The SM comes from the platform context, not the raw probe, so
+    # override_platform (tests, simulated hosts) governs every reader alike.
+    if not get_platform().is_cuda or get_platform().device_sm != 70:
         return
     cfg = resolving_view(server_args)
     if cfg.attention_backend is None:

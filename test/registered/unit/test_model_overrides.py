@@ -794,14 +794,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # Golden resolution must be host-independent: accelerator-less CI
         # runners resolve only the base platform, where get_device() raises.
         server_kwargs.setdefault("device", "cuda")
-        config = dict(self._MINI_CONFIG, architectures=[arch], model_type=model_type)
-        config.update(config_extra or {})
-        config_dir = tempfile.mkdtemp(prefix="golden_override_")
-        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
-        with open(os.path.join(config_dir, "config.json"), "w") as f:
-            json.dump(config, f)
-        server_args = ServerArgs(model_path=config_dir, **server_kwargs)
-        server_args.resolve_once()
+        # Same contract on GPU hosts: this fork's target machine is SM70, where
+        # _handle_sm70_backends auto-selects 'tilelang_fa_v100', which upstream
+        # whitelists (deterministic inference, GptOss) reject. Tests that
+        # describe other machines must not inherit it; SM70 scenarios are
+        # declared explicitly at callable level (e.g.
+        # test_deepseek_v41_sm70_overrides).
+        with override_platform(is_sm70=False, device_sm=80):
+            config = dict(
+                self._MINI_CONFIG, architectures=[arch], model_type=model_type
+            )
+            config.update(config_extra or {})
+            config_dir = tempfile.mkdtemp(prefix="golden_override_")
+            self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+            with open(os.path.join(config_dir, "config.json"), "w") as f:
+                json.dump(config, f)
+            server_args = ServerArgs(model_path=config_dir, **server_kwargs)
+            server_args.resolve_once()
         return server_args
 
     def _publish(self, server_args):
@@ -917,7 +926,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with override_platform(is_cuda=True):
             for kwargs, expected in (
                 ({}, True),
-                ({"dtype": "float16"}, False),
+                # SM70 fork extension: the model runs fp16 there (no bf16 on
+                # Volta), so the PLE n-gram table must offload for fp16 too.
+                ({"dtype": "float16"}, True),
                 ({"ple_offload_embedding": False}, False),
                 ({"ple_offload_embedding": False, "cpu_offload_gb": 1}, False),
             ):
@@ -2053,14 +2064,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
-        # V4.1 leaves the ratio unset (cap-mode SWA sizing).
+        # V4.1 leaves the ratio unset (cap-mode SWA sizing). Non-SM70 scenario:
+        # the SM70 path declares the ratio unconditionally; that behavior is
+        # covered by test_deepseek_v41_sm70_overrides.
         hf41 = SimpleNamespace(
             architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v41"
         )
-        self.assertNotIn(
-            "swa_full_tokens_ratio",
-            _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf41),
-        )
+        with override_platform(is_sm70=False):
+            self.assertNotIn(
+                "swa_full_tokens_ratio",
+                _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf41),
+            )
         # An explicit user choice takes precedence over the model default.
         self.assertNotIn(
             "moe_runner_backend",
