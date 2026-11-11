@@ -47,6 +47,13 @@ degeneration. Logged as `short_stop_waived`.
 - Production caps `--max-running-requests 3`; keep `--concurrency` <= 3.
   LongBench 32k-token prompts against `--max-total-tokens 786432`: run
   LongBench phases serially (`--concurrency 1`, the default).
+- **Flush the radix cache before every run**:
+  `curl -X POST $BASE/flush_cache`. A single 32k-token request poisons
+  the Unified Radix Cache (mamba extra_buffer): afterwards every greedy
+  short-prompt answer degrades silently (gsm8k 0.969 -> 0.34, '!' floods),
+  with textually coherent output. `flush_cache` restores accuracy
+  immediately; evidence in `results/poison_evidence/`. This is an engine
+  bug under investigation — the bench reports it, it does not cause it.
 
 ### Datasets (outside the repo, downloaded once)
 

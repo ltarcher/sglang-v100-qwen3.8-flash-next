@@ -1,0 +1,38 @@
+{
+ "date": "2026-11-11",
+ "server": "chunk-ahead image, container sglang-v100-qwen38-8110",
+ "flags": {
+  "chunked_prefill_size": 4096,
+  "mamba_radix_cache_strategy": "extra_buffer",
+  "max_total_tokens": 786432,
+  "speculative": "EAGLE steps3 topk1 draft4"
+ },
+ "experiments": [
+  {
+   "name": "AB empty vs warm",
+   "empty": "30/32 93.8% floods=1",
+   "warm": "11/32 34.4% floods=15"
+  },
+  {
+   "name": "control no row",
+   "result": "10-12/12 both"
+  },
+  {
+   "name": "post flush heal",
+   "result": "26/32 81.2% floods=5 (flush insufficient)"
+  },
+  {
+   "name": "cache_salt isolate",
+   "result": "26/32 81.2% floods=0 (tree-merge feeds flood signature; residual remains)"
+  },
+  {
+   "name": "decode sweep",
+   "result": "8/16/32/64/96 clean; 128 poisoned early-session, 5/5 clean late-session (nondeterministic)"
+  },
+  {
+   "name": "length sweep",
+   "result": "8k-28k clean, 28672/29696 clean, 31735 borderline-nondeterministic"
+  }
+ ],
+ "baseline_gsm8k": "30-31/32 greedy, 5-shot, chat-wrapped thinking-off"
+}
