@@ -1197,9 +1197,16 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # a wild data_ptr dereference (n > max_rows), and the prep-side
             # bit-exact id match cannot catch it (both its sides are
             # local-width) — refuse to serve (review M5, 2026-11-10).
-            staged_w = (
-                staging._staged_ids.numel() if staging._staged_ids is not None else -1
-            )
+            staged = staging._staged_ids
+            # Production _staged_ids is a numpy array (PleRowStaging
+            # _to_ids_np); numel() is torch-only and raised AttributeError on
+            # the first real serve gather (2026-11-11 SIGQUIT).
+            if staged is None:
+                staged_w = -1
+            elif isinstance(staged, torch.Tensor):
+                staged_w = int(staged.numel())
+            else:
+                staged_w = int(staged.size)
             if n != staged_w:
                 raise RuntimeError(
                     "PLE chunk-ahead serve width mismatch: this forward has "

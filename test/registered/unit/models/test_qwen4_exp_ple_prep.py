@@ -1050,8 +1050,11 @@ class TestGatherStagedServeWidthGuard:
     def _make_serve(staged_ids):
         from types import SimpleNamespace
 
+        # Production _staged_ids is ALWAYS a numpy array (PleRowStaging
+        # _to_ids_np); a torch stub hides dtype-dependent bugs in the guard
+        # itself (crash: numpy has no .numel — 2026-11-11 production SIGQUIT).
         return SimpleNamespace(
-            _staged_ids=torch.tensor(staged_ids, dtype=torch.long),
+            _staged_ids=np.asarray(staged_ids, dtype=np.int64),
             buffer=SimpleNamespace(data_ptr=lambda: 0),
             slot_arange=lambda device: torch.arange(8, device=device, dtype=torch.long),
         )
