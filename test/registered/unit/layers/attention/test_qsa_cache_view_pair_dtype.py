@@ -78,6 +78,100 @@ class TestQsaCacheViewPeerDtype(CustomTestCase):
         view = decode_cuda._qsa_cache_view(cache)
         self.assertEqual(view.dtype, torch.float16)
 
+    def test_local_e4m3_tensor_viewed_as_uint8(self):
+        # E4M3 is also a one-byte-per-element pool and the op only accepts
+        # byte or half caches; it must reach the op through the same uint8
+        # byte view as E5M2 (with the dequant LUT supplied separately).
+        cache = torch.zeros(4, dtype=torch.float8_e4m3fn)
+        view = decode_cuda._qsa_cache_view(cache)
+        self.assertEqual(view.dtype, torch.uint8)
+        self.assertEqual(view.numel(), 4)
+
+    def test_peer_e4m3_wrapped_as_uint8_byte_view(self):
+        ext, _ = self._view(torch.float8_e4m3fn, like=torch.zeros(4, 16))
+        ((ptr, shape, dtype),) = ext.calls
+        self.assertEqual(dtype, torch.uint8)
+        self.assertEqual(shape, [4, 16])
+        self.assertEqual(ptr, 0x1234)
+
+
+class TestQsaFp8Lut(CustomTestCase):
+    def test_e4m3_builds_256_entry_fp16_table(self):
+        lut = decode_cuda._qsa_fp8_lut(torch.float8_e4m3fn)
+        self.assertEqual(lut.dtype, torch.float16)
+        self.assertEqual(lut.numel(), 256)
+        # 0x38: sign 0, exp 0111 (bias 7), man 000 -> 1.0.
+        self.assertEqual(lut[0x38].item(), 1.0)
+        # 0xBC: sign 1, exp 0111, man 100 -> -1.5.
+        self.assertEqual(lut[0xBC].item(), -1.5)
+        # 0x7E: exp 1111, man 110 -> 2**8 * 1.75 = 448 (e4m3 max normal).
+        self.assertEqual(lut[0x7E].item(), 448.0)
+        self.assertEqual(lut[0x00].item(), 0.0)
+        # 0x7F is the E4M3 NaN pattern.
+        self.assertTrue(lut[0x7F].isnan())
+
+    def test_e5m2_and_fp16_need_no_lut(self):
+        # E5M2 shares the FP16 exponent layout, so the kernel keeps its
+        # built-in bit-shift conversion when the LUT pointer is null; FP16
+        # pools are never byte-dequantized at all.
+        self.assertIsNone(decode_cuda._qsa_fp8_lut(torch.float8_e5m2))
+        self.assertIsNone(decode_cuda._qsa_fp8_lut(torch.float16))
+
+
+class _RecordingPrefillExt:
+    def __init__(self):
+        self.lut = "not-called"
+        self.kv_dtype = None
+
+    def sm70_qsa_prefill(
+        self, q, k, v, req_to_token, req_indices, indices, seq_lens, scale, lut, out
+    ):
+        self.lut = lut
+        self.kv_dtype = k.dtype
+        out.fill_(0)
+        return out
+
+
+class TestQsaPrefillLutWiring(CustomTestCase):
+    """The prefill wrapper must hand the op a dequant LUT for E4M3 pools.
+
+    Regression (ff52c061e8 audit, P1): the SM70 gates admitted
+    ``float8_e4m3fn`` pools while the wrapper passed ``lut=None``, so every
+    byte went through the kernel's E5M2 bit-shift path and prefill silently
+    dequantized wrong (decode, by contrast, TORCH_CHECK-failed on the raw
+    float8 dtype -- loudly).
+    """
+
+    def _run(self, kv_dtype):
+        ext = _RecordingPrefillExt()
+        q = torch.zeros(2, 6, 256, dtype=torch.float16)
+        k = torch.zeros(16, 1, 256, dtype=kv_dtype)
+        v = torch.zeros(16, 1, 256, dtype=kv_dtype)
+        with mock.patch.object(decode_cuda, "_load_sm70_cuda_decode_ops", lambda: ext):
+            out = decode_cuda.sm70_cuda_qsa_prefill(
+                q,
+                k,
+                v,
+                torch.zeros(1, 16, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(2, 4, dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                0.0625,
+            )
+        return ext, out
+
+    def test_e4m3_pool_passes_dequant_lut(self):
+        ext, _ = self._run(torch.float8_e4m3fn)
+        self.assertEqual(ext.kv_dtype, torch.uint8)
+        self.assertEqual(ext.lut.dtype, torch.float16)
+        self.assertEqual(ext.lut.numel(), 256)
+        self.assertEqual(ext.lut[0x38].item(), 1.0)
+
+    def test_e5m2_pool_passes_no_lut(self):
+        ext, _ = self._run(torch.float8_e5m2)
+        self.assertEqual(ext.kv_dtype, torch.uint8)
+        self.assertIsNone(ext.lut)
+
 
 if __name__ == "__main__":
     import unittest

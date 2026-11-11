@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-from pathlib import Path
 
 import torch
 from sglang.kernels.sm70_paths import sm70_csrc
@@ -138,6 +137,26 @@ def sm70_cuda_decode_partial(
     return partial_o, partial_lse
 
 
+def _qsa_fp8_lut(cache_dtype, device=None):
+    """256-entry fp16 dequant LUT for byte KV caches, or None if unneeded.
+
+    The kernel dequantizes E4M3 bytes through this table (no bit layout
+    shared with FP16) and E5M2 bytes through its built-in bit-shift
+    conversion when the LUT pointer is null. Review P1 of merge
+    ff52c061e8: the SM70 gates admitted ``float8_e4m3fn`` pools while the
+    wrappers passed ``lut=None``, so an E4M3 pool silently went through the
+    E5M2 shift path in prefill (and decode TORCH_CHECK-failed on the raw
+    float8 dtype). Keep this the single source of the gate/arg consistency.
+    """
+    if cache_dtype == torch.float8_e4m3fn:
+        return (
+            torch.arange(256, dtype=torch.uint8, device=device)
+            .view(torch.float8_e4m3fn)
+            .to(torch.float16)
+        )
+    return None
+
+
 def sm70_cuda_qsa_prefill(
     q,
     k_cache,
@@ -148,7 +167,7 @@ def sm70_cuda_qsa_prefill(
     seq_lens,
     softmax_scale,
 ):
-    """Run exact-shape QSA chunk-prefill directly from the E5M2 cache."""
+    """Run exact-shape QSA chunk-prefill directly from the E5M2/E4M3 cache."""
     ext = _load_sm70_cuda_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 CUDA QSA prefill extension is unavailable.")
@@ -162,7 +181,7 @@ def sm70_cuda_qsa_prefill(
         indices.to(dtype=torch.int32).contiguous(),
         seq_lens.to(dtype=torch.int32).contiguous(),
         float(softmax_scale),
-        None,
+        _qsa_fp8_lut(k_cache.dtype, k_cache.device),
         output,
     )
     return output
@@ -186,9 +205,13 @@ def _qsa_cache_view(cache: torch.Tensor, like: torch.Tensor = None) -> torch.Ten
         # an E5M2 pool through its uint8 byte view (one byte per element), an
         # FP16 pool as half. Passing the raw float8 dtype through would hand
         # the op a tensor it cannot read as bytes.
-        dtype = torch.uint8 if cache.dtype == torch.float8_e5m2 else cache.dtype
+        dtype = (
+            torch.uint8
+            if cache.dtype in (torch.float8_e5m2, torch.float8_e4m3fn)
+            else cache.dtype
+        )
         return ext.sm70_as_tensor(cache.data_ptr(), shape, dtype)
-    if cache.dtype == torch.float8_e5m2:
+    if cache.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
         return cache.view(torch.uint8).contiguous()
     return cache.contiguous()
 
@@ -204,7 +227,7 @@ def sm70_cuda_qsa_decode(
     softmax_scale,
     peer_kv=None,
 ):
-    """Run QSA split-KV decode directly from selected E5M2 or FP16 cache rows.
+    """Run QSA split-KV decode directly from selected E5M2/E4M3 or FP16 cache rows.
 
     ``peer_kv`` = ``(peer_k, peer_v)`` enables the pair-split read path: the
     table carries owner-bit entries (``kv_host_tier.map_slot_table``) and
@@ -247,7 +270,7 @@ def sm70_cuda_qsa_decode(
         max_splits,
         QSA_DECODE_TOKENS_PER_SPLIT,
         float(softmax_scale),
-        None,
+        _qsa_fp8_lut(k_cache.dtype, q.device),
         partial_o,
         partial_lse,
     )
