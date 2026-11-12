@@ -1,0 +1,42 @@
+=== conc=2 L=1024 ===
+Successful requests:                     4         
+Benchmark duration (s):                  11.75     
+Input token throughput (tok/s):          348.69    
+Output token throughput (tok/s):         87.17     
+Median TTFT (ms):                        678.19    
+Median TPOT (ms):                        19.16     
+=== conc=2 L=4096 ===
+Successful requests:                     4         
+Benchmark duration (s):                  41.49     
+Input token throughput (tok/s):          394.85    
+Output token throughput (tok/s):         24.68     
+Median TTFT (ms):                        13427.19  
+Median TPOT (ms):                        27.30     
+=== conc=2 L=8192 ===
+Successful requests:                     4         
+Benchmark duration (s):                  23.89     
+Input token throughput (tok/s):          1371.85   
+Output token throughput (tok/s):         42.87     
+Median TTFT (ms):                        4362.20   
+Median TPOT (ms):                        28.40     
+=== conc=2 L=16384 ===
+Successful requests:                     4         
+Benchmark duration (s):                  35.96     
+Input token throughput (tok/s):          1822.61   
+Output token throughput (tok/s):         28.48     
+Median TTFT (ms):                        7525.59   
+Median TPOT (ms):                        34.92     
+=== conc=2 L=32768 ===
+Successful requests:                     4         
+Benchmark duration (s):                  64.42     
+Input token throughput (tok/s):          2034.79   
+Output token throughput (tok/s):         15.90     
+Median TTFT (ms):                        20238.66  
+Median TPOT (ms):                        46.70     
+=== conc=2 L=65536 ===
+Successful requests:                     4         
+Benchmark duration (s):                  122.70    
+Input token throughput (tok/s):          2136.54   
+Output token throughput (tok/s):         8.35      
+Median TTFT (ms):                        28889.44  
+Median TPOT (ms):                        73.60     

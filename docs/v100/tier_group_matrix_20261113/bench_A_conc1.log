@@ -1,0 +1,42 @@
+=== conc=1 L=1024 ===
+Successful requests:                     2         
+Benchmark duration (s):                  6.79      
+Input token throughput (tok/s):          301.75    
+Output token throughput (tok/s):         75.44     
+Median TTFT (ms):                        381.20    
+Median TPOT (ms):                        11.74     
+=== conc=1 L=4096 ===
+Successful requests:                     2         
+Benchmark duration (s):                  8.78      
+Input token throughput (tok/s):          932.82    
+Output token throughput (tok/s):         58.30     
+Median TTFT (ms):                        1467.68   
+Median TPOT (ms):                        11.36     
+=== conc=1 L=8192 ===
+Successful requests:                     2         
+Benchmark duration (s):                  12.27     
+Input token throughput (tok/s):          1335.53   
+Output token throughput (tok/s):         41.74     
+Median TTFT (ms):                        3093.33   
+Median TPOT (ms):                        11.84     
+=== conc=1 L=16384 ===
+Successful requests:                     2         
+Benchmark duration (s):                  20.81     
+Input token throughput (tok/s):          1574.61   
+Output token throughput (tok/s):         24.60     
+Median TTFT (ms):                        6436.02   
+Median TPOT (ms):                        15.49     
+=== conc=1 L=32768 ===
+Successful requests:                     2         
+Benchmark duration (s):                  32.70     
+Input token throughput (tok/s):          2004.21   
+Output token throughput (tok/s):         15.66     
+Median TTFT (ms):                        13588.87  
+Median TPOT (ms):                        10.73     
+=== conc=1 L=65536 ===
+Successful requests:                     2         
+Benchmark duration (s):                  62.98     
+Input token throughput (tok/s):          2081.29   
+Output token throughput (tok/s):         8.13      
+Median TTFT (ms):                        28310.31  
+Median TPOT (ms):                        12.37     

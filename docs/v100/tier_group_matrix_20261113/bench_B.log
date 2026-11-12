@@ -1,0 +1,58 @@
+=== JIT warmup (discard) ===
+Benchmark duration (s):                  5.68      
+=== B conc=1 L=1024 ===
+Benchmark duration (s):                  6.81      
+Output token throughput (tok/s):         75.17     
+Median TTFT (ms):                        385.14    
+Median TPOT (ms):                        11.75     
+=== B conc=1 L=4096 ===
+Benchmark duration (s):                  8.99      
+Output token throughput (tok/s):         56.98     
+Median TTFT (ms):                        1502.53   
+Median TPOT (ms):                        11.64     
+=== B conc=1 L=8192 ===
+Benchmark duration (s):                  11.87     
+Output token throughput (tok/s):         43.13     
+Median TTFT (ms):                        2889.82   
+Median TPOT (ms):                        11.85     
+=== B conc=1 L=16384 ===
+Benchmark duration (s):                  17.30     
+Output token throughput (tok/s):         29.59     
+Median TTFT (ms):                        5865.61   
+Median TPOT (ms):                        10.82     
+=== B conc=1 L=32768 ===
+Benchmark duration (s):                  29.85     
+Output token throughput (tok/s):         17.15     
+Median TTFT (ms):                        12357.36  
+Median TPOT (ms):                        9.98      
+=== B conc=1 L=65536 ===
+Benchmark duration (s):                  59.32     
+Output token throughput (tok/s):         8.63      
+Median TTFT (ms):                        26622.13  
+Median TPOT (ms):                        11.83     
+=== B conc=2 L=1024 ===
+Benchmark duration (s):                  11.44     
+Output token throughput (tok/s):         89.48     
+Median TTFT (ms):                        564.66    
+Median TPOT (ms):                        18.96     
+=== B conc=2 L=4096 ===
+Benchmark duration (s):                  16.18     
+Output token throughput (tok/s):         63.28     
+Median TTFT (ms):                        2379.54   
+Median TPOT (ms):                        22.18     
+=== B conc=2 L=8192 ===
+Benchmark duration (s):                  23.05     
+Output token throughput (tok/s):         44.42     
+Median TTFT (ms):                        3976.64   
+Median TPOT (ms):                        26.36     
+=== B conc=2 L=16384 ===
+Benchmark duration (s):                  33.22     
+Output token throughput (tok/s):         30.82     
+Median TTFT (ms):                        6873.40   
+Median TPOT (ms):                        30.83     
+=== B conc=2 L=32768 ===
+Benchmark duration (s):                  58.47     
+Output token throughput (tok/s):         17.51     
+Median TTFT (ms):                        18404.75  
+Median TPOT (ms):                        41.37     
+=== B conc=2 L=65536 ===
