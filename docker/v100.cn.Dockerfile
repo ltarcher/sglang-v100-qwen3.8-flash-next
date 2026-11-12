@@ -42,6 +42,10 @@ ENV CUDA_HOME=/usr/local/cuda \
 # Swap the Ubuntu archives for the mirror before the first apt-get call. http
 # is deliberate: TLS trust is only guaranteed once ca-certificates (installed
 # in this same RUN) is present.
+#
+# libssl-dev: the HiCache native hash JIT extension (hicache_hash_cpp links
+# -lcrypto) needs openssl headers at runtime; without them prefix-cache KV
+# events fail to load and radix inserts raise.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     for sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do \
@@ -53,7 +57,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         "$sources"; \
     done \
     && apt-get update && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates cmake curl ffmpeg git g++-12 libnuma-dev \
+      build-essential ca-certificates cmake curl ffmpeg git g++-12 \
+      libnuma-dev libssl-dev \
       ninja-build patch pkg-config protobuf-compiler python3.12 python3.12-dev \
       python3-pip python3-venv \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \

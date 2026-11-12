@@ -41,8 +41,8 @@ fi
 log "Installing host compiler and CUDA 12.8 prerequisites"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" apt-get install -y \
-  build-essential ca-certificates cmake curl git g++-12 g++-14 libnuma-dev \
-  ninja-build pkg-config wget
+  build-essential ca-certificates cmake curl git g++-12 g++-14 \
+  libnuma-dev libssl-dev ninja-build pkg-config wget
 
 # SGLang's Rust extensions use edition 2024 (rustc 1.85+); distro cargo is often
 # older, so fall back to a user-local rustup toolchain.

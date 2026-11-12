@@ -17,10 +17,14 @@ ENV CUDA_HOME=/usr/local/cuda \
     PATH=/opt/venv/bin:/root/.cargo/bin:/usr/local/cuda/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
+# libssl-dev: the HiCache native hash JIT extension (hicache_hash_cpp links
+# -lcrypto) needs openssl headers at runtime; without them prefix-cache KV
+# events fail to load and radix inserts raise.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates cmake curl ffmpeg git g++-12 g++-14 libnuma-dev \
+      build-essential ca-certificates cmake curl ffmpeg git g++-12 g++-14 \
+      libnuma-dev libssl-dev \
       ninja-build patch pkg-config protobuf-compiler python3.12 python3.12-dev \
       python3-pip python3-venv \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
