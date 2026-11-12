@@ -146,6 +146,9 @@ GLM 线:分组被 smem 判死、planner 被 round-2 判死 → 本立项书范�
 > 实现 = `_kernels_grouped_sparse_prefill.py`(TileLang 分组核 + sort-based
 > GPU planner)+ `qwen_sparse_attn_backend.py` 接线(batched_plan 之后、
 > packed gather 之前,ineligible 时原路 fall through)。
+> (2026-11-12 注:KV tier phase3 门控已按 PAIR 感知定界重开——planner 经
+> tier 物理表寻址、内核双指针读对家,详见 §8.3;非 PAIR phase3 仍走
+> tier-aware gather。)
 >
 > **与原工程项的三处偏差(均有 A/B 证据)**:
 > 1. **并集索引直读池,不做稠密 panel 物理化**:V1g 间接读 5.88-6.32ms vs
@@ -738,3 +741,92 @@ WorkBuddy 鹈鹕骑自行车任务连续三次 21-24 分钟(健康基线 2-4 分
 可选定案实验(未执行,不阻塞):再切 ON 重跑同 prompt 一次,复现螺旋即
 因果完全闭环。如未来要找回该收益,正确路径是 §8.1 遗留②的确定性治理
 (内核选择固定/batch-invariant)先行,而非直接开 flag。
+
+### 8.3 质量问题解决与路线 B 落地:tier 感知 grouped 重启(2026-11-12)
+
+§8.2 的 agentic 质量问题于 2026-11-12 解决(用户裁定;§8.2 #4 的可选定案
+实验不再需要)。生产要拿回 grouped 的 +13~18% prefill,但 b8bf957f76 的
+phase3 门控(11-11)在 tier 开启时 blanket 阻断了 grouped——planner 直读
+逻辑 `req_to_token`,而 phase3 设备行已 mod-remap。选定**路线 B:PAIR 感知
+planner**(而非绕过门控或仅改 env):
+
+- planner `build_grouped_union_plan` 新增 `slot_table`(tier 的
+  `map_slot_table` batch-local 物理表)+ `owner_mask`:slot 解析改查物理表,
+  PAIR 条目的 owner 位(bit 30)拆出,低 30 位仍是两 rank 池一致的 token 行;
+- TileLang 内核加 KPeer/VPeer/Owner 双指针:4 处池加载点按 Owner 字节在
+  本地池与对家 imported buffer 间选基指针(镜像 decode 侧
+  `sm70_cuda_qsa_decode` peer_kv 先例,docs/v100/KV_HOST_TIER_DESIGN.md
+  §6.1 v2);Owner 数据驱动、非编译期参数,不新增 JIT 变体;
+- 门控定界:**仅 phase3+PAIR 放行**。PAIR 的 owner-computes + 无超售
+  boot 门保证选中页全部设备驻留(与 gather PAIR slice 同契约,无 page-in、
+  无 host fallback);非 PAIR phase3 的 extend 写与 modulo 槽别名,page-in
+  与 write-restore 竞态无解,保持 tier-aware gather。
+
+验证:CPU 测试 54 例全绿(含新增 slot_table/owner 解析用例、phase3 PAIR
+路由用例;顺带修复 `_qsa_grouped_prefill_gate` 在 HEAD 上因 `_kv_host_tier`
+stub 缺失的 9 个既有失败)。**GPU 验收待重启窗口**:TileLang 双指针内核
+数值测试(`test_grouped_sparse_prefill_sm70.py` peer 用例)、smoke、
+前缀缓存门、三臂回归带(prefill 8k 2,687-2,798 / decode 95-114 / accept
+2.70-3.15 不回退)、32k+ prefill A/B(目标 2,600-2,900 tok/s 带位);数字
+回填本节与 README。
+
+**基线记录(grouped OFF,2026-11-12)**:生产 compose(8110,2 并发、
+kv tier phase3 + PAIR_PARITY + PLE staged CHUNK_AHEAD、MTP on、
+`SGLANG_SM70_QSA_GROUPED_PREFILL=0`,镜像 `sglang-v100-unified:review`)。
+命令:`sglang.bench_serving --dataset-name random --random-range-ratio 1
+(钉死长度) --random-input-len L --random-output-len 256
+--max-concurrency 2 --num-prompts 4 --backend sglang`,每组间 /flush_cache。
+2 并发下 TTFT ≈ 一波 2 条 prompt 的交错 prefill,故 per-prompt ≈ 聚合/2:
+
+| input tok | TTFT median(波) | 聚合 prefill tok/s | per-prompt tok/s | TPOT median(2 并发) | decode tok/s/流 |
+| --- | --- | --- | --- | --- | --- |
+| 1,024 | 0.78 s | 2,615 | 1,308 | 27.2 ms | ~37 |
+| 4,096 | 2.04 s | 4,008 | 2,004 | 28.2 ms | ~36 |
+| 8,192 | 4.16 s | 3,943 | 1,971 | 33.1 ms | ~30 |
+| 16,384 | 10.18 s(复测;首测 34.1 s 为不可复现瞬态) | 3,220 | 1,610 | 27.8 ms | ~36 |
+| 32,768 | 16.43 s | 3,988 | 1,994 | 49.1 ms | ~20 |
+| 65,536 | 29.92 s | 4,381 | 2,191 | 83.0 ms | ~12 |
+
+单流对照(conc=1,同命令 `--max-concurrency 1 --num-prompts 2`,n=2 方差
+大,读数取带位不看单点):
+
+| input tok | TTFT | prefill tok/s | TPOT | decode tok/s/流 |
+| --- | --- | --- | --- | --- |
+| 1,024 | 0.57 s | 1,803 | 13.5 ms | 74 |
+| 4,096 | 1.40 s | 2,930 | 14.2 ms | 71 |
+| 8,192 | 3.58 s | 2,290 | 17.5 ms | 57 |
+| 16,384 | 5.54 s | 2,958 | 11.2 ms | 90 |
+| 32,768 | 9.09 s | 3,602 | 14.2 ms | 70 |
+| 65,536 | 17.42 s | 3,755 | 18.5 ms | 54 |
+
+观察:①per-prompt prefill 稳定在 ~1,600-2,200 带位,低于旧锚点 2,600-2,900(11-05 前栈,PLE staged + tier phase3 两层税后的现值)——grouped 重启要拿回的就是这段;②长上下文 decode 随前缀变长
+衰减(37 → 12 tok/s/流 @64k,2 并发交错 + tier 读成本),单流 16k 89
+tok/s 正常;③首测 16k 的 82.5s 毛刺需在后续 A/B 中留意是否再现。
+
+**A/B 实测:grouped ON 回归,已回退(2026-11-12)**:镜像
+`sglang-v100-unified:group-prefill`(含 §8.3 路线 B 改动;GPU 内核测试
+2 passed——TileLang 双指针编译 + peer 数值对齐;smoke 通过;needle QA
+16k/32k PASS,PAIR 寻址正确)。同口径 A/B(2 并发/conc=1,TTFT 波):
+
+| 桶 | baseline TTFT | grouped TTFT | Δ |
+| --- | --- | --- | --- |
+| 16k, conc=1 | 5.54 s | 8.98 s | **+62%** |
+| 16k, conc=2 | 10.18 s | 24.03 s | **+136%** |
+| 8k, conc=2 | 4.16 s | 5.35 s | +29% |
+| 4k, conc=2 | 2.04 s | 2.04 s | 持平 |
+
+torch profiler 定位(trace:
+`/data/sglang-ple-staged/_profiles/gp16k/`,TP-0):grouped 内核 36 次大
+launch **50-95 ms/次**(2.5 s/6 步),planner 热态 9.9 ms(与 L2-b 一致,
+非瓶颈);微基准(u_pad 10752 > 生产 5632,对家=本地 clone)同内核仅
+29 ms,且 peer/alias 分支差 <3%。生产唯一系统性差异是对家 buffer 经
+**IPC 映射**(PAIR 拓扑):union 面板约一半列(~1.4 GB/launch)跨
+NVLink/IPC 随机 512B 读,latency-bound(~40 GB/s 有效带宽 vs 本地
+~190 GB/s),把内核拖慢 4-6×。**结论:L2-b 的 +13-18% 锚点测于 PAIR
+启用前的全本地读拓扑,不迁移**;PAIR 下 grouped 以当前"逐列双指针"
+内核设计无法取胜(前缀越长 union 越大,回归越重)。生产已回退
+GROUPED=0(镜像保留,代码经数值验证)。后续若要重开,可选:
+(a) 对家 union 页按页粒度 bulk-copy 到本地 scratch 再全本地读内核
+(每次 launch ~0.7GB 拷贝 + scratch 驻留,OOM 预算敏感,净收益存疑);
+(b) 内核按页粒度读对家半区(把 512B 随机读合并为 16KB 顺序读,
+TileLang 加载路径重构);(c) 维持 OFF,等 PAIR 拓扑变化再评估。

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
 import torch
+
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     ForwardMode,
     QwenSparseAttnBackend,
@@ -38,6 +39,9 @@ class _Harness(CustomTestCase):
         backend.req_to_token = req_to_token
         backend.max_context_len = 2048
         backend._sm70_grouped_prefill_logged = False
+        # No KV host tier (production-less stub); the tier3 gate reads this
+        # attribute on every path that survives the mixed-batch guard.
+        backend._kv_host_tier = None
         return backend
 
     def _batch(self, forward_mode=ForwardMode.EXTEND, original_mode=None):
@@ -164,11 +168,12 @@ class TestGroupedPrefillHappyPath(_Harness):
         q, k, v, topk = self._eligible_inputs()
         backend = self._backend()
         batch = self._batch()
-        # Realistic plan triple: the one-shot log line reads uidx.shape[0].
+        # Realistic plan tuple: the one-shot log line reads uidx.shape[0].
         plan = (
             torch.zeros(4, dtype=torch.int32),
             torch.zeros(4, 16, dtype=torch.int32),
             64,
+            torch.zeros(4, dtype=torch.uint8),
         )
         kernel_output = torch.zeros(256, 6, 256, dtype=torch.float16)
         with (
@@ -190,8 +195,10 @@ class TestGroupedPrefillHappyPath(_Harness):
             batch.req_pool_indices,
             backend.req_to_token,
             backend.max_context_len,
+            slot_table=None,
+            owner_mask=None,
         )
-        run_kernel.assert_called_once_with(q, k, v, plan, SCALING)
+        run_kernel.assert_called_once_with(q, k, v, plan, SCALING, peer_kv=None)
 
 
 if __name__ == "__main__":

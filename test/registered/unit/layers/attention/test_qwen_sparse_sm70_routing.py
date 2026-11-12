@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -97,9 +98,7 @@ def test_sm70_qsa_dense_prefill_uses_packaged_kernel_per_sequence(monkeypatch):
     k = torch.zeros((5, 1, 256), dtype=torch.float16)
     v = torch.zeros_like(k)
 
-    output = QwenSparseAttnBackend._forward_sm70_dense_prefill(
-        q, k, v, [2, 3], 0.0625
-    )
+    output = QwenSparseAttnBackend._forward_sm70_dense_prefill(q, k, v, [2, 3], 0.0625)
 
     assert calls == [(2, 2, 2, 0), (3, 3, 3, 0)]
     torch.testing.assert_close(output[:2], torch.ones_like(output[:2]))
@@ -112,9 +111,7 @@ def test_sm70_qsa_dense_prefill_rejects_mismatched_packing():
     v = torch.zeros_like(k)
 
     with pytest.raises(ValueError, match="packed rows"):
-        QwenSparseAttnBackend._forward_sm70_dense_prefill(
-            q, k, v, [2, 2], 0.0625
-        )
+        QwenSparseAttnBackend._forward_sm70_dense_prefill(q, k, v, [2, 2], 0.0625)
 
 
 @pytest.mark.parametrize(
@@ -271,6 +268,9 @@ def _eligible_grouped_prefill_args():
 class _RecordingTier:
     """Fake KV host tier recording flush() calls (m8: replay flush guard)."""
 
+    phase3 = False
+    pair_split = False
+
     def __init__(self, phase3):
         self.phase3 = phase3
         self.pagein = False
@@ -278,6 +278,21 @@ class _RecordingTier:
 
     def flush(self, out_cache_loc):
         self.flush_calls.append(out_cache_loc)
+
+
+class _PairSplitTier(_RecordingTier):
+    """phase3 + PAIR_PARITY tier stub recording pair_peer_kv lookups."""
+
+    pair_split = True
+
+    def __init__(self):
+        super().__init__(phase3=True)
+        self.layer_slot = {5: 0}
+        self.peer_calls = []
+
+    def pair_peer_kv(self, tier_layer):
+        self.peer_calls.append(tier_layer)
+        return (1 << 30, "peer_k_buf", "peer_v_buf")
 
 
 def _make_replay_backend(tier, gpu_kernel):
@@ -513,12 +528,12 @@ def test_batched_sm70_prefill_plan_rejects_kv_tier_phase3(monkeypatch):
     )
 
 
-def test_grouped_prefill_guard_blocks_kv_tier_phase3(monkeypatch):
-    # L2-b declared the grouped-prefill route reopenable, but the grouped
-    # planner also resolves slots through the logical req_to_token table:
-    # under phase3 it would corrupt every prefixed chunk (device rows are
-    # mod-remapped, PAIR halves them). The tier guard must precede the
-    # planner like the mixed-batch guard does.
+def test_grouped_prefill_guard_blocks_kv_tier_phase3_non_pair(monkeypatch):
+    # Phase3 remaps device rows (mod-picked slots; PAIR halves them), so a
+    # prefill kernel that indexes the pool through the LOGICAL req_to_token
+    # table reads the wrong physical rows. Without PAIR there is no
+    # device-resident read path at all (host-mirror fallback + extend-write
+    # aliasing), so the grouped route must still decline under phase3.
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (7, 0))
     tier = _RecordingTier(phase3=True)
     backend = _GuardSentinelBackend()
@@ -528,7 +543,80 @@ def test_grouped_prefill_guard_blocks_kv_tier_phase3(monkeypatch):
         _original_forward_mode=None,
     )
     q, k, v, topk, cu, scale = _eligible_grouped_prefill_args()
-    result = QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
-        backend, q, k, v, forward_batch, topk, cu, scale
-    )
+    with patch(
+        "sglang.srt.layers.attention.tilelang_fa_v100."
+        "_kernels_grouped_sparse_prefill.build_grouped_union_plan"
+    ) as build_plan:
+        result = QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
+            backend, q, k, v, forward_batch, topk, cu, scale
+        )
     assert result is None
+    build_plan.assert_not_called()
+
+
+def test_grouped_prefill_phase3_pair_routes_through_planner(monkeypatch):
+    # Route B (docs/v100/PREFILL_LEVERS_PLAN.md §8.3): under phase3+PAIR the
+    # planner resolves slots through the tier's batch-local physical table
+    # (owner-bit dual pointer, same contract as the decode read path) and the
+    # kernel reads the pair member's imported buffers, so the phase3 gate no
+    # longer blocks the grouped route.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (7, 0))
+    tier = _PairSplitTier()
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._kv_host_tier = tier
+    backend.max_context_len = 2048
+    backend._sm70_grouped_prefill_logged = True
+    phys_table = torch.zeros(1, 32, dtype=torch.int32)
+    backend.forward_metadata = SimpleNamespace(phys_token_slot_table=phys_table)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        _original_forward_mode=None,
+        seq_lens=torch.tensor([256], dtype=torch.int64),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+    )
+    layer = SimpleNamespace(layer_id=5)
+    plan = (torch.zeros(4, dtype=torch.int32), None, 64, None)
+    kernel_output = torch.zeros(256, 6 * 256, dtype=torch.float16)
+    fake_peer = torch.zeros(256, 1, 256, dtype=torch.float16)
+    q, k, v, topk, cu, scale = _eligible_grouped_prefill_args()
+    with (
+        patch(
+            "sglang.srt.layers.attention.qwen_sparse_attn_backend."
+            "is_in_breakable_cuda_graph",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.mem_cache.pair_split_ipc.imported_as_tensor",
+            return_value=fake_peer,
+        ) as as_tensor,
+        patch(
+            "sglang.srt.layers.attention.tilelang_fa_v100."
+            "_kernels_grouped_sparse_prefill.build_grouped_union_plan",
+            return_value=plan,
+        ) as build_plan,
+        patch(
+            "sglang.srt.layers.attention.tilelang_fa_v100."
+            "_kernels_grouped_sparse_prefill.run_grouped_sparse_prefill",
+            return_value=kernel_output,
+        ) as run_kernel,
+    ):
+        result = QwenSparseAttnBackend._forward_sm70_grouped_sparse_prefill(
+            backend, q, k, v, forward_batch, topk, cu, scale, layer=layer
+        )
+    assert result is kernel_output
+    assert tier.peer_calls == [0]
+    assert as_tensor.call_count == 2
+    assert as_tensor.call_args_list[0].args[1] == (256, 1, 256)
+    build_plan.assert_called_once_with(
+        topk,
+        cu,
+        forward_batch.seq_lens,
+        forward_batch.req_pool_indices,
+        None,
+        2048,
+        slot_table=phys_table,
+        owner_mask=1 << 30,
+    )
+    run_kernel.assert_called_once_with(
+        q, k, v, plan, scale, peer_kv=(fake_peer, fake_peer)
+    )

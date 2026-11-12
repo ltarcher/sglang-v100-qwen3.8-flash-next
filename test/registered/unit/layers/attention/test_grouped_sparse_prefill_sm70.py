@@ -16,7 +16,7 @@ Fixture shape classes covered:
   - rows 4-7 (group 0): first tile fully masked (their request's
     union block sorts behind 128 lower-slot entries);
   - rows 8-11 (group 1): pad tail tiles 2-7 fully masked;
-  - rows 12-15 (group 2): fresh prefill, row_keep=1..4, 4-entry
+  - rows 12-15 (group 1, m=4..7): fresh prefill, row_keep=1..4, 4-entry
     union -- tiles 1-7 fully masked;
   - rows 0-3 (group 0): the ordinary continuation case.
 
@@ -106,9 +106,11 @@ def _build_mixed_group_fixture():
 def test_grouped_fully_masked_tiles_stay_finite():
     q, k_pool, v_pool, plan = _build_mixed_group_fixture()
     assert plan is not None, "fixture must stay inside the planner envelope"
-    uidx, mask, u_pad = plan
+    uidx, mask, u_pad, owner = plan
     # 128 + 128 distinct group-0 entries bucketed to the 512 panel step
     assert u_pad == 512
+    # off the tier every union column reads the local pool
+    assert int(owner.max()) == 0
     # NaN-critical shape: rows 4-7 (group-0 m=4..7) see no visible column
     # in either of the first two tiles
     assert int(mask[0, 4, :128].sum()) == 0
@@ -116,12 +118,106 @@ def test_grouped_fully_masked_tiles_stay_finite():
     assert int(mask[1, 0, :128].sum()) == TOPK
     assert int(mask[1, 0, 128:].sum()) == 0
     # row_keep edge: first fresh row keeps exactly its single token
-    assert int(mask[2, 0].sum()) == 1
-    assert int(mask[2, 3].sum()) == 4
+    # (rows 12-15 are group 1, m=4..7)
+    assert int(mask[1, 4].sum()) == 1
+    assert int(mask[1, 7].sum()) == 4
 
     sm_scale = 1.0 / math.sqrt(DIM)
     out = run_grouped_sparse_prefill(q, k_pool, v_pool, plan, sm_scale)
 
     assert torch.isfinite(out.float()).all(), "NaN/Inf leaked from fully-masked tiles"
     ref = _torch_reference(q, k_pool, v_pool, uidx, mask, sm_scale)
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+OWNER_MASK = 1 << 30
+
+
+def _torch_reference_peer(
+    q, k_pool, v_pool, k_peer, v_peer, uidx, mask, owner, sm_scale
+):
+    """_torch_reference with the per-column pool selected by the Owner byte."""
+    R = q.shape[0]
+    G = uidx.shape[0]
+    out = torch.empty_like(q)
+    for g in range(G):
+        idx = uidx[g].long()
+        peer_col = owner[g].bool()
+        kg = torch.where(peer_col.unsqueeze(1), k_peer[idx], k_pool[idx]).float()
+        vg = torch.where(peer_col.unsqueeze(1), v_peer[idx], v_pool[idx]).float()
+        for m in range(min(GROUP_ROWS, R - g * GROUP_ROWS)):
+            row = g * GROUP_ROWS + m
+            vis = mask[g, m].bool()
+            assert vis.any(), f"row {row} fully masked in union (planner contract)"
+            s = (q[row].float() @ kg[vis].T) * sm_scale
+            p = torch.softmax(s, dim=-1)
+            out[row] = (p @ vg[vis]).half()
+    return out
+
+
+def _build_pair_fixture():
+    """phase3+PAIR fixture: req 0 reads local rows, req 1 mixes local (odd
+    positions) and peer (even positions) pages via the owner-bit table."""
+    bs, R, max_ctx = 2, 16, 2048
+    cu = torch.tensor([0, 8, 16], dtype=torch.int32, device=DEV)
+    seq_lens = torch.tensor([2048, 2048], dtype=torch.int32, device=DEV)
+    req_pool_indices = torch.tensor([0, 1], dtype=torch.int32, device=DEV)
+    table = torch.zeros(bs, max_ctx, dtype=torch.int32, device=DEV)
+    table[0, :2048] = 1000 + torch.arange(2048, dtype=torch.int32)
+    for pos in range(2048):
+        slot = 3000 + pos
+        if pos % 2 == 0:
+            slot |= OWNER_MASK  # pair member owns the page
+        table[1, pos] = slot
+
+    topk_indices = torch.full((R, TOPK), -1, dtype=torch.int32, device=DEV)
+    early = torch.arange(128, dtype=torch.int32, device=DEV)
+    late = torch.arange(128, dtype=torch.int32, device=DEV) + 1900
+    for r in range(8):
+        topk_indices[r] = early
+    for r in range(8, 16):
+        topk_indices[r] = late
+
+    q = torch.randn(R, HEADS, DIM, dtype=torch.float16, device=DEV) * 0.5
+    k_pool = torch.randn(8192, DIM, dtype=torch.float16, device=DEV) * 0.5
+    v_pool = torch.randn(8192, DIM, dtype=torch.float16, device=DEV) * 0.5
+    k_peer = torch.randn(8192, DIM, dtype=torch.float16, device=DEV) * 0.5
+    v_peer = torch.randn(8192, DIM, dtype=torch.float16, device=DEV) * 0.5
+
+    plan = build_grouped_union_plan(
+        topk_indices,
+        cu,
+        seq_lens,
+        req_pool_indices,
+        None,
+        max_ctx,
+        slot_table=table,
+        owner_mask=OWNER_MASK,
+    )
+    return q, k_pool, v_pool, k_peer, v_peer, plan
+
+
+def test_grouped_pair_dual_pointer_matches_reference():
+    q, k_pool, v_pool, k_peer, v_peer, plan = _build_pair_fixture()
+    assert plan is not None, "fixture must stay inside the planner envelope"
+    uidx, mask, u_pad, owner = plan
+    # req 1's window (positions 1900..2027) mixes even/odd parity pages
+    assert int(owner.max()) == 1
+    assert int((owner == 0).sum()) > 0
+    assert int((owner == 1).sum()) > 0
+
+    sm_scale = 1.0 / math.sqrt(DIM)
+    out = run_grouped_sparse_prefill(
+        q,
+        k_pool,
+        v_pool,
+        plan,
+        sm_scale,
+        peer_kv=(k_peer.unsqueeze(1), v_peer.unsqueeze(1)),
+    )
+
+    assert torch.isfinite(out.float()).all()
+    ref = _torch_reference_peer(
+        q, k_pool, v_pool, k_peer, v_peer, uidx, mask, owner, sm_scale
+    )
     torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)

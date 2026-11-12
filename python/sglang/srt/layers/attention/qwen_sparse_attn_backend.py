@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
@@ -33,8 +34,6 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
     compressed_decode_view,
-)
-from sglang.srt.layers.attention.qsa.metadata import (
     set_qsa_max_pos_hint,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
@@ -179,9 +178,7 @@ def _resolve_flash_attn_varlen_func():
     except ImportError:
         pass
     try:
-        from flash_attn.cute.interface import (
-            flash_attn_varlen_func as cute_varlen_func,
-        )
+        from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
 
         def flash_attn_varlen_func(*args, **kwargs):
             output = cute_varlen_func(*args, **kwargs)
@@ -2084,7 +2081,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # through the LOGICAL req_to_token table reads the wrong physical
         # rows -- or runs off the pool. The decode side got the same
         # treatment (sparse decode switches to phys_token_slot_table under
-        # tier3); route these batches to the tier-aware gather below.
+        # tier3); the fused/batched routes decline below, the grouped route
+        # re-enters under PAIR with owner-bit-aware addressing
+        # (_forward_sm70_grouped_sparse_prefill), and the rest falls to the
+        # tier-aware gather.
         _tier = self._kv_host_tier
         tier3 = _tier is not None and _tier.phase3
         if not tier3 and self._can_use_sm70_sparse_prefill(
@@ -2146,7 +2146,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
             return self._pad_extend_output(output, num_output_rows)
-        if not tier3 and envs.SGLANG_SM70_QSA_GROUPED_PREFILL.get():
+        if envs.SGLANG_SM70_QSA_GROUPED_PREFILL.get():
             grouped = self._forward_sm70_grouped_sparse_prefill(
                 q,
                 k_buffer,
@@ -2155,6 +2155,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 cu_seqlens_q,
                 layer.scaling,
+                layer=layer,
             )
             if grouped is not None:
                 return self._pad_extend_output(grouped, num_output_rows)
@@ -2469,6 +2470,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         scaling: float,
+        *,
+        layer=None,
     ) -> Optional[torch.Tensor]:
         """Grouped TileLang sparse chunk-prefill over the fp16 token pool.
 
@@ -2492,14 +2495,47 @@ class QwenSparseAttnBackend(AttentionBackend):
         ):
             return None
         # KV host tier phase3 remaps device rows (mod-picked slots, PAIR
-        # halves the per-rank pool); the grouped planner resolves slots
-        # through the logical req_to_token table and would corrupt every
-        # prefixed chunk. Same guard the mixed-batch check above uses the
-        # method body for: keep it here so future callers cannot bypass the
-        # forward_extend call-site check.
+        # halves the per-rank pool): the planner must resolve slots through
+        # the tier's batch-local physical table, not the logical
+        # req_to_token. Only the PAIR layout admits a direct read here --
+        # owner-computes plus the no-oversubscription boot gate keep every
+        # logical page resident in exactly one rank's pool, so the union
+        # reads local rows or the pair member's imported buffers with no
+        # page-in and no host-mirror fallback (the same residency contract
+        # as the gather path's PAIR slice). The non-PAIR phase3 layout pages
+        # out to the host mirror and this forward's extend writes alias the
+        # modulo slots, so page-in would race the write-restore -- those
+        # batches keep the tier-aware gather.
         _tier = self._kv_host_tier
-        if _tier is not None and _tier.phase3:
-            return None
+        tier3 = _tier is not None and _tier.phase3
+        slot_table = None
+        owner_mask = None
+        peer_kv = None
+        req_to_token = None
+        if tier3:
+            if not _tier.pair_split:
+                return None
+            if layer is None:
+                return None
+            tier_layer = _tier.layer_slot.get(layer.layer_id)
+            if tier_layer is None:
+                return None
+            metadata = self._resolve_metadata(forward_batch)
+            slot_table = metadata.phys_token_slot_table
+            if slot_table is None:
+                return None
+            from sglang.srt.mem_cache.pair_split_ipc import imported_as_tensor
+
+            pkv = _tier.pair_peer_kv(tier_layer)
+            owner_mask = pkv[0]
+            peer_kv = (
+                imported_as_tensor(pkv[1], tuple(k_buffer.shape)),
+                imported_as_tensor(pkv[2], tuple(v_buffer.shape)),
+            )
+        else:
+            req_to_token = self.req_to_token
+            if req_to_token is None:
+                return None
         R = q.shape[0]
         if not (
             forward_batch.forward_mode.is_extend()
@@ -2521,9 +2557,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         if v_buffer.stride(2) != 1 or v_buffer.stride(1) != 256:
             return None
-        req_to_token = self.req_to_token
-        if req_to_token is None:
-            return None
         from sglang.srt.layers.attention.tilelang_fa_v100._kernels_grouped_sparse_prefill import (
             build_grouped_union_plan,
             run_grouped_sparse_prefill,
@@ -2536,20 +2569,25 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             req_to_token,
             self.max_context_len,
+            slot_table=slot_table,
+            owner_mask=owner_mask,
         )
         if plan is None:
             return None
         if not self._sm70_grouped_prefill_logged:
-            uidx, mask, u_pad = plan
+            uidx, mask, u_pad, _ = plan
             logger.info(
                 "SM70 QSA grouped prefill: rows=%d groups=%d union_pad=%d "
-                "(SGLANG_SM70_QSA_GROUPED_PREFILL).",
+                "%s(SGLANG_SM70_QSA_GROUPED_PREFILL).",
                 R,
                 uidx.shape[0],
                 u_pad,
+                "phase3 PAIR dual-pointer, " if tier3 else "",
             )
             self._sm70_grouped_prefill_logged = True
-        return run_grouped_sparse_prefill(q, k_buffer, v_buffer, plan, scaling)
+        return run_grouped_sparse_prefill(
+            q, k_buffer, v_buffer, plan, scaling, peer_kv=peer_kv
+        )
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:

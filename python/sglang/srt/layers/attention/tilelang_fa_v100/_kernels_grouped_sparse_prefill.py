@@ -23,13 +23,27 @@ Planner contract:
     reduce (see the guard in the kernel body, mirroring _kernels_paged.py);
   - one scalar readback (max union length -> padded panel width) -- eager
     prefill only; the breakable-graph path keeps the Triton fallback.
+
+KV host tier phase3 + PAIR_PARITY (docs/v100/KV_HOST_TIER_DESIGN.md 6.1 v2):
+the planner can resolve slots through the tier's batch-local physical slot
+table (``map_slot_table`` output) instead of the logical ``req_to_token``.
+PAIR entries carry an owner bit (bit 30): set = the bytes live in the pair
+member's imported buffers, and the low bits are the token row, which indexes
+BOTH ranks' pools identically (the pair-half bijection). The kernel therefore
+takes twin pool operands (KPool/VPool local, KPeer/VPeer the pair member's
+buffers) and selects the base pointer per union column from the Owner byte;
+owner-computes + the no-oversubscription boot gate keep every logical page
+device-resident, so no page-in and no host-mirror fallback exist on this
+route. Off pair-split the planner emits an all-zero Owner and ``run_`` aliases
+the peer operands onto the local pools, so the compiled kernel (and its JIT
+cache key) is identical for both modes.
 """
 
 from typing import Dict, Optional, Tuple
 
-import torch
 import tilelang
 import tilelang.language as T
+import torch
 
 # NOTE: no `from __future__ import annotations` here -- TileLang's eager
 # builder evals T.prim_func type hints at module scope and stringified
@@ -76,12 +90,17 @@ def _grouped_qsa_sparse_prefill_sm70(
     threads: int = THREADS,
 ):
     """One program per query-row group; dense pre-sorted union panel read
-    through Uidx from the token pool, per-row visibility in Mask.
+    through Uidx from the token pool, per-row visibility in Mask, per-column
+    pool selection in Owner (PAIR dual pointer, docs/v100/KV_HOST_TIER_DESIGN.md
+    6.1 v2).
 
-    Q/Out [R, H, D] fp16; KPool/VPool [pool, D] fp16 (flat token pool rows);
-    Uidx [G, union_len] int32 (pool row per union column, 0 in pad columns);
-    Mask [G, group_rows, union_len] uint8. Rows past R duplicate the group's
-    last live row (their output columns are never stored).
+    Q/Out [R, H, D] fp16; KPool/VPool and KPeer/VPeer [pool, D] fp16 (flat
+    token pool rows; the peer pair indexes the pair member's buffers and is
+    aliased onto the local pools when Owner is all zero); Uidx [G, union_len]
+    int32 (pool row per union column, 0 in pad columns); Mask [G, group_rows,
+    union_len] uint8; Owner [G, union_len] uint8 (0 = local pool, >0 = peer).
+    Rows past R duplicate the group's last live row (their output columns are
+    never stored).
     """
     M = group_rows * num_heads
     D_half = dim // 2
@@ -98,8 +117,11 @@ def _grouped_qsa_sparse_prefill_sm70(
         Q: T.Tensor([R, num_heads, dim], "float16"),
         KPool: T.Tensor([P, dim], "float16"),
         VPool: T.Tensor([P, dim], "float16"),
+        KPeer: T.Tensor([P, dim], "float16"),
+        VPeer: T.Tensor([P, dim], "float16"),
         Uidx: T.Tensor([G, union_len], "int32"),
         Mask: T.Tensor([G, group_rows, union_len], "uint8"),
+        Owner: T.Tensor([G, union_len], "uint8"),
         Out: T.Tensor([R, num_heads, dim], "float16"),
     ):
         with T.Kernel(G, threads=threads) as bg:
@@ -136,7 +158,10 @@ def _grouped_qsa_sparse_prefill_sm70(
                         Mask[bg, m_src, p0 + bi] > 0, 0, -T.infinity(acc_s.dtype)
                     )
                 for bi, d in T.Parallel(BI, D_half):
-                    K_shared[bi, d] = KPool[Uidx[bg, p0 + bi], d]
+                    if Owner[bg, p0 + bi] > 0:
+                        K_shared[bi, d] = KPeer[Uidx[bg, p0 + bi], d]
+                    else:
+                        K_shared[bi, d] = KPool[Uidx[bg, p0 + bi], d]
                 T.gemm(
                     Q_shared_l,
                     K_shared,
@@ -146,7 +171,10 @@ def _grouped_qsa_sparse_prefill_sm70(
                     policy=T.GemmWarpPolicy.FullCol,
                 )
                 for bi, d in T.Parallel(BI, D_half):
-                    K_shared[bi, d] = KPool[Uidx[bg, p0 + bi], D_half + d]
+                    if Owner[bg, p0 + bi] > 0:
+                        K_shared[bi, d] = KPeer[Uidx[bg, p0 + bi], D_half + d]
+                    else:
+                        K_shared[bi, d] = KPool[Uidx[bg, p0 + bi], D_half + d]
                 T.gemm(
                     Q_shared_r,
                     K_shared,
@@ -196,7 +224,10 @@ def _grouped_qsa_sparse_prefill_sm70(
 
                 T.copy(acc_s, S_shared)
                 for bi, d in T.Parallel(BI, D_half):
-                    V_shared[bi, d] = VPool[Uidx[bg, p0 + bi], d]
+                    if Owner[bg, p0 + bi] > 0:
+                        V_shared[bi, d] = VPeer[Uidx[bg, p0 + bi], d]
+                    else:
+                        V_shared[bi, d] = VPool[Uidx[bg, p0 + bi], d]
                 T.gemm(
                     S_shared,
                     V_shared,
@@ -205,7 +236,10 @@ def _grouped_qsa_sparse_prefill_sm70(
                     policy=T.GemmWarpPolicy.FullCol,
                 )
                 for bi, d in T.Parallel(BI, D_half):
-                    V_shared[bi, d] = VPool[Uidx[bg, p0 + bi], D_half + d]
+                    if Owner[bg, p0 + bi] > 0:
+                        V_shared[bi, d] = VPeer[Uidx[bg, p0 + bi], D_half + d]
+                    else:
+                        V_shared[bi, d] = VPool[Uidx[bg, p0 + bi], D_half + d]
                 T.gemm(
                     S_shared,
                     V_shared,
@@ -239,16 +273,27 @@ def build_grouped_union_plan(
     cu_seqlens_q: torch.Tensor,
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
+    req_to_token: Optional[torch.Tensor],
     max_context_len: int,
     *,
+    slot_table: Optional[torch.Tensor] = None,
+    owner_mask: Optional[int] = None,
     group_rows: int = GROUP_ROWS,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]]:
     """Planner: per-group sorted union indices + per-row visibility mask.
 
     Returns (Uidx [G, U_pad] int32, Mask [G, group_rows, U_pad] uint8,
-    U_pad) or None when the input is out of the planner's envelope. One
-    scalar readback picks U_pad; everything else stays on device.
+    U_pad, Owner [G, U_pad] uint8) or None when the input is out of the
+    planner's envelope. One scalar readback picks U_pad; everything else
+    stays on device.
+
+    ``slot_table``: batch-local phase3 physical slot table (the KV host
+    tier's ``map_slot_table`` output) replacing the logical ``req_to_token``
+    addressing, which does not reach the phase3 device pool. Its PAIR
+    entries carry the owner bit (``owner_mask``, bit 30): set = the bytes
+    live in the pair member's pool, low bits = the token row in BOTH ranks'
+    pools. ``Owner`` carries the per-union-column owner bit for the kernel's
+    dual-pointer read; off pair-split it is all zero.
     """
     R, topk = topk_indices.shape
     device = topk_indices.device
@@ -339,8 +384,21 @@ def build_grouped_union_plan(
     # gather into topk_indices); invalid entries clamp to column 0 because
     # their slot never lands in uidx
     logical_entry = torch.where(is_valid, s_logical, torch.zeros_like(s_logical))
-    req_rows = req_to_token.index_select(0, req_pool_indices.to(torch.long))
+    if slot_table is not None:
+        # Phase3 batch-local physical table; PAIR entries carry the owner
+        # bit above the token row. The row bits index both ranks' pools
+        # identically (pair-half bijection), so Uidx stays plain pool-row
+        # addressing and Owner selects the base pointer.
+        if owner_mask is None or owner_mask <= 0:
+            raise ValueError("slot_table requires the PAIR owner mask")
+        req_rows = slot_table
+    else:
+        req_rows = req_to_token.index_select(0, req_pool_indices.to(torch.long))
     slot = req_rows[batch_of_entry, logical_entry].to(torch.int32)
+    peer_bits = None
+    if slot_table is not None:
+        peer_bits = (slot >> (owner_mask.bit_length() - 1)) & 1
+        slot = slot & (owner_mask - 1)
 
     mask_i32 = torch.zeros(G, group_rows, u_pad, device=device, dtype=torch.int32)
     mask_i32.view(-1).index_add_(
@@ -352,20 +410,40 @@ def build_grouped_union_plan(
     uidx.view(-1).index_add_(
         0, g_sorted * u_pad + u_local, torch.where(vd, slot, torch.zeros_like(slot))
     )
-    return uidx, mask_i32.to(torch.uint8), u_pad
+    owner_i32 = torch.zeros(G, u_pad, device=device, dtype=torch.int32)
+    if slot_table is not None:
+        owner_i32.view(-1).index_add_(
+            0,
+            g_sorted * u_pad + u_local,
+            torch.where(vd, peer_bits, torch.zeros_like(peer_bits)),
+        )
+    return uidx, mask_i32.to(torch.uint8), u_pad, owner_i32.to(torch.uint8)
 
 
 def run_grouped_sparse_prefill(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
-    plan: Tuple[torch.Tensor, torch.Tensor, int],
+    plan: Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor],
     sm_scale: float,
+    peer_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Run the grouped kernel; q [R, 6, 256] fp16 -> out [R, 6, 256] fp16."""
-    uidx, mask, u_pad = plan
+    """Run the grouped kernel; q [R, 6, 256] fp16 -> out [R, 6, 256] fp16.
+
+    ``peer_kv``: (peer_k, peer_v) torch views of the PAIR member's imported
+    buffers ([pool_rows, 1, 256], same row space as the local pool); the
+    plan's Owner byte selects the base pointer per union column. None
+    aliases the peer operands onto the local pools -- Owner is all zero, so
+    the peer branch never fires.
+    """
+    uidx, mask, u_pad, owner = plan
     kern = _get_kernel(u_pad, sm_scale)
     pool_rows = k_buffer.shape[0]
     k_pool = k_buffer.view(pool_rows, HEAD_DIM)
     v_pool = v_buffer.view(pool_rows, HEAD_DIM)
-    return kern(q, k_pool, v_pool, uidx, mask)
+    if peer_kv is None:
+        peer_k_pool, peer_v_pool = k_pool, v_pool
+    else:
+        peer_k_pool = peer_kv[0].view(peer_kv[0].shape[0], HEAD_DIM)
+        peer_v_pool = peer_kv[1].view(peer_kv[1].shape[0], HEAD_DIM)
+    return kern(q, k_pool, v_pool, peer_k_pool, peer_v_pool, uidx, mask, owner)

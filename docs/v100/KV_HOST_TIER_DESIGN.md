@@ -363,9 +363,12 @@ TTFT 分钟级仍是 1M 场景第一体验约束(初版 39-70 min 估计落在�
 进本地行」被协议测试证伪——本地行数只有对半,己有页与 fetch 页必然碰撞
 (gp=4 与 gp=5 同落 row 2)。正确形态:物理表项编码 owner 位 + owner 行号,
 decode/gather kernel 按位选基指针(本地池或 IPC 导入的对家池)。受影响的
-三个表消费者:`_p3_gather_kernel`(Triton,自有)、
+表消费者:`_p3_gather_kernel`(Triton,自有)、
 `qwen_sparse_kv_extraction_compact_triton`(Triton)、`sm70_cuda_qsa_decode`
-(JIT CUDA,改动最大)。
+(JIT CUDA,改动最大)、`_kernels_grouped_sparse_prefill`(TileLang
+grouped prefill,2026-11-12:planner 经 `map_slot_table` 的 batch-local
+物理表解析 union 列,内核按 Owner 字节在本地池/对家 buffer 间选基指针,
+pair-split 下 prefill direct-read 的第三条消费路径)。
 
 ** rendezvous**:boot 时一次 `cudaIpcGetMemHandle/OpenMemHandle` 交换
 (`pair_split_ipc.py`,池张量常驻 → 无生命周期管理,图安全);对家 tags

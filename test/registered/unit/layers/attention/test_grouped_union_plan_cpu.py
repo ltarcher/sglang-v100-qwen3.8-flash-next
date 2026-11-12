@@ -131,7 +131,10 @@ class TestGroupedUnionPlanNoHiddenReadback(CustomTestCase):
         ti, cu, seq_lens, req_pool_indices, req_to_token, max_ctx = fixture
         plan = self._build(fixture)
         self.assertIsNotNone(plan)
-        uidx, mask, u_pad = plan
+        uidx, mask, u_pad, owner = plan
+        # off the tier the Owner byte is all zero (local pool everywhere)
+        self.assertIsNotNone(owner)
+        self.assertEqual(int(owner.max()), 0)
         uidx_ref, mask_ref, unions = _plan_reference(
             ti, cu, seq_lens, req_pool_indices, req_to_token, u_pad
         )
@@ -157,6 +160,85 @@ class TestGroupedUnionPlanNoHiddenReadback(CustomTestCase):
         self.assertLessEqual(max_slot + 1, 1 << 40)  # sanity
         self.assertGreaterEqual(max_slot + 1, 1 << (31 - 20))  # int64 regime
         self._assert_plan(fixture)
+
+
+class TestGroupedUnionPlanSlotTable(CustomTestCase):
+    """Route B: phase3 + PAIR slot resolution through the tier's batch-local
+    physical table (owner-bit dual pointer, docs/v100/KV_HOST_TIER_DESIGN.md
+    6.1 v2). Uidx keeps plain pool-row addressing (low 30 bits); the Owner
+    byte carries the per-column peer bit."""
+
+    OWNER_MASK = 1 << 30
+
+    def _slot_table_fixture(self):
+        # bs=2, R=8 (one group), topk=4. Req 0 reads only local rows; req 1
+        # mixes local (odd positions) and peer (even positions) entries.
+        topk = 4
+        cu = torch.tensor([0, 4, 8], dtype=torch.int64)
+        seq_lens = torch.tensor([8, 8], dtype=torch.int64)
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
+        ti = torch.full((8, topk), -1, dtype=torch.int32)
+        for r in range(4):
+            ti[r] = torch.tensor([0, 1, 3, 5])
+        for r in range(4, 8):
+            ti[r] = torch.tensor([2, 4, 6, 7])
+        table = torch.zeros(2, 8, dtype=torch.int32)
+        table[0] = torch.arange(8) + 100  # local rows 100..107
+        for pos in range(8):
+            slot = 200 + pos
+            if pos % 2 == 0:
+                slot |= self.OWNER_MASK  # peer-owned page
+            table[1, pos] = slot
+        return ti, cu, seq_lens, req_pool_indices, table
+
+    def test_slot_table_resolves_owner_bits_and_rows(self):
+        ti, cu, seq_lens, req_pool_indices, table = self._slot_table_fixture()
+        plan = build_grouped_union_plan(
+            ti,
+            cu,
+            seq_lens,
+            req_pool_indices,
+            None,
+            8,
+            slot_table=table,
+            owner_mask=self.OWNER_MASK,
+        )
+        self.assertIsNotNone(plan)
+        uidx, mask, u_pad, owner = plan
+        # union sorted by (group_slot, logical): all of req 0's entries
+        # (group_slot 0) precede req 1's (group_slot 1). Req 1 mixes
+        # peer-owned even positions with local odd ones (bit 30 cleared in
+        # uidx, owner byte carries the bit).
+        expected = [
+            (100, 0),
+            (101, 0),
+            (103, 0),
+            (105, 0),
+            (202, 1),
+            (204, 1),
+            (206, 1),
+            (207, 0),
+        ]
+        for col, (row, bit) in enumerate(expected):
+            self.assertEqual(int(uidx[0, col]), row, f"uidx col {col}")
+            self.assertEqual(int(owner[0, col]), bit, f"owner col {col}")
+        self.assertEqual(u_pad, 64)
+        # every real row keeps its own entries (planner contract)
+        for m in range(8):
+            self.assertGreaterEqual(int(mask[0, m].sum()), 1)
+
+    def test_slot_table_without_owner_mask_fails_loud(self):
+        ti, cu, seq_lens, req_pool_indices, table = self._slot_table_fixture()
+        with self.assertRaisesRegex(ValueError, "owner mask"):
+            build_grouped_union_plan(
+                ti,
+                cu,
+                seq_lens,
+                req_pool_indices,
+                None,
+                8,
+                slot_table=table,
+            )
 
 
 if __name__ == "__main__":
