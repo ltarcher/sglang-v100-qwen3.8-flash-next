@@ -935,6 +935,7 @@ def _summarize_longbench(records: list[dict[str, Any]]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _CHAT_TEMPLATE: str | None = None
+_CHAT_TOKENIZER = None
 
 
 def chat_wrap(content: str) -> str:
@@ -943,20 +944,23 @@ def chat_wrap(content: str) -> str:
     Raw completion prompting made the probe echo ("Question: ...\\nAnswer: 5
     \\n\\nQuestion: ..." repeated); the server's own template plus the
     enable_thinking=False kwarg produces clean single-turn output. Templates
-    are read once from the served checkpoint directory.
+    are read once from the served checkpoint directory. The tokenizer is
+    likewise loaded once: AutoTokenizer.from_pretrained re-parses the
+    multi-MB tokenizer.json on every call and dominated full-suite runs.
     """
-    global _CHAT_TEMPLATE
+    global _CHAT_TEMPLATE, _CHAT_TOKENIZER
     if _CHAT_TEMPLATE is None:
         tok_cfg = json.loads(
             Path(args_tokenizer_path()).joinpath("tokenizer_config.json").read_text()
         )
         _CHAT_TEMPLATE = tok_cfg["chat_template"]
-    from transformers import AutoTokenizer
+    if _CHAT_TOKENIZER is None:
+        from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(
-        args_tokenizer_path(), trust_remote_code=True, use_fast=True
-    )
-    return tok.apply_chat_template(
+        _CHAT_TOKENIZER = AutoTokenizer.from_pretrained(
+            args_tokenizer_path(), trust_remote_code=True, use_fast=True
+        )
+    return _CHAT_TOKENIZER.apply_chat_template(
         [{"role": "user", "content": content}],
         chat_template=_CHAT_TEMPLATE,
         tokenize=False,
