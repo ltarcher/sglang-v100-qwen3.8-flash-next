@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -587,6 +588,23 @@ def eagle_prepare_for_verify(
                 batch_size=bs,
                 draft_token_num=verify_input.draft_token_num,
                 device=device,
+            )
+        if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+            # Poison hunt: this is the verify KV write target, read straight out
+            # of the request row. It is the only MTP write not covered by the
+            # draft/move probes, and the one a stale row would poison silently.
+            from sglang.srt.mem_cache.radix_page_poison_probe import (
+                check_write_against_free,
+                check_write_pages,
+            )
+
+            _ps = batch.token_to_kv_pool_allocator.page_size
+            check_write_pages(batch.out_cache_loc, _ps, "verify out_cache_loc")
+            check_write_against_free(
+                batch.out_cache_loc,
+                _ps,
+                batch.token_to_kv_pool_allocator,
+                "verify out_cache_loc",
             )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(

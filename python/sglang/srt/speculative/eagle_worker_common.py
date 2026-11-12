@@ -356,6 +356,19 @@ def prepare_for_draft(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
+    if not forward_batch.forward_mode.is_idle() and batch.out_cache_loc is not None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+            from sglang.srt.mem_cache.radix_page_poison_probe import (
+                check_write_pages,
+            )
+
+            check_write_pages(
+                batch.out_cache_loc,
+                batch.token_to_kv_pool_allocator.page_size,
+                "draft out_cache_loc",
+            )
     return forward_batch, can_run_decode_cuda_graph
 
 

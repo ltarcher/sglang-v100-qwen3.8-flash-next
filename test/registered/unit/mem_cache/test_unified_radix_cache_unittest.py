@@ -8957,13 +8957,15 @@ class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
 
 
 class TestMambaCheckpointGrid(CustomTestCase):
-    """A mamba-less node must not truncate the device match boundary.
+    """A mamba-less boundary clips the serve to the deepest state-bearing node.
 
     ``tree_page_size`` simulates DCP: it widens the page the tree allocates on
     while ``page_size`` and the mamba chunk grid stay where they are, which is
     exactly the split that lets a checkpoint land between two node boundaries.
-    The mamba state stays leaf-only data; serving the Full-KV chain through a
-    node without one is COW's src=None recompute path.
+    The mamba state stays leaf-only data, so a match ending on a node without
+    one must not serve its Full KV: the request would start its state from
+    zero at a non-zero position. Prior state-bearing ancestors are still
+    servable, and ``full_kv_hit_length`` keeps reporting the raw Full coverage.
     """
 
     cfg = CacheConfig(
@@ -9008,35 +9010,17 @@ class TestMambaCheckpointGrid(CustomTestCase):
         self.assertEqual(result.full_kv_hit_length, full_hit_length)
         return result
 
-    def test_mambaless_leaf_does_not_truncate_device_serve(self):
-        # A mamba-less node (split fragment or evicted state) must not veto the
-        # device match boundary: the Full-KV pages it covers are real. Serving
-        # the whole chain also pushes mamba_branching_seqlen to None, because
-        # the aligned branching point no longer lies beyond the mamba boundary;
-        # the grid math now only fires for host-backed (HiCache) hits.
-        self.assertEqual(
-            len(
-                self._mambaless_leaf_match(
-                    tree_page_size=96, full_hit_length=288
-                ).device_indices
-            ),
-            288,
-        )
-        self.assertIsNone(
-            self._mambaless_leaf_match(
-                tree_page_size=96, full_hit_length=288
-            ).mamba_branching_seqlen
-        )
+    def test_mambaless_boundary_clips_device_serve_to_state_ancestor(self):
+        # A mamba-less node (split fragment or evicted state) is not servable,
+        # but the state-bearing ancestor still is. full_kv_hit_length keeps the
+        # raw Full coverage, and the clipped match has no branching point.
+        result = self._mambaless_leaf_match(tree_page_size=96, full_hit_length=288)
+        self.assertEqual(len(result.device_indices), 96)
+        self.assertIsNone(result.mamba_branching_seqlen)
 
-    def test_mambaless_leaf_covers_widened_pages_without_widening(self):
-        self.assertEqual(
-            len(
-                self._mambaless_leaf_match(
-                    tree_page_size=32, full_hit_length=160
-                ).device_indices
-            ),
-            160,
-        )
+    def test_mambaless_boundary_clips_to_widened_page_ancestor(self):
+        result = self._mambaless_leaf_match(tree_page_size=32, full_hit_length=160)
+        self.assertEqual(len(result.device_indices), 32)
 
 
 class TestMambaFinishedOvershootCheckpoint(CustomTestCase):

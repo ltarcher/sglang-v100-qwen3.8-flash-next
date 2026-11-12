@@ -445,6 +445,11 @@ class TestMambaDonateEvictReallocIntegration(CustomTestCase):
         )
         ret = self.mamba.prepare_for_caching_req(req, params, 64, is_finished=True)
         self.assertEqual(ret, 48)
+        # The cache layer truncates the insert key to the components' effective
+        # length before calling insert (UnifiedRadixCache.cache_finished_req),
+        # so a donated state always sits on a node whose depth it covers.
+        params.key = RadixKey(array("q", list(range(1, 49))))
+        params.value = params.value[:48]
         result = self.cache.insert(params)
         self.assertFalse(result.mamba_exist)
         donated = _slot(params.mamba_value)
@@ -459,6 +464,125 @@ class TestMambaDonateEvictReallocIntegration(CustomTestCase):
         )
         self.assertEqual(len(match.device_indices), 48)
         self.cache.sanity_check()
+
+
+class TestMambaMatchClipsToReusableState(CustomTestCase):
+    """A match must never serve Full KV longer than the reusable Mamba state.
+
+    The device-only tree accepts a Full boundary without a Mamba state (a
+    divergence split keeps the state on the deeper child, and a donated state
+    can be evicted). Serving that prefix would start the request's state from
+    zero at a non-zero position, so the match is clipped to the deepest
+    state-bearing ancestor, or to zero when there is none.
+    """
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        mamba_cache_size=32,
+        kv_size=4096,
+        max_context_len=4096,
+    )
+
+    def setUp(self):
+        self.cache, self.allocator, self.pool = build_fixture(
+            self.cfg, mamba_cache_chunk_size=64
+        )
+        self.mamba: MambaComponent = self.cache.components[ComponentType.MAMBA]
+        self._rid = 0
+
+    def _req(self) -> Req:
+        self._rid += 1
+        return _make_req(self.pool, f"mamba-clip-{self._rid}")
+
+    def _insert(self, tokens, donate_len) -> InsertParams:
+        req = self._req()
+        _set_track(req, last_seqlen=donate_len)
+        value = self.allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        params = InsertParams(
+            key=RadixKey(array("q", tokens)),
+            value=value[: len(tokens)],
+        )
+        ret = self.mamba.prepare_for_caching_req(req, params, len(tokens), True)
+        self.assertEqual(ret, donate_len)
+        self.cache.insert(params)
+        return params
+
+    def _match(self, tokens):
+        # A fresh request reaches the scheduler without a mamba slot; the match
+        # must clip before COW allocates one (production: alloc_for_extend).
+        self._rid += 1
+        req = Req(
+            rid=f"mamba-clip-{self._rid}",
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        self.assertFalse(req.kv.holds_mamba)
+        result = self.cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens)),
+                cow_mamba=True,
+                req=req,
+            )
+        )
+        return req, result
+
+    def test_split_fragment_without_any_state_serves_nothing(self):
+        # 1..128 owns a state at 128. The second insert diverges at 64, so the
+        # split fragment (64 tokens) is left state-less while its child keeps
+        # the 128-token state further down this branch.
+        self._insert(list(range(1, 129)), 128)
+        self._insert(list(range(1, 65)) + list(range(9001, 9065)), 128)
+
+        req, result = self._match(list(range(1, 65)))
+
+        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.full_kv_hit_length, 64)
+        self.assertEqual(result.best_match_node, self.cache.tree_core.root_node.id)
+        self.assertIsNone(result.mamba_branching_seqlen)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        # Nothing to copy: the request stays empty and will clear on alloc.
+        self.assertFalse(req.kv.holds_mamba)
+
+    def test_split_fragment_clips_to_deepest_state_bearing_ancestor(self):
+        # 704 and 1408 both own states. The third insert diverges at 960, so the
+        # 960 fragment is state-less; the reusable state is the 704 ancestor.
+        insert_704 = self._insert(list(range(1, 705)), 704)
+        self._insert(list(range(1, 1409)), 1408)
+        self._insert(list(range(1, 961)) + list(range(9001, 9065)), 1024)
+
+        req, result = self._match(list(range(1, 961)))
+
+        self.assertEqual(len(result.device_indices), 704)
+        self.assertEqual(result.full_kv_hit_length, 960)
+        self.assertIsNone(result.mamba_branching_seqlen)
+        self.assertIsNotNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(
+            _slot(req.kv.mamba_cow_src_index), _slot(insert_704.mamba_value)
+        )
+
+    def test_state_holding_req_keeps_device_match_boundary(self):
+        # A request that already owns a state continues from it; clipping to a
+        # shallower tree ancestor would strand that state, so it is not clipped.
+        self._insert(list(range(1, 705)), 704)
+        self._insert(list(range(1, 1409)), 1408)
+        self._insert(list(range(1, 961)) + list(range(9001, 9065)), 1024)
+
+        req = self._req()
+        self.assertTrue(req.kv.holds_mamba)
+        result = self.cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", list(range(1, 961)))),
+                cow_mamba=True,
+                req=req,
+            )
+        )
+
+        self.assertEqual(len(result.device_indices), 960)
+        self.assertIsNone(result.mamba_branching_seqlen)
 
 
 if __name__ == "__main__":

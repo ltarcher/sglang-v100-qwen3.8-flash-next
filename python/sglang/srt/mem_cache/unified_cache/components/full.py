@@ -194,6 +194,11 @@ class FullComponent(TreeComponent):
                     cd.value[:8].tolist(),
                     int(cd.value.sum().item()),
                 )
+                from sglang.srt.mem_cache.radix_page_poison_probe import (
+                    tree_release_pages,
+                )
+
+                tree_release_pages(cd.value, self.tree_core.page_size)
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed

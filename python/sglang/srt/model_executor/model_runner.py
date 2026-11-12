@@ -1891,6 +1891,8 @@ class ModelRunner:
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return
+        if envs.SGLANG_DEBUG_ZERO_FRESH_KV.get():
+            self._debug_zero_fresh_extend_kv(forward_batch)
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
@@ -1913,13 +1915,64 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
+                if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+                    from sglang.srt.mem_cache.radix_page_poison_probe import (
+                        mamba_state_digest,
+                    )
+
+                    mamba_state_digest(
+                        pool, forward_batch.mamba_cow_src_indices, "cow-copy-src"
+                    )
+                    mamba_state_digest(
+                        pool, forward_batch.mamba_cow_dst_indices, "cow-copy-dst-before"
+                    )
                 pool.copy_mamba_state(
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
+                if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+                    mamba_state_digest(
+                        pool, forward_batch.mamba_cow_dst_indices, "cow-copy-dst-after"
+                    )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+
+    def _debug_zero_fresh_extend_kv(self, forward_batch: ForwardBatch) -> None:
+        """Zero the extend batch's freshly allocated KV slots (debug repro).
+
+        A cache hit writes only ``len - prefix`` tokens into freshly allocated
+        pages. Zeroing them makes any read of the page's unwritten tail
+        deterministic, separating "stale-memory read" from kernel
+        non-determinism.
+        """
+        loc = forward_batch.out_cache_loc
+        if loc is None or loc.numel() == 0:
+            return
+        pool = self.token_to_kv_pool
+        loc = loc.to(dtype=torch.long)
+        # Hybrid pools expose KV buffers only for full-attention layers; other
+        # layer ids raise from get_kv_buffer.
+        mapping = getattr(pool, "full_attention_layer_id_mapping", None)
+        layer_ids = (
+            list(mapping.keys())
+            if mapping is not None
+            else range(self.model_config.num_hidden_layers)
+        )
+        zeroed = 0
+        for layer_id in layer_ids:
+            k_buf, v_buf = pool.get_kv_buffer(layer_id)
+            for buf in (k_buf, v_buf):
+                if buf is None or buf.numel() == 0:
+                    continue
+                buf.index_fill_(0, loc, 0)
+                zeroed += 1
+        logger.info(
+            "[radix-dbg] zeroed fresh extend KV slots=%d buffers=%d pool=%s",
+            loc.numel(),
+            zeroed,
+            type(pool).__name__,
+        )
 
     def _forward_raw(
         self,

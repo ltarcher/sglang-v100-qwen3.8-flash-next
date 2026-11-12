@@ -833,6 +833,17 @@ def move_accept_tokens_to_target_kvcache(
         accept_out_cache_loc,
         size,
     )
+    if batch.token_to_kv_pool_allocator is not None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+            from sglang.srt.mem_cache.radix_page_poison_probe import (
+                check_write_pages,
+            )
+
+            ps = batch.token_to_kv_pool_allocator.page_size
+            check_write_pages(tgt_cache_loc, ps, "move_accept tgt")
+            check_write_pages(accept_out_cache_loc, ps, "move_accept src")
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )

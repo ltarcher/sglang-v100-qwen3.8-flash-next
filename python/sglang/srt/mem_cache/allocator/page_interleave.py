@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
@@ -300,6 +301,17 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             extend_len = int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i])
             offsets = torch.arange(extend_len, dtype=torch.int64, device=self.device)
             out_parts.append(pages[offsets // ps] * ps + offsets % ps)
+            if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+                from sglang.srt.mem_cache.radix_page_poison_probe import (
+                    check_alloc_pages,
+                )
+
+                check_alloc_pages(pages, ps, f"alloc_extend req{i}")
+                from sglang.srt.mem_cache.radix_page_poison_probe import (
+                    alloc_take_pages,
+                )
+
+                alloc_take_pages(pages, ps, f"alloc_extend req{i}")
         out_indices = torch.cat(out_parts) if len(out_parts) > 1 else out_parts[0]
 
         if self.debug_mode:
@@ -320,6 +332,12 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+            from sglang.srt.mem_cache.radix_page_poison_probe import (
+                alloc_release_pages,
+            )
+
+            alloc_release_pages(free_index, self.page_size)
 
         if self.free_group is not None:
             # Match the base allocator's ownership contract: callers may

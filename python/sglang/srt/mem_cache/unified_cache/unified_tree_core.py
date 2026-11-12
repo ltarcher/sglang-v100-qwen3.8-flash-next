@@ -490,6 +490,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        if _unified_radix_debug():
+            from sglang.srt.mem_cache.radix_page_poison_probe import probe_reset
+
+            probe_reset()
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
@@ -1544,6 +1548,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value[:8].tolist(),
                 int(value.sum().item()),
             )
+            from sglang.srt.mem_cache.radix_page_poison_probe import tree_own_pages
+
+            tree_own_pages(value, self.page_size)
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage or self.enable_external_cache_linker:
@@ -1567,6 +1574,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
+        if _unified_radix_debug():
+            from sglang.srt.mem_cache.radix_page_poison_probe import tree_own_pages
+
+            tree_own_pages(fresh_value, self.page_size)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:

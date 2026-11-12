@@ -161,13 +161,49 @@ class MambaComponent(TreeComponent):
             # boundary desyncs the chunked stash: insert frees the request's
             # duplicate live pages over the full overlap while the rebind only
             # rewrites the row up to the vetoed boundary, leaving freed pages
-            # referenced by the row. COW handles a mamba-less boundary via
-            # src=None (full recompute).
+            # referenced by the row. Instead of vetoing here, the match is
+            # clipped afterwards by _clip_to_reusable_state, which keeps every
+            # derived length (prefix_indices, cache_protected_len) on the
+            # served boundary.
             return lambda node: True
         # HiCache: evicted + backuped (host_value present) is also a valid match
         return lambda node: (
             node.component_data[ct].value is not None
             or node.component_data[ct].host_value is not None
+        )
+
+    def _clip_to_reusable_state(self, result: MatchResult) -> MatchResult:
+        """Serve no Full KV prefix that the reusable Mamba state does not cover.
+
+        The device-only tree accepts a Full match boundary without a Mamba
+        state: a divergence split leaves its fragment state-less (the state
+        stays on the deeper child), and a donated checkpoint can be evicted.
+        Serving such a prefix starts the request's state from zero at a
+        non-zero position. Clip the match to the deepest matched ancestor that
+        still holds a device state; with none, serve nothing and let prefill
+        rebuild the state from the prompt.
+        """
+        ct = self.component_type
+        root = self.tree_core.root_node
+        node = result.best_match_node
+        if node.component_data[ct].value is not None:
+            return result
+        while node is not root and node.component_data[ct].value is None:
+            node = node.parent
+        if node is result.best_match_node:
+            # No state-bearing ancestor other than the boundary itself.
+            return result
+        depth = 0
+        cur = node
+        while cur is not root:
+            depth += len(cur.key)
+            cur = cur.parent
+        return result._replace(
+            device_indices=result.device_indices[:depth],
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+            host_hit_length=0,
         )
 
     def finalize_match_result_in_tree_core(
@@ -177,6 +213,18 @@ class MambaComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
+        # Only a request that will COW a tree state needs the clipped boundary.
+        # A request that already holds its own state keeps its match: its state
+        # is deeper than anything the tree can clip to, so re-prefilling from
+        # a shallower ancestor would strand the state.
+        clipped = False
+        if (
+            not self.tree_core.enable_hicache
+            and (params.req is None or not params.req.kv.holds_mamba)
+        ):
+            clipped_result = self._clip_to_reusable_state(result)
+            clipped = clipped_result is not result
+            result = clipped_result
         last_node = result.best_match_node
 
         mamba_boundary_len = len(result.device_indices) + result.host_hit_length
@@ -185,12 +233,15 @@ class MambaComponent(TreeComponent):
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
         # that lies beyond the current Mamba boundary. With HiCache, incremental
         # persistence of a new branching state is currently write-through only;
-        # write-back eviction may discard the device-only state.
+        # write-back eviction may discard the device-only state. A clipped match
+        # serves exactly the state boundary, so it has no branching point.
         aligned_seqlen = (
             result.full_kv_hit_length // self.mamba_checkpoint_grid
         ) * self.mamba_checkpoint_grid
         branching_seqlen = (
-            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
+            aligned_seqlen
+            if not clipped and aligned_seqlen > mamba_boundary_len
+            else None
         )
 
         # HiCache: if mamba was evicted from device but has host backup,
@@ -219,6 +270,17 @@ class MambaComponent(TreeComponent):
                 result.full_kv_hit_length,
                 "None" if src_index is None else int(src_index.reshape(-1)[0]),
             )
+            if src_index is not None:
+                from sglang.srt.mem_cache.radix_page_poison_probe import (
+                    mamba_state_digest,
+                )
+
+                mamba_state_digest(
+                    self.cache.req_to_token_pool,
+                    src_index,
+                    f"cow-src serve={len(result.device_indices)} "
+                    f"full_hit={result.full_kv_hit_length}",
+                )
         if src_index is None:
             return result
         req = params.req
@@ -624,6 +686,16 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
             else:
                 insert_params.mamba_value = active_value
+            if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+                from sglang.srt.mem_cache.radix_page_poison_probe import (
+                    mamba_state_digest,
+                )
+
+                mamba_state_digest(
+                    self.cache.req_to_token_pool,
+                    insert_params.mamba_value,
+                    f"donate-finish rid={req.rid} key_len={cache_len}",
+                )
             return cache_len
         else:
             if cache_len is None:
@@ -660,6 +732,16 @@ class MambaComponent(TreeComponent):
                     translate(mamba_value_donated),
                 )
             insert_params.mamba_value = mamba_value_donated
+            if envs.SGLANG_DEBUG_MAMBA_RADIX.get():
+                from sglang.srt.mem_cache.radix_page_poison_probe import (
+                    mamba_state_digest,
+                )
+
+                mamba_state_digest(
+                    self.cache.req_to_token_pool,
+                    mamba_value_donated,
+                    f"donate-unfinished rid={req.rid} key_len={cache_len}",
+                )
             return cache_len
 
     def cleanup_after_caching_req(
