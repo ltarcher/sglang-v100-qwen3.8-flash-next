@@ -2009,46 +2009,9 @@ class KVCacheConfigurator:
             # device-resident at the logical capacity, which keeps the draft
             # on the plain logical read path and avoids a second pinned
             # mirror next to the target's.
-            phys_size = envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get()
-            draft_pool_tier_free = bool(phys_size) and self.is_draft_worker
-            if draft_pool_tier_free:
-                logger.warning(
-                    "SGLANG_V100_KV_TIER_PHYS_TOKENS is ignored on the MTP draft "
-                    "pool: it stays fully device-resident at the logical budget "
-                    "(%d tokens) with no host tier",
-                    max_total_num_tokens,
-                )
-                phys_size = 0
-            if phys_size:
-                if phys_size % self.pool_page_size:
-                    raise ValueError(
-                        "SGLANG_V100_KV_TIER_PHYS_TOKENS must be a multiple of the "
-                        f"KV pool page size ({self.pool_page_size}), got {phys_size}"
-                    )
-                if envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY:
-                    # Pair-split (docs/v100/KV_HOST_TIER_DESIGN.md §6.1): PHYS
-                    # is the PAIR TOTAL; each rank allocates half and P2P-
-                    # reads the pair member's blocks through the tier's read
-                    # path. The tier owns the parity mapping, so the pool
-                    # only sees a smaller device region. The PAIR total is
-                    # allowed to meet or exceed the logical budget (that is
-                    # the point: the logical pool fits the PAIR-total space
-                    # instead of wraparound-shrinking into one rank's half);
-                    # the logical_pages <= pair_pages check lives in the
-                    # tier's _init_pair_split.
-                    block = envs.SGLANG_V100_KV_HEAD_LAYOUT_BLOCK.get()
-                    if block <= 0 or (phys_size // self.pool_page_size) % (2 * block):
-                        raise ValueError(
-                            "SGLANG_V100_KV_HEAD_LAYOUT_BLOCK must divide the "
-                            f"pair-total physical page count "
-                            f"({phys_size // self.pool_page_size}), got {block}"
-                        )
-                    phys_size //= 2
-                elif phys_size >= max_total_num_tokens:
-                    raise ValueError(
-                        "SGLANG_V100_KV_TIER_PHYS_TOKENS must be smaller than the "
-                        f"logical KV budget ({max_total_num_tokens}), got {phys_size}"
-                    )
+            phys_size, draft_pool_tier_free = self._resolve_qsa_phys_size(
+                max_total_num_tokens
+            )
             return QSATokenToKVPool(
                 **common_kwargs,
                 phys_size=int(phys_size),
@@ -2420,6 +2383,79 @@ class KVCacheConfigurator:
             token_capacity = tensor.item()
 
         return token_capacity
+
+    def _resolve_qsa_phys_size(self, max_total_num_tokens: int):
+        """Resolve the Phase 3 tier device-pool override for the QSA pool.
+
+        Returns ``(phys_size, draft_pool_tier_free)``. The PHYS override and
+        the PAIR_PARITY layout are tier-owned semantics: the device-pool
+        shrink is only sound when the tier owns the modulo mapping, the host
+        mirror and the pair peer IPC buffers. Without
+        SGLANG_V100_KV_HOST_TIER=1 a shrunk pool has no mapping and logical
+        slots beyond it index out of bounds (2026-11-13 incident: tier=0 +
+        PHYS=786432 + PAIR booted a 393,216-token device pool under a
+        436,736-token scheduler budget), so the misconfiguration refuses to
+        boot instead of shrinking silently.
+        """
+        tier_on = envs.SGLANG_V100_KV_HOST_TIER.get()
+        phys_size = envs.SGLANG_V100_KV_TIER_PHYS_TOKENS.get()
+        if not tier_on:
+            if envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY:
+                raise ValueError(
+                    "SGLANG_V100_KV_HEAD_LAYOUT=PAIR_PARITY requires "
+                    "SGLANG_V100_KV_HOST_TIER=1: the parity mapping and the "
+                    "pair peer IPC buffers live in the host tier, so the "
+                    "layout is not implemented without it"
+                )
+            if phys_size:
+                raise ValueError(
+                    "SGLANG_V100_KV_TIER_PHYS_TOKENS requires "
+                    "SGLANG_V100_KV_HOST_TIER=1: the device-pool shrink is "
+                    "mapped by the tier's modulo table and host mirror; with "
+                    "the tier off the shrunk pool would silently truncate the "
+                    f"logical budget ({max_total_num_tokens} tokens)"
+                )
+            return 0, False
+        draft_pool_tier_free = bool(phys_size) and self.is_draft_worker
+        if draft_pool_tier_free:
+            logger.warning(
+                "SGLANG_V100_KV_TIER_PHYS_TOKENS is ignored on the MTP draft "
+                "pool: it stays fully device-resident at the logical budget "
+                "(%d tokens) with no host tier",
+                max_total_num_tokens,
+            )
+            return 0, True
+        if phys_size:
+            if phys_size % self.pool_page_size:
+                raise ValueError(
+                    "SGLANG_V100_KV_TIER_PHYS_TOKENS must be a multiple of the "
+                    f"KV pool page size ({self.pool_page_size}), got {phys_size}"
+                )
+            if envs.SGLANG_V100_KV_HEAD_LAYOUT.get() == KVHeadLayout.PAIR_PARITY:
+                # Pair-split (docs/v100/KV_HOST_TIER_DESIGN.md §6.1): PHYS
+                # is the PAIR TOTAL; each rank allocates half and P2P-
+                # reads the pair member's blocks through the tier's read
+                # path. The tier owns the parity mapping, so the pool
+                # only sees a smaller device region. The PAIR total is
+                # allowed to meet or exceed the logical budget (that is
+                # the point: the logical pool fits the PAIR-total space
+                # instead of wraparound-shrinking into one rank's half);
+                # the logical_pages <= pair_pages check lives in the
+                # tier's _init_pair_split.
+                block = envs.SGLANG_V100_KV_HEAD_LAYOUT_BLOCK.get()
+                if block <= 0 or (phys_size // self.pool_page_size) % (2 * block):
+                    raise ValueError(
+                        "SGLANG_V100_KV_HEAD_LAYOUT_BLOCK must divide the "
+                        f"pair-total physical page count "
+                        f"({phys_size // self.pool_page_size}), got {block}"
+                    )
+                phys_size //= 2
+            elif phys_size >= max_total_num_tokens:
+                raise ValueError(
+                    "SGLANG_V100_KV_TIER_PHYS_TOKENS must be smaller than the "
+                    f"logical KV budget ({max_total_num_tokens}), got {phys_size}"
+                )
+        return int(phys_size), False
 
     def _tier_extend_logical_capacity(
         self, config: MemoryPoolConfig, available_bytes: int

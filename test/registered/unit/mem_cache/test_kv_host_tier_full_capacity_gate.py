@@ -87,3 +87,39 @@ class TestFullMappingInjectivity:
         slots[:PAGE] = t.phys_slot_base + torch.arange(PAGE)
         table = t.map_slot_table(slots)
         assert int(table[1 * PAGE]) // PAGE == int(table[5 * PAGE]) // PAGE
+
+
+class TestAttachRefusesShrunkPoolWithoutTier:
+    """Second boot gate for the 2026-11-13 misconfiguration.
+
+    The configurator halves the device pool for PHYS/PAIR, but the shrink is
+    only sound when the tier owns the modulo mapping + host mirror. If the
+    tier is disabled the pool reaches ``attach_kv_host_tier`` already shrunk
+    (``phys_size < logical_size``) and would boot unmapped -- refuse there
+    too, independent of which caller misconfigured it.
+    """
+
+    @staticmethod
+    def _attach(tier: int, phys_size: int, logical_size: int):
+        from types import SimpleNamespace
+
+        import sglang.srt.mem_cache.kv_host_tier as kvt
+
+        pool = SimpleNamespace(phys_size=phys_size, logical_size=logical_size)
+        env = SimpleNamespace(
+            SGLANG_V100_KV_HOST_TIER=SimpleNamespace(get=lambda: tier),
+            SGLANG_V100_KV_TIER_PAGEIN=SimpleNamespace(get=lambda: 0),
+        )
+        saved = kvt.envs
+        kvt.envs = env
+        try:
+            return kvt.attach_kv_host_tier(pool, [0])
+        finally:
+            kvt.envs = saved
+
+    def test_tier_off_unshrunk_pool_returns_none(self):
+        assert self._attach(tier=0, phys_size=0, logical_size=1000) is None
+
+    def test_tier_off_shrunk_pool_refuses(self):
+        with pytest.raises(ValueError, match="SGLANG_V100_KV_HOST_TIER"):
+            self._attach(tier=0, phys_size=393216, logical_size=436736)

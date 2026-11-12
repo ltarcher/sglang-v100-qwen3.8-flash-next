@@ -142,6 +142,17 @@ def attach_kv_host_tier(
     unset, which keeps every consumer on a plain ``is not None`` check).
     """
     if not envs.SGLANG_V100_KV_HOST_TIER.get():
+        # Belt against a shrunk pool reaching attach with the tier disabled
+        # (2026-11-13 incident): the PHYS/PAIR device-pool shrink is only
+        # mapped by the tier's modulo table + host mirror, so an already
+        # shrunk pool must not boot on the plain logical read path.
+        if 0 < pool.phys_size < pool.logical_size:
+            raise ValueError(
+                "SGLANG_V100_KV_HOST_TIER is disabled but the QSA pool is "
+                f"shrunk (phys_size={pool.phys_size} < logical_size="
+                f"{pool.logical_size}): the PHYS/PAIR device-pool override is "
+                "mapped by the host tier and cannot boot without it"
+            )
         return None
     return KVHostTier(
         pool, full_attention_layer_ids, pagein=envs.SGLANG_V100_KV_TIER_PAGEIN.get()
