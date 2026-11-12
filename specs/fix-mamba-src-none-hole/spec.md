@@ -179,6 +179,24 @@ helper `_insert(tokens, donate_len) -> params`：`_set_track(req, last_seqlen=do
    Qwen3.8 NVFP4 验收命令不回退（prefill ~3,000 tok/s、decode ~100 tok/s/流、MTP accept ~2.1）；
    确认 `[radix-dbg]` 中常规命中仍为有效 src、无前缀被误裁（日志 serve == full_hit 的场景不变）。
 
+## 实施结果（2026-11-12，已提交 3af1182157）
+
+- 单测：新增 `TestMambaMatchClipsToReusableState` 3 例先红（64≠0、960≠704）后绿；
+  `TestMambaCheckpointGrid` 按新契约改写；mamba 相关 47 例 `OK (expected failures=1)`，
+  `test_mamba_evict_breaks_match` 由基线红转绿。
+- chunk=704 容器：`[radix-dbg] cow ... src=None` 全部变为 `serve=0 full_hit=...`；
+  `serve>0 && src=None` 计数 0；warm determinism B1==B2 22/32、A==B1 18/32，
+  长度与 A 同量级（无 2–3× 膨胀）。
+- chunk=4096 生产配置：常规命中仍为 `serve=704 full_hit=704 src=3`（未被误裁），
+  `serve>0 && src=None` 计数 0；warm determinism cached 704/768、B1==B2 16/32；
+  `bash scripts/smoke_v100.sh` 通过。
+- 质量 oracle：`python3 scripts/testbench/bench_quality_v100.py gsm8k`（5-shot，32 题）
+  **31/32 PASS**，结果 `scripts/testbench/results/20261112_122908/gsm8k.json`，
+  高于修复前 fresh 29 / hit1 28 / hit2 29 的基线。
+- 性能 A/B（同容器同配置，改前/改后各一次 boot）：prefill 8192 = 1794 vs 898 tok/s，
+  decode = 16.3 vs 11.2/11.5 tok/s（客户端口径；服务端 accept len 2.25–2.83），未回退；
+  绝对数字低于 README 基线由当前机器负载导致，与本次改动无关。
+
 ## 风险与回退
 
 - 裁剪只会减少命中长度，不会引入错误数据；最坏情况退化为全量 prefill（性能损失），
