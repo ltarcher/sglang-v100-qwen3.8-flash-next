@@ -803,6 +803,20 @@ kv tier phase3 + PAIR_PARITY + PLE staged CHUNK_AHEAD、MTP on、
 衰减(37 → 12 tok/s/流 @64k,2 并发交错 + tier 读成本),单流 16k 89
 tok/s 正常;③首测 16k 的 82.5s 毛刺需在后续 A/B 中留意是否再现。
 
+**⚠️ 方法论修正(2026-11-12 晚)**:上表全部 bench_serving 数字被
+**warmup + radix 命中污染**——bench 默认发一条 warmup(=input_requests[0],
+完整长度),且 warmup 后不 flush(`--flush-cache` 未传),导致 n=1 的计测
+请求与 warmup 同 prompt 走 radix 全命中(n=1 "32k 单流 4.0s" 是命中后的
+TTFT,不是冷 prefill;n≥2 的 mean/median 是 {命中 ~4.0s, 冷 ~14.1s} 的
+混合)。真冷 32k 单流 prefill = **14.4s ≈ 2,275 tok/s**(--flush-cache
+实测),真随机 ids 与重复序列同为 13.6-14.3s(内容重复性无影响;此前
+"PLE staged 内容命中"假说已被 A/B 否定)。真实生产读数(用户实测 2,200
+prefill / 65 decode)与真冷值一致,引擎无异常;decode 单流真冷 ~58-65
+tok/s。**后续所有 prefill 基线/A/B 必须加 `--flush-cache`**(并注意
+"Low device headroom → empty_cache" 守卫仅启动期集中触发 ~14 次,非
+持续开销)。8k 桶受污染较小(真冷 3.4s ≈ 2,400 tok/s 与原表接近),
+16k/32k/64k 原表数字作废。
+
 **A/B 实测:grouped ON 回归,已回退(2026-11-12)**:镜像
 `sglang-v100-unified:group-prefill`(含 §8.3 路线 B 改动;GPU 内核测试
 2 passed——TileLang 双指针编译 + peer 数值对齐;smoke 通过;needle QA
